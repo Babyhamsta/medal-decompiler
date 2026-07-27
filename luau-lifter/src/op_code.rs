@@ -365,6 +365,169 @@ pub enum OpCode {
     // C: constant table index (0..255)
     LOP_IDIVK,
 
+    // Userdata access aliases with cached slots in AUX.
+    LOP_GETUDATAKS,
+    LOP_SETUDATAKS,
+    LOP_NAMECALLUDATA,
+
+    // Create or update a class member.
+    LOP_NEWCLASSMEMBER,
+
+    // Feedback-aware call and prototype guard.
+    LOP_CALLFB,
+    LOP_CMPPROTO,
+
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT,
+}
+
+impl OpCode {
+    pub const fn encoding(self) -> crate::instruction::InstructionEncoding {
+        use crate::instruction::InstructionEncoding::{Abc, Ad, E};
+
+        match self {
+            Self::LOP_NOP
+            | Self::LOP_BREAK
+            | Self::LOP_LOADNIL
+            | Self::LOP_LOADB
+            | Self::LOP_MOVE
+            | Self::LOP_GETGLOBAL
+            | Self::LOP_SETGLOBAL
+            | Self::LOP_GETUPVAL
+            | Self::LOP_SETUPVAL
+            | Self::LOP_CLOSEUPVALS
+            | Self::LOP_GETTABLE
+            | Self::LOP_SETTABLE
+            | Self::LOP_GETTABLEKS
+            | Self::LOP_SETTABLEKS
+            | Self::LOP_GETTABLEN
+            | Self::LOP_SETTABLEN
+            | Self::LOP_NAMECALL
+            | Self::LOP_CALL
+            | Self::LOP_RETURN
+            | Self::LOP_ADD
+            | Self::LOP_SUB
+            | Self::LOP_MUL
+            | Self::LOP_DIV
+            | Self::LOP_MOD
+            | Self::LOP_POW
+            | Self::LOP_ADDK
+            | Self::LOP_SUBK
+            | Self::LOP_MULK
+            | Self::LOP_DIVK
+            | Self::LOP_MODK
+            | Self::LOP_POWK
+            | Self::LOP_AND
+            | Self::LOP_OR
+            | Self::LOP_ANDK
+            | Self::LOP_ORK
+            | Self::LOP_CONCAT
+            | Self::LOP_NOT
+            | Self::LOP_MINUS
+            | Self::LOP_LENGTH
+            | Self::LOP_NEWTABLE
+            | Self::LOP_SETLIST
+            | Self::LOP_FASTCALL3
+            | Self::LOP_GETVARARGS
+            | Self::LOP_PREPVARARGS
+            | Self::LOP_FASTCALL
+            | Self::LOP_CAPTURE
+            | Self::LOP_SUBRK
+            | Self::LOP_DIVRK
+            | Self::LOP_FASTCALL1
+            | Self::LOP_FASTCALL2
+            | Self::LOP_FASTCALL2K
+            | Self::LOP_IDIV
+            | Self::LOP_IDIVK
+            | Self::LOP_GETUDATAKS
+            | Self::LOP_SETUDATAKS
+            | Self::LOP_NAMECALLUDATA
+            | Self::LOP_NEWCLASSMEMBER
+            | Self::LOP_CALLFB => Abc,
+
+            Self::LOP_LOADN
+            | Self::LOP_LOADK
+            | Self::LOP_GETIMPORT
+            | Self::LOP_NEWCLOSURE
+            | Self::LOP_JUMP
+            | Self::LOP_JUMPBACK
+            | Self::LOP_JUMPIF
+            | Self::LOP_JUMPIFNOT
+            | Self::LOP_JUMPIFEQ
+            | Self::LOP_JUMPIFLE
+            | Self::LOP_JUMPIFLT
+            | Self::LOP_JUMPIFNOTEQ
+            | Self::LOP_JUMPIFNOTLE
+            | Self::LOP_JUMPIFNOTLT
+            | Self::LOP_DUPTABLE
+            | Self::LOP_FORNPREP
+            | Self::LOP_FORNLOOP
+            | Self::LOP_FORGLOOP
+            | Self::LOP_FORGPREP_INEXT
+            | Self::LOP_FORGPREP_NEXT
+            | Self::LOP_NATIVECALL
+            | Self::LOP_DUPCLOSURE
+            | Self::LOP_LOADKX
+            | Self::LOP_FORGPREP
+            | Self::LOP_JUMPXEQKNIL
+            | Self::LOP_JUMPXEQKB
+            | Self::LOP_JUMPXEQKN
+            | Self::LOP_JUMPXEQKS
+            | Self::LOP_CMPPROTO => Ad,
+
+            Self::LOP_JUMPX | Self::LOP_COVERAGE => E,
+
+            Self::LOP__COUNT => panic!("LOP__COUNT is not a wire opcode"),
+        }
+    }
+
+    pub const fn has_aux(self) -> bool {
+        matches!(
+            self,
+            Self::LOP_GETGLOBAL
+                | Self::LOP_SETGLOBAL
+                | Self::LOP_GETIMPORT
+                | Self::LOP_GETTABLEKS
+                | Self::LOP_SETTABLEKS
+                | Self::LOP_NAMECALL
+                | Self::LOP_JUMPIFEQ
+                | Self::LOP_JUMPIFLE
+                | Self::LOP_JUMPIFLT
+                | Self::LOP_JUMPIFNOTEQ
+                | Self::LOP_JUMPIFNOTLE
+                | Self::LOP_JUMPIFNOTLT
+                | Self::LOP_NEWTABLE
+                | Self::LOP_SETLIST
+                | Self::LOP_FORGLOOP
+                | Self::LOP_FASTCALL3
+                | Self::LOP_LOADKX
+                | Self::LOP_FASTCALL2
+                | Self::LOP_FASTCALL2K
+                | Self::LOP_JUMPXEQKNIL
+                | Self::LOP_JUMPXEQKB
+                | Self::LOP_JUMPXEQKN
+                | Self::LOP_JUMPXEQKS
+                | Self::LOP_GETUDATAKS
+                | Self::LOP_SETUDATAKS
+                | Self::LOP_NAMECALLUDATA
+                | Self::LOP_NEWCLASSMEMBER
+                | Self::LOP_CALLFB
+                | Self::LOP_CMPPROTO
+        )
+    }
+
+    pub const fn word_len(self) -> usize {
+        if self.has_aux() { 2 } else { 1 }
+    }
+
+    pub const fn minimum_version(self) -> u8 {
+        match self {
+            Self::LOP_SUBRK | Self::LOP_DIVRK => 5,
+            Self::LOP_FASTCALL3 => 6,
+            Self::LOP_GETUDATAKS | Self::LOP_SETUDATAKS | Self::LOP_NAMECALLUDATA => 9,
+            Self::LOP_NEWCLASSMEMBER => 10,
+            Self::LOP_CALLFB | Self::LOP_CMPPROTO => 11,
+            _ => 4,
+        }
+    }
 }

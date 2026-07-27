@@ -16,6 +16,7 @@ mod assign;
 mod binary;
 mod r#break;
 mod call;
+mod class;
 mod close;
 mod closure;
 mod r#continue;
@@ -44,21 +45,21 @@ mod r#while;
 
 pub use assign::*;
 pub use binary::*;
+pub use r#break::*;
 pub use call::*;
+pub use class::*;
 pub use close::*;
 pub use closure::*;
+pub use r#continue::*;
+pub use r#for::*;
 pub use global::*;
 pub use goto::*;
+pub use r#if::*;
 pub use index::*;
 pub use literal::*;
 pub use local::*;
-pub use r#break::*;
-pub use r#continue::*;
-pub use r#for::*;
-pub use r#if::*;
-pub use r#return::*;
-pub use r#while::*;
 pub use repeat::*;
+pub use r#return::*;
 pub use set_list::*;
 pub use side_effects::*;
 pub use table::*;
@@ -66,6 +67,7 @@ pub use traverse::*;
 use type_system::{Type, TypeSystem};
 pub use unary::*;
 pub use vararg::*;
+pub use r#while::*;
 
 pub trait Reduce {
     fn reduce(self) -> RValue;
@@ -156,6 +158,7 @@ impl RValue {
             RValue::Literal(Literal::Number(n)) if n.is_finite() && n.is_sign_negative() => {
                 return 7;
             }
+            RValue::Literal(Literal::Integer(n)) if *n < 0 => return 7,
             _ => 9,
         }
     }
@@ -265,6 +268,7 @@ pub enum Statement {
     Call(Call),
     MethodCall(MethodCall),
     Assign(Assign),
+    Class(Class),
     If(If),
     Goto(Goto),
     Label(Label),
@@ -312,6 +316,7 @@ impl fmt::Display for Statement {
             Statement::Call(call) => write!(f, "{}", call),
             Statement::MethodCall(method_call) => write!(f, "{}", method_call),
             Statement::Assign(assign) => write!(f, "{}", assign),
+            Statement::Class(class) => write!(f, "{}", class),
             // TODO: STYLE: replace all `if_` with `r#if`, etc
             Statement::If(if_) => write!(f, "{}", if_),
             Statement::Goto(goto) => write!(f, "{}", goto),

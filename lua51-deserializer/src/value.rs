@@ -1,10 +1,10 @@
 use enum_as_inner::EnumAsInner;
 use nom::{
+    Err, IResult,
     bytes::complete::take,
     error::{Error, ErrorKind, ParseError},
     multi::count,
-    number::complete::{le_f64, le_u32, le_u8},
-    Err, IResult,
+    number::complete::{le_f64, le_u8, le_u32},
 };
 
 #[derive(Debug, EnumAsInner)]

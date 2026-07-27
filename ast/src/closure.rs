@@ -5,9 +5,9 @@ use parking_lot::Mutex;
 use triomphe::Arc;
 
 use crate::{
+    Block, Literal, LocalRw, RcLocal, Reduce, SideEffects, Traverse, Type,
     formatter::Formatter,
     type_system::{Infer, TypeSystem},
-    Block, Literal, LocalRw, RcLocal, Reduce, SideEffects, Traverse, Type,
 };
 
 #[derive(Debug, PartialEq, Clone)]

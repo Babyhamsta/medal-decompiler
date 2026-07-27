@@ -57,7 +57,7 @@ impl<'a> Inliner<'a> {
                                     operation,
                                 }) if operation.is_comparator()
                                     && left.has_side_effects()
-                                    && let box ast::RValue::Local(ref local) = right
+                                    && let &mut box ast::RValue::Local(ref local) = right
                                     && local == read =>
                                 {
                                     *right = std::mem::replace(
@@ -556,8 +556,14 @@ pub fn inline(
                         && local == &object_local
                     {
                         let right = &field_assign.right[0];
-                        if right.as_closure().is_none()
-                            && right.values_read().contains(&&object_local)
+                        let key = field_assign.left[0]
+                            .as_index()
+                            .expect("field assignment must use an index")
+                            .right
+                            .as_ref();
+                        if (right.as_closure().is_none()
+                            && right.values_read().contains(&&object_local))
+                            || key.values_read().contains(&&object_local)
                         {
                             break;
                         }

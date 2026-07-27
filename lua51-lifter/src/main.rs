@@ -2,8 +2,8 @@
 #![feature(let_chains)]
 
 use ast::{
-    local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
-    Traverse,
+    Traverse, local_declarations::LocalDeclarer, name_locals::name_locals,
+    replace_locals::replace_locals,
 };
 use by_address::ByAddress;
 use cfg::ssa::{

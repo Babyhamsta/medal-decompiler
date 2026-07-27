@@ -6,9 +6,9 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use petgraph::{
+    Direction,
     algo::dominators::simple_fast,
     prelude::{DiGraph, NodeIndex},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
@@ -29,7 +29,10 @@ impl LocalDeclarer {
         self.block_to_node.insert(block.clone().into(), node);
         for (stat_index, stat) in block.lock().iter().enumerate() {
             // for loops already declare their own locals :)
-            if !matches!(stat, Statement::GenericFor(_) | Statement::NumericFor(_)) {
+            if !matches!(
+                stat,
+                Statement::Class(_) | Statement::GenericFor(_) | Statement::NumericFor(_)
+            ) {
                 // we only visit locals written because locals are guaranteed to be written
                 // before they are read.
                 // TODO: move to seperate function and visit breadth-first?

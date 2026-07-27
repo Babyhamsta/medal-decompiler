@@ -8,8 +8,9 @@ use std::{
 use itertools::Itertools;
 
 use crate::{
-    Assign, Binary, BinaryOperation, Block, Call, Closure, GenericFor, If, Index, LValue, Literal,
-    MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary, While,
+    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, GenericFor, If, Index, LValue,
+    Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary,
+    While,
 };
 
 pub enum IndentationMode {
@@ -199,6 +200,8 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
+        let compacted = table.without_shadowed_literal_fields();
+        let table = &compacted;
         let sequential_keys = Self::are_table_keys_sequential(table);
         let should_space = !table.0.is_empty();
         let should_format = !table.0.is_empty() && (!sequential_keys || table.0.len() > 3)
@@ -227,9 +230,15 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             } else {
                 if !sequential_keys {
                     if let Some(key) = key {
-                        write!(self.output, "[")?;
-                        self.format_rvalue(key)?;
-                        write!(self.output, "] = ")?;
+                        if let RValue::Literal(Literal::String(field)) = key
+                            && Self::is_valid_name(field)
+                        {
+                            write!(self.output, "{} = ", std::str::from_utf8(field).unwrap())?;
+                        } else {
+                            write!(self.output, "[")?;
+                            self.format_rvalue(key)?;
+                            write!(self.output, "] = ")?;
+                        }
                     }
                 }
                 self.format_rvalue(value)?;
@@ -355,6 +364,41 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         write!(self.output, "end")
     }
 
+    pub(crate) fn format_class(&mut self, class: &Class) -> fmt::Result {
+        writeln!(self.output, "class {}", class.target)?;
+        self.indentation_level += 1;
+
+        for property in &class.properties {
+            self.indent()?;
+            writeln!(self.output, "public {property}")?;
+        }
+
+        for (name, value) in &class.methods {
+            self.indent()?;
+            if let RValue::Closure(closure) = value {
+                write!(self.output, "function {name}(")?;
+                self.format_closure_parameters(closure)?;
+                write!(self.output, ")")?;
+                self.format_closure_body(closure)?;
+                writeln!(self.output, "end")?;
+            } else {
+                writeln!(self.output, "function {name}(...)")?;
+                self.indentation_level += 1;
+                self.indent()?;
+                write!(self.output, "return ")?;
+                self.format_rvalue(value)?;
+                writeln!(self.output, "(...)")?;
+                self.indentation_level -= 1;
+                self.indent()?;
+                writeln!(self.output, "end")?;
+            }
+        }
+
+        self.indentation_level -= 1;
+        self.indent()?;
+        write!(self.output, "end")
+    }
+
     fn format_rvalue(&mut self, rvalue: &RValue) -> fmt::Result {
         match rvalue {
             RValue::Select(Select::Call(call)) | RValue::Call(call) => self.format_call(call),
@@ -420,8 +464,9 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         // TODO: Consider adding "goto" to reserved keywords
         const RESERVED_KEYWORDS: &[&str] = &[
-            "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
-            "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+            "and", "break", "class", "do", "else", "elseif", "end", "false", "for", "function",
+            "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+            "while",
         ];
 
         let name_str = std::str::from_utf8(name).unwrap_or("");
@@ -574,11 +619,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         {
             let left = &assign.left[0];
             if assign.prefix || left.as_global().is_some() || {
-                if let LValue::Index(ref index) = left {
+                if let LValue::Index(index) = left {
                     let mut index = index;
                     let mut valid = true;
                     loop {
-                        if let box RValue::Literal(Literal::String(ref key)) = &index.right
+                        if let box RValue::Literal(Literal::String(key)) = &index.right
                             && Self::is_valid_name(key)
                         {
                             match index.left {
@@ -725,6 +770,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 
         match statement {
             Statement::Assign(assign) => self.format_assign(assign),
+            Statement::Class(class) => self.format_class(class),
             Statement::If(r#if) => self.format_if(r#if),
             Statement::While(r#while) => self.format_while(r#while),
             Statement::Repeat(repeat) => self.format_repeat(repeat),

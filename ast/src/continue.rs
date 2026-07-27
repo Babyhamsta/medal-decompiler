@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{has_side_effects, LocalRw, Traverse};
+use crate::{LocalRw, Traverse, has_side_effects};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Continue {}

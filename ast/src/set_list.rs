@@ -1,4 +1,4 @@
-use crate::{formatter, LocalRw, RValue, RcLocal, SideEffects, Traverse};
+use crate::{LocalRw, RValue, RcLocal, SideEffects, Traverse, formatter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetList {

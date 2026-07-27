@@ -1,12 +1,12 @@
 use nom::{
+    IResult,
     combinator::opt,
     multi::count,
-    number::complete::{le_u32, le_u8},
-    IResult,
+    number::complete::{le_u8, le_u32},
 };
 
 use crate::{
-    instruction::{position::Position, Instruction},
+    instruction::{Instruction, position::Position},
     local::Local,
     value::{self, Value},
 };

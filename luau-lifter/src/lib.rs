@@ -3,9 +3,12 @@ mod instruction;
 mod lifter;
 mod op_code;
 
+#[cfg(test)]
+mod compatibility_tests;
+
 use ast::{
-    local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
-    Traverse,
+    Traverse, local_declarations::LocalDeclarer, name_locals::name_locals,
+    replace_locals::replace_locals,
 };
 
 use by_address::ByAddress;
@@ -62,84 +65,178 @@ struct Args {
 }
 
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
-    let chunk = deserializer::deserialize(bytecode, encode_key).unwrap();
-    match chunk {
-        Bytecode::Error(msg) => msg,
-        Bytecode::Chunk(chunk) => {
-            let mut lifted = Vec::new();
-            let mut stack = vec![(Arc::<Mutex<ast::Function>>::default(), chunk.main)];
-            while let Some((ast_func, func_id)) = stack.pop() {
-                let (function, upvalues, child_functions) =
-                    Lifter::lift(&chunk.functions, &chunk.string_table, func_id);
-                lifted.push((ast_func, function, upvalues));
-                stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+    match try_decompile_bytecode(bytecode, encode_key) {
+        Ok(output) => output,
+        Err(error) => error
+            .lines()
+            .map(|line| format!("-- decompiler error: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+pub fn try_decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_decompile_bytecode_inner(bytecode, encode_key)
+    }))
+    .map_err(panic_message)
+    .and_then(|result| result)
+}
+
+fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
+    let parsed = deserializer::deserialize(bytecode, encode_key)?;
+    let Bytecode::Chunk(chunk) = parsed else {
+        let Bytecode::Error(message) = parsed else {
+            unreachable!()
+        };
+        return Err(message);
+    };
+
+    decompile_chunk(chunk)
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "decompiler panicked with an unknown error".to_owned()
+    }
+}
+
+fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, String> {
+    let mut lifted = Vec::new();
+    let mut stack = vec![(Arc::<Mutex<ast::Function>>::default(), chunk.main)];
+    while let Some((ast_func, func_id)) = stack.pop() {
+        let (function, upvalues, child_functions) =
+            Lifter::lift(&chunk.functions, &chunk.string_table, func_id);
+        lifted.push((ast_func, function, upvalues));
+        stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+    }
+
+    let (main, ..) = lifted.first().unwrap().clone();
+    let mut upvalues = lifted
+        .into_iter()
+        .map(|(ast_function, function, upvalues_in)| {
+            use std::{backtrace::Backtrace, cell::RefCell, fmt::Write, panic};
+
+            thread_local! {
+                static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
             }
 
-            let (main, ..) = lifted.first().unwrap().clone();
-            let mut upvalues = lifted
-                .into_iter()
-                .map(|(ast_function, function, upvalues_in)| {
-                    use std::{backtrace::Backtrace, cell::RefCell, fmt::Write, panic};
+            let function_id = function.id;
+            let mut args =
+                std::panic::AssertUnwindSafe(Some((ast_function.clone(), function, upvalues_in)));
 
-                    thread_local! {
-                        static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
-                    }
+            let prev_hook = panic::take_hook();
+            panic::set_hook(Box::new(|_| {
+                let trace = Backtrace::capture();
+                BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
+            }));
+            let result = panic::catch_unwind(move || {
+                let (ast_function, function, upvalues_in) = args.take().unwrap();
+                decompile_function(ast_function, function, upvalues_in)
+            });
+            panic::set_hook(prev_hook);
 
-                    let function_id = function.id;
-                    let mut args = std::panic::AssertUnwindSafe(Some((
-                        ast_function.clone(),
-                        function,
-                        upvalues_in,
-                    )));
+            match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let panic_information = match e.downcast::<String>() {
+                        Ok(v) => *v,
+                        Err(e) => match e.downcast::<&str>() {
+                            Ok(v) => v.to_string(),
+                            _ => "Unknown Source of Error".to_owned(),
+                        },
+                    };
 
-                    let prev_hook = panic::take_hook();
-                    panic::set_hook(Box::new(|_| {
-                        let trace = Backtrace::capture();
-                        BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
-                    }));
-                    let result = panic::catch_unwind(move || {
-                        let (ast_function, function, upvalues_in) = args.take().unwrap();
-                        decompile_function(ast_function, function, upvalues_in)
-                    });
-                    panic::set_hook(prev_hook);
+                    let mut message = String::new();
+                    writeln!(message, "failed to decompile").unwrap();
+                    // writeln!(message, "function {} panicked at '{}'", function_id, panic_information).unwrap();
+                    // if let Some(backtrace) = BACKTRACE.with(|b| b.borrow_mut().take()) {
+                    //     write!(message, "stack backtrace:\n{}", backtrace).unwrap();
+                    // }
 
-                    match result {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let panic_information = match e.downcast::<String>() {
-                                Ok(v) => *v,
-                                Err(e) => match e.downcast::<&str>() {
-                                    Ok(v) => v.to_string(),
-                                    _ => "Unknown Source of Error".to_owned(),
-                                },
-                            };
+                    ast_function.lock().body.extend(
+                        message
+                            .trim_end()
+                            .split('\n')
+                            .map(|s| ast::Comment::new(s.to_string()).into()),
+                    );
+                    (ByAddress(ast_function), Vec::new())
+                }
+            }
+        })
+        .collect::<FxHashMap<_, _>>();
 
-                            let mut message = String::new();
-                            writeln!(message, "failed to decompile").unwrap();
-                            // writeln!(message, "function {} panicked at '{}'", function_id, panic_information).unwrap();
-                            // if let Some(backtrace) = BACKTRACE.with(|b| b.borrow_mut().take()) {
-                            //     write!(message, "stack backtrace:\n{}", backtrace).unwrap();
-                            // }
+    let main = ByAddress(main);
+    upvalues.remove(&main);
+    let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
+    link_upvalues(&mut body, &mut upvalues);
+    if block_contains_unsupported_jump(&mut body) {
+        return Err("control-flow structuring left unsupported goto or label nodes".to_owned());
+    }
+    name_locals(&mut body, true);
+    Ok(body.to_string())
+}
 
-                            ast_function.lock().body.extend(
-                                message
-                                    .trim_end()
-                                    .split('\n')
-                                    .map(|s| ast::Comment::new(s.to_string()).into()),
-                            );
-                            (ByAddress(ast_function), Vec::new())
-                        }
-                    }
-                })
-                .collect::<FxHashMap<_, _>>();
-
-            let main = ByAddress(main);
-            upvalues.remove(&main);
-            let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
-            link_upvalues(&mut body, &mut upvalues);
-            name_locals(&mut body, true);
-            body.to_string()
+fn block_contains_unsupported_jump(block: &mut ast::Block) -> bool {
+    for statement in &mut block.0 {
+        if matches!(
+            statement,
+            ast::Statement::Goto(_) | ast::Statement::Label(_)
+        ) {
+            return true;
         }
+
+        let nested_jump = match statement {
+            ast::Statement::If(r#if) => {
+                block_contains_unsupported_jump(&mut r#if.then_block.lock())
+                    || block_contains_unsupported_jump(&mut r#if.else_block.lock())
+            }
+            ast::Statement::While(r#while) => {
+                block_contains_unsupported_jump(&mut r#while.block.lock())
+            }
+            ast::Statement::Repeat(repeat) => {
+                block_contains_unsupported_jump(&mut repeat.block.lock())
+            }
+            ast::Statement::NumericFor(numeric_for) => {
+                block_contains_unsupported_jump(&mut numeric_for.block.lock())
+            }
+            ast::Statement::GenericFor(generic_for) => {
+                block_contains_unsupported_jump(&mut generic_for.block.lock())
+            }
+            _ => false,
+        };
+        if nested_jump {
+            return true;
+        }
+
+        let mut closure_jump = false;
+        statement.traverse_rvalues(&mut |rvalue| {
+            if !closure_jump && let ast::RValue::Closure(closure) = rvalue {
+                closure_jump = block_contains_unsupported_jump(&mut closure.function.lock().body);
+            }
+        });
+        if closure_jump {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::block_contains_unsupported_jump;
+
+    #[test]
+    fn rejects_unsupported_jump_nodes() {
+        let label = ast::Label("exit".to_owned());
+        let mut body = ast::Block(vec![ast::Goto::new(label).into()]);
+
+        assert!(block_contains_unsupported_jump(&mut body));
     }
 }
 

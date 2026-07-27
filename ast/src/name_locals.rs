@@ -11,10 +11,10 @@ struct Namer {
 
 impl Namer {
     fn name_local(&mut self, prefix: &str, local: &RcLocal) {
-        let mut lock = local.0 .0.lock();
+        let mut lock = local.0.0.lock();
         if self.rename || lock.0.is_none() {
             // TODO: hacky and slow
-            if Arc::count(&local.0 .0) == 1 {
+            if Arc::count(&local.0.0) == 1 {
                 lock.0 = Some("_".to_string());
             } else {
                 let prefix = prefix.to_string()
@@ -47,6 +47,18 @@ impl Namer {
                     for lvalue in &assign.left {
                         self.name_local("v", lvalue.as_local().unwrap());
                     }
+                }
+                Statement::Class(class) => {
+                    let name = if crate::Formatter::<String>::is_valid_name(
+                        class.source_name.as_bytes(),
+                    ) {
+                        class.source_name.clone()
+                    } else {
+                        let generated = format!("v{}", self.counter);
+                        self.counter += 1;
+                        generated
+                    };
+                    class.target.0.0.lock().0 = Some(name);
                 }
                 Statement::If(r#if) => {
                     self.name_locals(&mut r#if.then_block.lock());

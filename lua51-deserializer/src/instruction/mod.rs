@@ -1,6 +1,6 @@
 use nom::{
-    error::{Error, ErrorKind, ParseError},
     Err, IResult,
+    error::{Error, ErrorKind, ParseError},
 };
 use num_traits::ToPrimitive;
 
@@ -397,7 +397,7 @@ impl Instruction {
                 return Err(Err::Failure(Error::from_error_kind(
                     input,
                     ErrorKind::Switch,
-                )))
+                )));
             }
         };
 

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{has_side_effects, LocalRw, SideEffects, Traverse};
+use crate::{LocalRw, SideEffects, Traverse, has_side_effects};
 
 // TODO: Rc
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,6 +47,6 @@ impl LocalRw for Goto {}
 
 impl fmt::Display for Goto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "goto {}", self.0 .0)
+        write!(f, "goto {}", self.0.0)
     }
 }

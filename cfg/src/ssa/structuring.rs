@@ -2,10 +2,10 @@ use ast::{LocalRw, Reduce, SideEffects, Traverse, UnaryOperation};
 
 use itertools::Itertools;
 use petgraph::{
+    Direction,
     algo::dominators::Dominators,
     stable_graph::{EdgeIndex, NodeIndex},
     visit::{DfsPostOrder, EdgeRef},
-    Direction,
 };
 use rustc_hash::FxHashMap;
 use tuple::Map;
@@ -354,7 +354,12 @@ fn is_truthy(rvalue: ast::RValue) -> Option<bool> {
             ..
         }) => Some(true),
         ast::RValue::Literal(
-            ast::Literal::Boolean(true) | ast::Literal::Number(_) | ast::Literal::String(_),
+            ast::Literal::Boolean(true)
+            | ast::Literal::Number(_)
+            | ast::Literal::Integer(_)
+            | ast::Literal::String(_)
+            | ast::Literal::Vector(..)
+            | ast::Literal::VectorD(..),
         )
         | ast::RValue::Table(_)
         | ast::RValue::Closure(_) => Some(true),
@@ -393,7 +398,7 @@ fn make_bool_conditional(
             None if !then_value.has_side_effects() => {
                 let value = match &r#if.condition {
                     ast::RValue::Binary(ast::Binary {
-                        right: box ref value,
+                        right: box value,
                         operation: ast::BinaryOperation::And,
                         ..
                     }) => value,
