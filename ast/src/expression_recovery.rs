@@ -2,7 +2,7 @@ use rustc_hash::FxHashSet;
 
 use crate::{
     Assign, Binary, BinaryOperation, Block, Conditional, LValue, LocalRw, RValue, RcLocal,
-    Statement, UnaryOperation,
+    SideEffects, Statement, Traverse, UnaryOperation,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,162 @@ fn short_circuit_operator(condition: &RValue, target: &RcLocal) -> Option<Binary
     }
 }
 
+fn is_structured(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::If(_)
+            | Statement::While(_)
+            | Statement::Repeat(_)
+            | Statement::NumericFor(_)
+            | Statement::GenericFor(_)
+    )
+}
+
+fn inline_candidate(statement: &Statement) -> Option<(RcLocal, RValue)> {
+    let assign = statement.as_assign()?;
+    if assign.prefix || assign.parallel || assign.left.len() != 1 || assign.right.len() != 1 {
+        return None;
+    }
+    let LValue::Local(target) = &assign.left[0] else {
+        return None;
+    };
+    let value = &assign.right[0];
+    if matches!(
+        value,
+        RValue::Local(_)
+            | RValue::Closure(_)
+            | RValue::Table(_)
+            | RValue::VarArg(_)
+            | RValue::Select(crate::Select::VarArg(_))
+    ) || value.values_read().contains(&target)
+    {
+        return None;
+    }
+    Some((target.clone(), value.clone()))
+}
+
+fn single_read_statement(block: &Block, start: usize, target: &RcLocal) -> Option<usize> {
+    let mut read_at = None;
+    for (index, statement) in block.iter().enumerate().skip(start) {
+        if is_structured(statement) || statement.values_written().contains(&target) {
+            return None;
+        }
+        for read in statement.values_read() {
+            if read == target {
+                if read_at.is_some() {
+                    return None;
+                }
+                read_at = Some(index);
+            }
+        }
+    }
+    read_at
+}
+
+fn has_observable_effect(value: &RValue) -> bool {
+    value.has_side_effects()
+        && !matches!(
+            value,
+            RValue::Global(global)
+                if global.origin() == crate::GlobalOrigin::CompilerImport
+        )
+}
+
+fn replace_local_before_effect(
+    value: &mut RValue,
+    target: &RcLocal,
+    replacement: &RValue,
+    crossed_effect: &mut bool,
+) -> Option<bool> {
+    if matches!(value, RValue::Local(local) if local == target) {
+        if *crossed_effect {
+            return Some(false);
+        }
+        *value = replacement.clone();
+        return Some(true);
+    }
+
+    for child in value.rvalues_mut() {
+        if let Some(replaced) =
+            replace_local_before_effect(child, target, replacement, crossed_effect)
+        {
+            return Some(replaced);
+        }
+    }
+    if has_observable_effect(value) {
+        *crossed_effect = true;
+    }
+    None
+}
+
+fn replace_in_consumer(statement: &mut Statement, target: &RcLocal, replacement: &RValue) -> bool {
+    if !matches!(
+        statement,
+        Statement::Assign(_)
+            | Statement::Call(_)
+            | Statement::MethodCall(_)
+            | Statement::Return(_)
+            | Statement::SetList(_)
+    ) {
+        return false;
+    }
+
+    let mut crossed_effect = false;
+    for value in statement.rvalues_mut() {
+        if let Some(replaced) =
+            replace_local_before_effect(value, target, replacement, &mut crossed_effect)
+        {
+            return replaced;
+        }
+    }
+    false
+}
+
+fn inline_block_once(block: &mut Block, protected: &FxHashSet<RcLocal>) -> usize {
+    let mut removed = 0;
+    let mut index = 0;
+    while index < block.len() {
+        let Some((target, value)) = inline_candidate(&block[index]) else {
+            index += 1;
+            continue;
+        };
+        if protected.contains(&target) {
+            index += 1;
+            continue;
+        }
+        let Some(read_at) = single_read_statement(block, index + 1, &target) else {
+            index += 1;
+            continue;
+        };
+        let source_reads = value
+            .values_read()
+            .into_iter()
+            .cloned()
+            .collect::<FxHashSet<_>>();
+        if block[index + 1..read_at]
+            .iter()
+            .any(SideEffects::has_side_effects)
+            || block[index + 1..=read_at].iter().any(|statement| {
+                statement
+                    .values_written()
+                    .into_iter()
+                    .any(|written| source_reads.contains(written))
+            })
+        {
+            index += 1;
+            continue;
+        }
+
+        if !replace_in_consumer(&mut block[read_at], &target, &value) {
+            index += 1;
+            continue;
+        }
+        block.remove(index);
+        removed += 1;
+    }
+    removed
+}
+
 fn try_extend_short_circuit(
     first: &mut Statement,
     second: &Statement,
@@ -153,6 +309,14 @@ fn recover_block(block: &mut Block, protected: &FxHashSet<RcLocal>) -> Expressio
             index += 1;
         }
     }
+
+    loop {
+        let inlined = inline_block_once(block, protected);
+        stats.inlined_temporaries += inlined;
+        if inlined == 0 {
+            break;
+        }
+    }
     stats
 }
 
@@ -169,7 +333,7 @@ pub fn recover_expressions_with_protected(
 mod tests {
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Global, If, LValue, Literal, Local, RValue,
-        RcLocal, Unary, UnaryOperation, recover_expressions_with_protected,
+        RcLocal, Return, Select, Unary, UnaryOperation, recover_expressions_with_protected,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -352,6 +516,123 @@ mod tests {
         let stats = recover_expressions_with_protected(&mut block, std::slice::from_ref(&result));
 
         assert_eq!(stats.short_circuits, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn inlines_single_use_expression_into_return() {
+        let input = local("input");
+        let temporary = local("temporary");
+        let arithmetic = Binary::new(
+            input.into(),
+            Literal::Number(1.0).into(),
+            BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            assign(&temporary, arithmetic.into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 1);
+        assert_eq!(block.to_string(), "return input + 1");
+    }
+
+    #[test]
+    fn inlines_single_selected_call_without_opening_return_arity() {
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let mut block = Block(vec![
+            assign(&temporary, selected.into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 1);
+        assert_eq!(block.to_string(), "return (produce())");
+    }
+
+    #[test]
+    fn keeps_call_result_when_consumer_has_an_earlier_call() {
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let other = Call::new(Global::from("other").into(), Vec::new());
+        let mut block = Block(vec![
+            assign(&temporary, selected.into()),
+            Return::new(vec![other.into(), temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_expression_across_source_write() {
+        let source = local("source");
+        let temporary = local("temporary");
+        let arithmetic = Binary::new(
+            source.clone().into(),
+            Literal::Number(1.0).into(),
+            BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            assign(&temporary, arithmetic.into()),
+            assign(&source, Literal::Integer(2).into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn keeps_expression_across_observable_work() {
+        let input = local("input");
+        let object = local("object");
+        let temporary = local("temporary");
+        let observed = local("observed");
+        let arithmetic = Binary::new(
+            input.into(),
+            Literal::Number(1.0).into(),
+            BinaryOperation::Add,
+        );
+        let index = crate::Index::new(object.into(), Literal::String(b"value".to_vec()).into());
+        let mut block = Block(vec![
+            assign(&temporary, arithmetic.into()),
+            assign(&observed, index.into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn keeps_expression_for_protected_target() {
+        let input = local("input");
+        let temporary = local("temporary");
+        let arithmetic = Binary::new(
+            input.into(),
+            Literal::Number(1.0).into(),
+            BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            assign(&temporary, arithmetic.into()),
+            Return::new(vec![temporary.clone().into()]).into(),
+        ]);
+
+        let stats =
+            recover_expressions_with_protected(&mut block, std::slice::from_ref(&temporary));
+
+        assert_eq!(stats.inlined_temporaries, 0);
         assert_eq!(block.len(), 2);
     }
 }

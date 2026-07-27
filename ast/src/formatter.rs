@@ -774,7 +774,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             } else {
                 write!(self.output, ", ")?;
             }
+            let wrap = i + 1 == r#return.values.len() && matches!(rvalue, RValue::Select(_));
+            if wrap {
+                write!(self.output, "(")?;
+            }
             self.format_rvalue(rvalue)?;
+            if wrap {
+                write!(self.output, ")")?;
+            }
         }
 
         Ok(())
