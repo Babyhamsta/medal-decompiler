@@ -5,7 +5,7 @@ use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use petgraph::{
-    algo::dominators::{simple_fast, Dominators},
+    algo::dominators::{Dominators, simple_fast},
     stable_graph::{EdgeIndex, NodeIndex, StableDiGraph},
     visit::*,
 };
@@ -194,6 +194,34 @@ impl GraphStructurer {
         }
     }
 
+    fn split_edge_target(&mut self, edge: EdgeIndex) -> bool {
+        let Some((source, target)) = self.function.graph().edge_endpoints(edge) else {
+            return false;
+        };
+        if self.is_loop_header(target) || source == target {
+            return false;
+        }
+
+        let target_block = self.function.block(target).unwrap().clone();
+        let outgoing = self
+            .function
+            .graph()
+            .edges(target)
+            .map(|edge| (edge.target(), edge.weight().clone()))
+            .collect::<Vec<_>>();
+        let incoming = self.function.graph_mut().remove_edge(edge).unwrap();
+        let duplicate = self.function.graph_mut().add_node(target_block);
+        self.function
+            .graph_mut()
+            .add_edge(source, duplicate, incoming);
+        for (successor, edge) in outgoing {
+            self.function
+                .graph_mut()
+                .add_edge(duplicate, successor, edge);
+        }
+        true
+    }
+
     fn remove_last_return(block: ast::Block) -> ast::Block {
         if let Some(ast::Statement::Return(last_statement)) = block.last() {
             if last_statement.values.is_empty() {
@@ -238,9 +266,14 @@ impl GraphStructurer {
                     continue;
                 }
 
-                self.insert_goto_for_edge(edge);
-                self.find_loop_headers();
-                changed = self.match_blocks();
+                if self.split_edge_target(edge) {
+                    self.find_loop_headers();
+                    changed = self.match_blocks();
+                } else {
+                    self.insert_goto_for_edge(edge);
+                    self.find_loop_headers();
+                    changed = self.match_blocks();
+                }
                 if changed {
                     break;
                 }

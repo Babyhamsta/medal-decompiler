@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use triomphe::Arc;
 
-use crate::{formatter::Formatter, has_side_effects, Block, LocalRw, RValue, RcLocal, Traverse};
+use crate::{Block, LocalRw, RValue, RcLocal, Traverse, formatter::Formatter, has_side_effects};
 use std::fmt;
 
 #[derive(Debug, Clone)]

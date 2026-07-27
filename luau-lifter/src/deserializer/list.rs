@@ -1,4 +1,4 @@
-use nom::{multi::count, IResult};
+use nom::{IResult, multi::count};
 use nom_leb128::leb128_usize;
 
 pub(crate) fn parse_list<'a, T>(

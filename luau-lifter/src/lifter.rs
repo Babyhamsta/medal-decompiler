@@ -149,7 +149,8 @@ impl<'a> Lifter<'a> {
                     OpCode::LOP_JUMP
                     | OpCode::LOP_JUMPBACK
                     | OpCode::LOP_JUMPIF
-                    | OpCode::LOP_JUMPIFNOT => {
+                    | OpCode::LOP_JUMPIFNOT
+                    | OpCode::LOP_CMPPROTO => {
                         let dest_index = (insn_index + 1).checked_add_signed((*d).into()).unwrap();
                         self.blocks
                             .entry(insn_index + 1)
@@ -246,7 +247,8 @@ impl<'a> Lifter<'a> {
         block_start: usize,
         block_end: usize,
     ) -> (Vec<ast::Statement>, Vec<(NodeIndex, BlockEdge)>) {
-        let mut statements = Vec::with_capacity((block_start..=block_end).count());
+        let mut statements: Vec<ast::Statement> =
+            Vec::with_capacity((block_start..=block_end).count());
         let mut edges = Vec::new();
 
         let mut top: Option<(ast::RValue, u8)> = None;
@@ -347,10 +349,15 @@ impl<'a> Lifter<'a> {
                             .into(),
                         );
                     }
-                    OpCode::LOP_GETTABLEKS => {
+                    OpCode::LOP_GETTABLEKS | OpCode::LOP_GETUDATAKS => {
                         let target = self.register(a as _);
                         let table = self.register(b as _);
-                        let key = self.constant(aux as _);
+                        let key_index = if op_code == OpCode::LOP_GETUDATAKS {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let key = self.constant(key_index as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![target.into()],
@@ -383,10 +390,15 @@ impl<'a> Lifter<'a> {
                             .into(),
                         );
                     }
-                    OpCode::LOP_SETTABLEKS => {
+                    OpCode::LOP_SETTABLEKS | OpCode::LOP_SETUDATAKS => {
                         let value = self.register(a as _);
                         let table = self.register(b as _);
-                        let key = self.constant(aux as _);
+                        let key_index = if op_code == OpCode::LOP_SETUDATAKS {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let key = self.constant(key_index as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![ast::Index::new(table.into(), key.into()).into()],
@@ -500,10 +512,15 @@ impl<'a> Lifter<'a> {
                     | OpCode::LOP_FASTCALL2
                     | OpCode::LOP_FASTCALL2K
                     | OpCode::LOP_FASTCALL3 => {}
-                    OpCode::LOP_NAMECALL => {
+                    OpCode::LOP_NAMECALL | OpCode::LOP_NAMECALLUDATA => {
                         let namecall_base = a;
                         let namecall_object = self.register(b as _);
-                        let namecall_method = match self.constant(aux as usize) {
+                        let key_index = if op_code == OpCode::LOP_NAMECALLUDATA {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let namecall_method = match self.constant(key_index as usize) {
                             ast::Literal::String(string) => String::from_utf8(string).unwrap(),
                             _ => unreachable!(),
                         };
@@ -516,7 +533,7 @@ impl<'a> Lifter<'a> {
                         ));
                         match iter.next().unwrap().1 {
                             &Instruction::BC {
-                                op_code: OpCode::LOP_CALL,
+                                op_code: OpCode::LOP_CALL | OpCode::LOP_CALLFB,
                                 a,
                                 b,
                                 c,
@@ -564,7 +581,7 @@ impl<'a> Lifter<'a> {
                             instruction => unreachable!("{:?}", instruction),
                         }
                     }
-                    OpCode::LOP_CALL => {
+                    OpCode::LOP_CALL | OpCode::LOP_CALLFB => {
                         let arguments = if b != 0 {
                             (a + 1..a + b)
                                 .map(|r| self.register(r as _).into())
@@ -602,6 +619,53 @@ impl<'a> Lifter<'a> {
                             .map(|i| self.register(i as _))
                             .collect();
                         statements.push(ast::Close { locals }.into());
+                    }
+                    OpCode::LOP_NEWCLASSMEMBER => {
+                        let class = self.register(a as _);
+                        let value = self.register(c as _);
+                        let member_name = self.constant_string(aux as _);
+                        let inline_method = statements.last().and_then(|statement| {
+                            let assign = statement.as_assign()?;
+                            if assign.left.len() == 1
+                                && assign.right.len() == 1
+                                && matches!(
+                                    &assign.left[0],
+                                    ast::LValue::Local(local) if local == &value
+                                )
+                                && matches!(&assign.right[0], ast::RValue::Closure(_))
+                            {
+                                Some(assign.right[0].clone())
+                            } else {
+                                None
+                            }
+                        });
+                        let method = if let Some(method) = inline_method {
+                            statements.pop();
+                            method
+                        } else {
+                            value.into()
+                        };
+                        if let Some(class_statement) = statements.iter_mut().rev().find_map(|s| {
+                            s.as_class_mut()
+                                .filter(|statement| statement.target == class)
+                        }) {
+                            class_statement.methods.push((member_name, method));
+                        } else {
+                            statements.push(
+                                ast::Assign::new(
+                                    vec![
+                                        ast::Index::new(
+                                            class.into(),
+                                            ast::Literal::String(member_name.as_bytes().to_vec())
+                                                .into(),
+                                        )
+                                        .into(),
+                                    ],
+                                    vec![method],
+                                )
+                                .into(),
+                            );
+                        }
                     }
                     OpCode::LOP_SETLIST => {
                         let setlist = if c != 0 {
@@ -656,48 +720,56 @@ impl<'a> Lifter<'a> {
                     OpCode::LOP_AND => statements.push(
                         ast::Assign::new(
                             vec![self.register(a as _).into()],
-                            vec![ast::Binary::new(
-                                self.register(b as _).into(),
-                                self.register(c as _).into(),
-                                ast::BinaryOperation::And,
-                            )
-                            .into()],
+                            vec![
+                                ast::Binary::new(
+                                    self.register(b as _).into(),
+                                    self.register(c as _).into(),
+                                    ast::BinaryOperation::And,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     ),
                     OpCode::LOP_ANDK => statements.push(
                         ast::Assign::new(
                             vec![self.register(a as _).into()],
-                            vec![ast::Binary::new(
-                                self.register(b as _).into(),
-                                self.constant(c as _).into(),
-                                ast::BinaryOperation::And,
-                            )
-                            .into()],
+                            vec![
+                                ast::Binary::new(
+                                    self.register(b as _).into(),
+                                    self.constant(c as _).into(),
+                                    ast::BinaryOperation::And,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     ),
                     OpCode::LOP_OR => statements.push(
                         ast::Assign::new(
                             vec![self.register(a as _).into()],
-                            vec![ast::Binary::new(
-                                self.register(b as _).into(),
-                                self.register(c as _).into(),
-                                ast::BinaryOperation::Or,
-                            )
-                            .into()],
+                            vec![
+                                ast::Binary::new(
+                                    self.register(b as _).into(),
+                                    self.register(c as _).into(),
+                                    ast::BinaryOperation::Or,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     ),
                     OpCode::LOP_ORK => statements.push(
                         ast::Assign::new(
                             vec![self.register(a as _).into()],
-                            vec![ast::Binary::new(
-                                self.register(b as _).into(),
-                                self.constant(c as _).into(),
-                                ast::BinaryOperation::Or,
-                            )
-                            .into()],
+                            vec![
+                                ast::Binary::new(
+                                    self.register(b as _).into(),
+                                    self.constant(c as _).into(),
+                                    ast::BinaryOperation::Or,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     ),
@@ -744,6 +816,35 @@ impl<'a> Lifter<'a> {
                         let statement =
                             ast::Assign::new(vec![target.into()], vec![constant.into()]);
                         statements.push(statement.into());
+                    }
+                    OpCode::LOP_LOADKX => {
+                        let target = self.register(a as _);
+                        match self.function_list[self.function.id]
+                            .constants
+                            .get(aux as usize)
+                            .expect("LOADKX constant index must be valid")
+                        {
+                            BytecodeConstant::ClassShape {
+                                class_name,
+                                properties,
+                                ..
+                            } => {
+                                let source_name = self.constant_string(*class_name);
+                                let properties = properties
+                                    .iter()
+                                    .map(|index| self.constant_string(*index))
+                                    .collect();
+                                statements
+                                    .push(ast::Class::new(target, source_name, properties).into());
+                            }
+                            _ => {
+                                let constant = self.constant(aux as usize);
+                                statements.push(
+                                    ast::Assign::new(vec![target.into()], vec![constant.into()])
+                                        .into(),
+                                );
+                            }
+                        }
                     }
                     OpCode::LOP_LOADN => {
                         let target = self.register(a as _);
@@ -980,6 +1081,17 @@ impl<'a> Lifter<'a> {
                             BlockEdge::new(BranchType::Unconditional),
                         ));
                     }
+                    OpCode::LOP_CMPPROTO => {
+                        // CMPPROTO guards an optimized inlined path using a runtime-only
+                        // prototype id. Luau source cannot express that identity test, so
+                        // retain the generic fallback path that the guard jumps to.
+                        edges.push((
+                            self.block_to_node(
+                                ((block_start + index + 1) as isize + d as isize) as usize,
+                            ),
+                            BlockEdge::new(BranchType::Unconditional),
+                        ));
+                    }
                     OpCode::LOP_JUMPXEQKNIL => {
                         let a = self.register(a as _);
                         statements.push(
@@ -1191,10 +1303,36 @@ impl<'a> Lifter<'a> {
                         ));
                     }
                     OpCode::LOP_DUPTABLE => {
+                        let entries = match self.function_list[self.function.id]
+                            .constants
+                            .get(d as usize)
+                        {
+                            Some(BytecodeConstant::Table { entries }) => entries.clone(),
+                            other => panic!("DUPTABLE expected table constant, got {other:?}"),
+                        };
+                        let mut values = Vec::with_capacity(entries.len());
+                        for (key_index, value_index) in entries {
+                            let key = self.constant(key_index);
+                            let value = match value_index {
+                                Some(value_index)
+                                    if matches!(
+                                        self.function_list[self.function.id]
+                                            .constants
+                                            .get(value_index),
+                                        Some(BytecodeConstant::Nil)
+                                    ) =>
+                                {
+                                    continue;
+                                }
+                                Some(value_index) => self.constant(value_index),
+                                None => ast::Literal::Number(0.0),
+                            };
+                            values.push((Some(key.into()), value.into()));
+                        }
                         statements.push(
                             ast::Assign::new(
                                 vec![self.register(a as _).into()],
-                                vec![ast::Table::default().into()],
+                                vec![ast::Table(values).into()],
                             )
                             .into(),
                         );
@@ -1255,11 +1393,13 @@ impl<'a> Lifter<'a> {
                         statements.push(
                             ast::Assign::new(
                                 vec![dest_local.into()],
-                                vec![ast::Closure {
-                                    function: ByAddress(function),
-                                    upvalues: upvalues_passed,
-                                }
-                                .into()],
+                                vec![
+                                    ast::Closure {
+                                        function: ByAddress(function),
+                                        upvalues: upvalues_passed,
+                                    }
+                                    .into(),
+                                ],
                             )
                             .into(),
                         );
@@ -1315,17 +1455,35 @@ impl<'a> Lifter<'a> {
             BytecodeConstant::Nil => ast::Literal::Nil,
             BytecodeConstant::Boolean(v) => ast::Literal::Boolean(*v),
             BytecodeConstant::Number(v) => ast::Literal::Number(*v),
+            BytecodeConstant::Integer(v) => ast::Literal::Integer(*v),
             BytecodeConstant::String(v) => {
                 // TODO: what does the official deserializer do if v == 0?
                 ast::Literal::String(self.string_table[*v - 1].clone())
             }
-            BytecodeConstant::Vector(x, y, z, _) => ast::Literal::Vector(*x, *y, *z),
+            BytecodeConstant::VectorF(x, y, z, _) => ast::Literal::Vector(*x, *y, *z),
+            BytecodeConstant::VectorD(x, y, z, _) => ast::Literal::VectorD(*x, *y, *z),
             _ => unimplemented!(),
         };
         self.constant_map
             .entry(index)
             .or_insert(converted_constant)
             .clone()
+    }
+
+    fn constant_string(&self, index: usize) -> String {
+        let BytecodeConstant::String(string_index) = self.function_list[self.function.id]
+            .constants
+            .get(index)
+            .expect("string constant index must be valid")
+        else {
+            panic!("constant {index} is not a string");
+        };
+        String::from_utf8_lossy(
+            self.string_table
+                .get(*string_index - 1)
+                .expect("string table index must be valid"),
+        )
+        .into_owned()
     }
 
     fn block_to_node(&self, insn_index: usize) -> NodeIndex {
@@ -1343,6 +1501,7 @@ impl<'a> Lifter<'a> {
                 op_code,
                 OpCode::LOP_JUMP
                     | OpCode::LOP_JUMPBACK
+                    | OpCode::LOP_CMPPROTO
                     | OpCode::LOP_JUMPIF
                     | OpCode::LOP_JUMPIFNOT
                     | OpCode::LOP_JUMPIFEQ

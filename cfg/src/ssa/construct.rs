@@ -4,9 +4,9 @@ use ast::{LocalRw, RcLocal, Traverse};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use petgraph::{
+    Direction,
     stable_graph::NodeIndex,
     visit::{Dfs, EdgeRef, Walker},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -647,10 +647,12 @@ pub fn construct(
     // if entry has predecessors, this might risk it never being incomplete
     // resulting in broken params
     // TODO: verify ^ and insert temporary entry that's removed if there is no block params (if its an issue)
-    assert!(function
-        .predecessor_blocks(function.entry().unwrap())
-        .next()
-        .is_none());
+    assert!(
+        function
+            .predecessor_blocks(function.entry().unwrap())
+            .next()
+            .is_none()
+    );
     let mut new_upvalues_in = IndexMap::with_capacity(upvalues_in.len());
     for upvalue in upvalues_in {
         new_upvalues_in.insert(upvalue.clone(), FxHashSet::default());

@@ -93,6 +93,11 @@ impl Reduce for Unary {
             (RValue::Literal(Literal::Number(value)), UnaryOperation::Negate) => {
                 RValue::Literal(Literal::Number(-value))
             }
+            (RValue::Literal(Literal::Integer(value)), UnaryOperation::Negate)
+                if value != i64::MIN =>
+            {
+                RValue::Literal(Literal::Integer(-value))
+            }
             (RValue::Literal(Literal::String(value)), UnaryOperation::Length) => {
                 // TODO: is this accurate w/ unicode in Luau?
                 RValue::Literal(Literal::Number(value.len() as f64))
@@ -242,6 +247,11 @@ impl Reduce for Unary {
             ) => value.reduce_condition(),
             (RValue::Literal(Literal::Number(value)), UnaryOperation::Negate) => {
                 RValue::Literal(Literal::Number(-value))
+            }
+            (RValue::Literal(Literal::Integer(value)), UnaryOperation::Negate)
+                if value != i64::MIN =>
+            {
+                RValue::Literal(Literal::Integer(-value))
             }
             // __len has to return number, numbers are always truthy
             (_, UnaryOperation::Length) => RValue::Literal(Literal::Boolean(true)),

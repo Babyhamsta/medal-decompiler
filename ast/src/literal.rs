@@ -3,8 +3,8 @@ use enum_as_inner::EnumAsInner;
 use std::fmt;
 
 use crate::{
-    formatter::Formatter, type_system::Infer, LocalRw, Reduce, SideEffects, Traverse, Type,
-    TypeSystem,
+    LocalRw, Reduce, SideEffects, Traverse, Type, TypeSystem, formatter::Formatter,
+    type_system::Infer,
 };
 
 #[derive(Debug, From, Clone, PartialEq, PartialOrd, EnumAsInner)]
@@ -12,8 +12,10 @@ pub enum Literal {
     Nil,
     Boolean(bool),
     Number(f64),
+    Integer(i64),
     String(Vec<u8>),
     Vector(f32, f32, f32),
+    VectorD(f64, f64, f64),
 }
 
 impl Reduce for Literal {
@@ -26,8 +28,10 @@ impl Reduce for Literal {
             Literal::Boolean(false) | Literal::Nil => false,
             Literal::Boolean(true)
             | Literal::Number(_)
+            | Literal::Integer(_)
             | Literal::String(_)
-            | Literal::Vector(..) => true,
+            | Literal::Vector(..)
+            | Literal::VectorD(..) => true,
         })
         .into()
     }
@@ -39,8 +43,9 @@ impl Infer for Literal {
             Literal::Nil => Type::Nil,
             Literal::Boolean(_) => Type::Boolean,
             Literal::Number(_) => Type::Number,
+            Literal::Integer(_) => Type::Integer,
             Literal::String(_) => Type::String,
-            Literal::Vector(..) => Type::Vector,
+            Literal::Vector(..) | Literal::VectorD(..) => Type::Vector,
         }
     }
 }
@@ -71,6 +76,10 @@ impl fmt::Display for Literal {
                 let printed = buffer.format_finite(value);
                 write!(f, "{}", printed.strip_suffix(".0").unwrap_or(printed))
             }
+            Literal::Integer(value) if *value == i64::MIN => {
+                write!(f, "(-9223372036854775807i - 1i)")
+            }
+            Literal::Integer(value) => write!(f, "{value}i"),
             Literal::String(value) => {
                 write!(
                     f,
@@ -79,6 +88,32 @@ impl fmt::Display for Literal {
                 )
             }
             Literal::Vector(x, y, z) => write!(f, "Vector3.new({}, {}, {})", x, y, z),
+            Literal::VectorD(x, y, z) => write!(f, "Vector3.new({}, {}, {})", x, y, z),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Literal;
+
+    #[test]
+    fn formats_exact_integer_literals() {
+        assert_eq!(
+            Literal::Integer(9_007_199_254_740_993).to_string(),
+            "9007199254740993i"
+        );
+        assert_eq!(
+            Literal::Integer(i64::MIN).to_string(),
+            "(-9223372036854775807i - 1i)"
+        );
+    }
+
+    #[test]
+    fn formats_double_vector_literals() {
+        assert_eq!(
+            Literal::VectorD(1.25, 2.5, 3.75).to_string(),
+            "Vector3.new(1.25, 2.5, 3.75)"
+        );
     }
 }

@@ -49,7 +49,7 @@ impl<'a> Labeller<'a, NodeIndex, EdgeIndex> for FunctionLabeller<'a> {
                 .iter()
                 .map(|s| {
                     for local in s.values() {
-                        let name = &mut local.0 .0.lock().0;
+                        let name = &mut local.0.0.lock().0;
                         if name.is_none() {
                             // TODO: ugly
                             *name = Some(format!("v{}", self.counter.borrow()));

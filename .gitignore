@@ -4,3 +4,7 @@ target/
 Cargo.lock
 flamegraph.svg
 result.lua
+/tests/luau_corpus/results/
+/.tools/
+__pycache__/
+*.pyc

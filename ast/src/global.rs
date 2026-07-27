@@ -1,7 +1,7 @@
 use derive_more::From;
 use std::fmt;
 
-use crate::{formatter::Formatter, LocalRw, SideEffects, Traverse};
+use crate::{LocalRw, SideEffects, Traverse, formatter::Formatter};
 
 #[derive(Debug, From, PartialEq, Eq, PartialOrd, Clone)]
 pub struct Global(pub Vec<u8>);

@@ -2,9 +2,9 @@ use ast::{LocalRw, RcLocal};
 use contracts::requires;
 
 use petgraph::{
+    Direction,
     stable_graph::{EdgeReference, Neighbors, NodeIndex, StableDiGraph},
     visit::{EdgeRef, IntoEdgesDirected},
-    Direction,
 };
 
 use crate::block::{BlockEdge, BranchType};
@@ -149,11 +149,7 @@ impl Function {
             .graph
             .edges_directed(node, Direction::Outgoing)
             .collect::<Vec<_>>();
-        if let [e] = edges[..] {
-            Some(e)
-        } else {
-            None
-        }
+        if let [e] = edges[..] { Some(e) } else { None }
     }
 
     // TODO: disable_contracts for production builds

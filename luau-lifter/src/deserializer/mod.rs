@@ -1,4 +1,4 @@
-use nom::{bytes::complete::take, IResult};
+use nom::{IResult, bytes::complete::take};
 use nom_leb128::leb128_usize;
 
 pub mod bytecode;
@@ -6,6 +6,10 @@ pub mod chunk;
 pub mod constant;
 pub mod function;
 mod list;
+pub mod version;
+
+#[cfg(test)]
+mod tests;
 
 fn parse_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     let (input, length) = leb128_usize(input)?;
@@ -14,8 +18,18 @@ fn parse_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
 }
 
 pub fn deserialize(bytecode: &[u8], encode_key: u8) -> Result<bytecode::Bytecode, String> {
+    if let Some(&version) = bytecode.first()
+        && version != 0
+    {
+        version::BytecodeVersion::new(version)?;
+    }
+
     match bytecode::Bytecode::parse(bytecode, encode_key) {
-        Ok((_, deserialized_bytecode)) => Ok(deserialized_bytecode),
+        Ok(([], deserialized_bytecode)) => Ok(deserialized_bytecode),
+        Ok((remaining, _)) => Err(format!(
+            "bytecode chunk has {} unexplained trailing byte(s)",
+            remaining.len()
+        )),
         Err(err) => Err(err.to_string()),
     }
 }

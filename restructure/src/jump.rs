@@ -2,10 +2,10 @@ use ast::SideEffects;
 use cfg::block::{BlockEdge, BranchType};
 use itertools::Itertools;
 use petgraph::{
+    Direction,
     algo::dominators::Dominators,
     stable_graph::NodeIndex,
     visit::{EdgeRef, IntoEdgeReferences},
-    Direction,
 };
 
 impl super::GraphStructurer {

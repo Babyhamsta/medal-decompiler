@@ -1,6 +1,11 @@
-use nom::{bytes::complete::take, number::complete::le_u8, IResult};
+use nom::{
+    Err, IResult,
+    bytes::complete::take,
+    error::{Error, ErrorKind},
+    number::complete::le_u8,
+};
 
-use super::chunk::Chunk;
+use super::{chunk::Chunk, version::BytecodeVersion};
 
 #[derive(Debug)]
 pub enum Bytecode {
@@ -19,11 +24,13 @@ impl Bytecode {
                     Bytecode::Error(String::from_utf8_lossy(error_msg).to_string()),
                 ))
             }
-            4..=6 => {
-                let (input, chunk) = Chunk::parse(input, encode_key, status_code)?;
+            4..=12 => {
+                let version = BytecodeVersion::new(status_code)
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::Verify)))?;
+                let (input, chunk) = Chunk::parse(input, encode_key, version)?;
                 Ok((input, Bytecode::Chunk(chunk)))
             }
-            _ => panic!("Unsupported bytecode version: {}", status_code),
+            _ => Err(Err::Failure(Error::new(input, ErrorKind::Verify))),
         }
     }
 }

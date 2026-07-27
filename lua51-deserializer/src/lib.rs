@@ -1,5 +1,5 @@
 pub use function::Function;
-pub use instruction::{argument, Instruction};
+pub use instruction::{Instruction, argument};
 pub use value::Value;
 
 pub mod chunk;

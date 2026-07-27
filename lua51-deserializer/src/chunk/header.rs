@@ -1,8 +1,8 @@
 use nom::{
+    Err, IResult,
     bytes::complete::tag,
     error::{Error, ErrorKind, ParseError},
     number::complete::le_u8,
-    Err, IResult,
 };
 
 #[derive(Debug, PartialEq, Eq)]

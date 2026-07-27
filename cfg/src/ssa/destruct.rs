@@ -4,11 +4,11 @@ use ast::{LocalRw, RcLocal};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use petgraph::{
+    Direction,
     algo::dominators::simple_fast,
     prelude::DiGraphMap,
     stable_graph::NodeIndex,
     visit::{Dfs, DfsPostOrder, EdgeRef},
-    Direction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -279,10 +279,12 @@ impl<'a> Destructor<'a> {
         while let Some(node) = dominator_dfs.next(self.function.graph()) {
             if node == self.function.entry().unwrap() {
                 assert!(dominator_index == 0);
-                assert!(!self
-                    .function
-                    .edges_to_block(node)
-                    .any(|(_, e)| !e.arguments.is_empty()));
+                assert!(
+                    !self
+                        .function
+                        .edges_to_block(node)
+                        .any(|(_, e)| !e.arguments.is_empty())
+                );
                 for (i, local) in self
                     .upvalues_in
                     .iter()

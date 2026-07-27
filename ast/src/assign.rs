@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{formatter::Formatter, RcLocal, SideEffects, Traverse};
+use crate::{RcLocal, SideEffects, Traverse, formatter::Formatter};
 
 use super::{LValue, LocalRw, RValue};
 

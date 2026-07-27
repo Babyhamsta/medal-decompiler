@@ -1,8 +1,13 @@
 /// NOTE: This is untested!
-
 use std::io;
 
-use axum::{body::{Body, Bytes}, http::StatusCode, response::{IntoResponse, Response}, routing::post, Router};
+use axum::{
+    Router,
+    body::{Body, Bytes},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use base64::prelude::*;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -43,11 +48,11 @@ async fn main() -> Result<(), io::Error> {
         .with_thread_ids(true)
         .with_target(false)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("failed to set global tracing subscriber");
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("failed to set global tracing subscriber");
 
     // Build our application with a route
-    let app = Router::new()
-        .route("/decompile", post(decompile));
+    let app = Router::new().route("/decompile", post(decompile));
 
     // Run the web server
     let listener = TcpListener::bind(BIND_ADDR).await?;

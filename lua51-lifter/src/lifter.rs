@@ -10,11 +10,11 @@ use ast::{RcLocal, Statement};
 use cfg::function::Function;
 
 use lua51_deserializer::{
-    argument::{Constant, Register, RegisterOrConstant},
     Function as BytecodeFunction, Instruction, Value,
+    argument::{Constant, Register, RegisterOrConstant},
 };
 
-use petgraph::{stable_graph::NodeIndex, visit::EdgeRef, Direction};
+use petgraph::{Direction, stable_graph::NodeIndex, visit::EdgeRef};
 
 use triomphe::Arc;
 
@@ -237,11 +237,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[&destination].clone().into()],
-                            vec![ast::Index::new(
-                                self.locals[&object].clone().into(),
-                                self.register_or_constant(key),
-                            )
-                            .into()],
+                            vec![
+                                ast::Index::new(
+                                    self.locals[&object].clone().into(),
+                                    self.register_or_constant(key),
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -265,11 +267,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[destination].clone().into()],
-                            vec![ast::Unary::new(
-                                self.locals[operand].clone().into(),
-                                ast::UnaryOperation::Not,
-                            )
-                            .into()],
+                            vec![
+                                ast::Unary::new(
+                                    self.locals[operand].clone().into(),
+                                    ast::UnaryOperation::Not,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -281,11 +285,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[destination].clone().into()],
-                            vec![ast::Unary::new(
-                                self.locals[operand].clone().into(),
-                                ast::UnaryOperation::Length,
-                            )
-                            .into()],
+                            vec![
+                                ast::Unary::new(
+                                    self.locals[operand].clone().into(),
+                                    ast::UnaryOperation::Length,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -297,11 +303,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[destination].clone().into()],
-                            vec![ast::Unary::new(
-                                self.locals[operand].clone().into(),
-                                ast::UnaryOperation::Negate,
-                            )
-                            .into()],
+                            vec![
+                                ast::Unary::new(
+                                    self.locals[operand].clone().into(),
+                                    ast::UnaryOperation::Negate,
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -354,20 +362,22 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[&destination].clone().into()],
-                            vec![ast::Binary::new(
-                                self.register_or_constant(lhs),
-                                self.register_or_constant(rhs),
-                                match instruction {
-                                    Instruction::Add { .. } => ast::BinaryOperation::Add,
-                                    Instruction::Sub { .. } => ast::BinaryOperation::Sub,
-                                    Instruction::Mul { .. } => ast::BinaryOperation::Mul,
-                                    Instruction::Div { .. } => ast::BinaryOperation::Div,
-                                    Instruction::Mod { .. } => ast::BinaryOperation::Mod,
-                                    Instruction::Pow { .. } => ast::BinaryOperation::Pow,
-                                    _ => unreachable!(),
-                                },
-                            )
-                            .into()],
+                            vec![
+                                ast::Binary::new(
+                                    self.register_or_constant(lhs),
+                                    self.register_or_constant(rhs),
+                                    match instruction {
+                                        Instruction::Add { .. } => ast::BinaryOperation::Add,
+                                        Instruction::Sub { .. } => ast::BinaryOperation::Sub,
+                                        Instruction::Mul { .. } => ast::BinaryOperation::Mul,
+                                        Instruction::Div { .. } => ast::BinaryOperation::Div,
+                                        Instruction::Mod { .. } => ast::BinaryOperation::Mod,
+                                        Instruction::Pow { .. } => ast::BinaryOperation::Pow,
+                                        _ => unreachable!(),
+                                    },
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -615,14 +625,16 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![self.locals[destination].clone().into()],
-                            vec![ast::Closure {
-                                function: ByAddress(ast_function),
-                                upvalues: upvalues_passed
-                                    .into_iter()
-                                    .map(ast::Upvalue::Ref)
-                                    .collect(),
-                            }
-                            .into()],
+                            vec![
+                                ast::Closure {
+                                    function: ByAddress(ast_function),
+                                    upvalues: upvalues_passed
+                                        .into_iter()
+                                        .map(ast::Upvalue::Ref)
+                                        .collect(),
+                                }
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -678,11 +690,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
                     statements.push(
                         ast::Assign::new(
-                            vec![ast::Index {
-                                left: Box::new(self.locals[&object].clone().into()),
-                                right: Box::new(key),
-                            }
-                            .into()],
+                            vec![
+                                ast::Index {
+                                    left: Box::new(self.locals[&object].clone().into()),
+                                    right: Box::new(key),
+                                }
+                                .into(),
+                            ],
                             vec![value],
                         )
                         .into(),
@@ -713,20 +727,21 @@ impl<'a, 'b> Lifter<'a, 'b> {
                             .checked_add_signed(skip.try_into().unwrap())
                             .unwrap()),
                     );
-                    assert!(self
-                        .insert_between
-                        .insert(
-                            self.nodes[&start],
-                            (
-                                body_node,
-                                ast::Assign::new(
-                                    vec![external_counter.into()],
-                                    vec![internal_counter.into()],
+                    assert!(
+                        self.insert_between
+                            .insert(
+                                self.nodes[&start],
+                                (
+                                    body_node,
+                                    ast::Assign::new(
+                                        vec![external_counter.into()],
+                                        vec![internal_counter.into()],
+                                    )
+                                    .into()
                                 )
-                                .into()
                             )
-                        )
-                        .is_none());
+                            .is_none()
+                    );
                 }
                 Instruction::IterateGenericForLoop {
                     generator,
@@ -745,11 +760,13 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vars.into_iter().map(|l| l.into()).collect(),
-                            vec![ast::Call::new(
-                                generator.clone().into(),
-                                vec![state.clone().into(), internal_control.clone().into()],
-                            )
-                            .into()],
+                            vec![
+                                ast::Call::new(
+                                    generator.clone().into(),
+                                    vec![state.clone().into(), internal_control.clone().into()],
+                                )
+                                .into(),
+                            ],
                         )
                         .into(),
                     );
@@ -768,20 +785,21 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     );
 
                     let body_node = self.get_node(&(end + 1));
-                    assert!(self
-                        .insert_between
-                        .insert(
-                            self.nodes[&start],
-                            (
-                                body_node,
-                                ast::Assign::new(
-                                    vec![internal_control.clone().into()],
-                                    vec![control.clone().into()],
+                    assert!(
+                        self.insert_between
+                            .insert(
+                                self.nodes[&start],
+                                (
+                                    body_node,
+                                    ast::Assign::new(
+                                        vec![internal_control.clone().into()],
+                                        vec![control.clone().into()],
+                                    )
+                                    .into()
                                 )
-                                .into()
                             )
-                        )
-                        .is_none());
+                            .is_none()
+                    );
                 }
             }
 

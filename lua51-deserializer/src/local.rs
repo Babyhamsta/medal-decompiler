@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use nom::{multi::count, number::complete::le_u32, IResult};
+use nom::{IResult, multi::count, number::complete::le_u32};
 
 use crate::value::parse_string;
 

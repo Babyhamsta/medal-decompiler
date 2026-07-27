@@ -1,0 +1,32 @@
+# Luau Truth Corpus
+
+This corpus contains 24 standalone Luau sources, from basic literals and
+assignments through closures, state machines, register pressure, and a combined
+wonky integration case.
+
+Run the primary quality matrix:
+
+```powershell
+python tools/run_luau_corpus.py --profiles primary
+```
+
+Run the compiler-emittable compatibility matrix:
+
+```powershell
+python tools/run_luau_corpus.py --profiles compatibility
+```
+
+Run one focused case:
+
+```powershell
+python tools/run_luau_corpus.py --profiles primary --case 21_state_machine
+```
+
+Every attempt records bytecode, decompiled Luau, compiler diagnostics,
+bytecode version, basic output metrics, and a summary. A run succeeds only when
+the original compiles, decompilation succeeds, and the decompiled output
+recompiles.
+
+Primary profiles are `O1/g1`, `O2/g1`, and `O2/g0`. Compatibility profiles use
+the bundled compiler's feature flags to emit bytecode V9, V10, V11, and V12.
+Format-level Rust fixtures cover the older supported V4-V8 layouts.

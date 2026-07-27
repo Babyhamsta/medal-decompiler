@@ -176,11 +176,14 @@ impl GraphStructurer {
                     };
                     let header_block = self.function.block_mut(header).unwrap();
                     *header_block = if header_block.is_empty() {
-                        vec![ast::While::new(
-                            ast::Unary::new(condition, ast::UnaryOperation::Not).reduce_condition(),
-                            header_block.clone(),
-                        )
-                        .into()]
+                        vec![
+                            ast::While::new(
+                                ast::Unary::new(condition, ast::UnaryOperation::Not)
+                                    .reduce_condition(),
+                                header_block.clone(),
+                            )
+                            .into(),
+                        ]
                         .into()
                     } else {
                         vec![ast::Repeat::new(condition, header_block.clone()).into()].into()
@@ -192,11 +195,10 @@ impl GraphStructurer {
                     self.match_jump(header, Some(next));
                 } else {
                     let header_block = self.function.block_mut(header).unwrap();
-                    *header_block = vec![ast::While::new(
-                        ast::Literal::Boolean(true).into(),
-                        header_block.clone(),
-                    )
-                    .into()]
+                    *header_block = vec![
+                        ast::While::new(ast::Literal::Boolean(true).into(), header_block.clone())
+                            .into(),
+                    ]
                     .into();
                     self.function.remove_edges(header);
                     self.match_jump(header, None);

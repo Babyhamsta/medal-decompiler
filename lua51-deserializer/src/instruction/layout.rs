@@ -1,7 +1,7 @@
 use nom::{
+    Err, IResult,
     error::{Error, ErrorKind, ParseError},
     number::complete::le_u32,
-    Err, IResult,
 };
 use num_traits::FromPrimitive;
 use strum_macros::EnumDiscriminants;
