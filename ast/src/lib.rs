@@ -20,6 +20,7 @@ mod call;
 mod class;
 mod close;
 mod closure;
+mod conditional;
 mod r#continue;
 mod r#for;
 pub mod formatter;
@@ -52,6 +53,7 @@ pub use call::*;
 pub use class::*;
 pub use close::*;
 pub use closure::*;
+pub use conditional::*;
 pub use r#continue::*;
 pub use r#for::*;
 pub use global::*;
@@ -107,6 +109,7 @@ pub enum RValue {
     Index(Index),
     Unary(Unary),
     Binary(Binary),
+    Conditional(Conditional),
     Closure(Closure),
     Select(Select),
 }
@@ -122,6 +125,7 @@ impl type_system::Infer for RValue {
             RValue::Index(_) => Type::Any,
             RValue::Unary(_) => Type::Any,
             RValue::Binary(_) => Type::Any,
+            RValue::Conditional(_) => Type::Any,
             RValue::Closure(closure) => closure.infer(system),
             _ => Type::VarArg,
         }
@@ -157,6 +161,7 @@ impl RValue {
         match self {
             Self::Binary(binary) => binary.precedence(),
             Self::Unary(unary) => unary.precedence(),
+            Self::Conditional(_) => 0,
             RValue::Literal(Literal::Number(n)) if n.is_finite() && n.is_sign_negative() => {
                 return 7;
             }
@@ -188,6 +193,7 @@ impl fmt::Display for RValue {
             RValue::Index(index) => write!(f, "{}", index),
             RValue::Unary(unary) => write!(f, "{}", unary),
             RValue::Binary(binary) => write!(f, "{}", binary),
+            RValue::Conditional(conditional) => write!(f, "{}", conditional),
             RValue::Closure(closure) => write!(f, "{}", closure),
             RValue::Select(select) => write!(f, "{}", select),
         }

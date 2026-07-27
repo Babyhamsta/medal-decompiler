@@ -8,9 +8,9 @@ use std::{
 use itertools::Itertools;
 
 use crate::{
-    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, GenericFor, If, Index, LValue,
-    Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary,
-    While,
+    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Conditional, GenericFor, If,
+    Index, LValue, Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement,
+    Table, Unary, While,
 };
 
 pub enum IndentationMode {
@@ -409,6 +409,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             RValue::Index(index) => self.format_index(index),
             RValue::Unary(unary) => self.format_unary(unary),
             RValue::Binary(binary) => self.format_binary(binary),
+            RValue::Conditional(conditional) => self.format_conditional(conditional),
             RValue::Closure(closure) => self.format_closure(closure),
             RValue::Literal(Literal::Number(n)) if n.is_infinite() => {
                 // TODO: only insert parentheses when necessary
@@ -433,6 +434,20 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 write!(self.output, ")")
             }
             _ => write!(self.output, "{}", rvalue),
+        }
+    }
+
+    pub(crate) fn format_conditional(&mut self, conditional: &Conditional) -> fmt::Result {
+        write!(self.output, "if ")?;
+        self.format_rvalue(&conditional.condition)?;
+        write!(self.output, " then ")?;
+        self.format_rvalue(&conditional.then_value)?;
+        if let RValue::Conditional(else_if) = conditional.else_value.as_ref() {
+            write!(self.output, " else")?;
+            self.format_conditional(else_if)
+        } else {
+            write!(self.output, " else ")?;
+            self.format_rvalue(&conditional.else_value)
         }
     }
 
