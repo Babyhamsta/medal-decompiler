@@ -15,6 +15,7 @@ from tools.luau_corpus import (
 )
 from tools.luau_corpus.process import (
     compiler_command,
+    count_trivial_aliases,
     decompiler_command,
     run_corpus,
 )
@@ -132,6 +133,16 @@ class ProfileTests(unittest.TestCase):
 
 
 class CorpusRunnerTests(unittest.TestCase):
+    def test_trivial_alias_metric_counts_identifier_copies(self) -> None:
+        source = """\
+local copy = original
+local value = call()
+table.slot = original
+return copy
+"""
+
+        self.assertEqual(count_trivial_aliases(source), 1)
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
@@ -235,12 +246,13 @@ class CorpusRunnerTests(unittest.TestCase):
         self.assertEqual(payload["totals"]["compile_failed"], 0)
         self.assertEqual(payload["cases"][0]["bytecode_version"], ord("B"))
         self.assertEqual(payload["cases"][0]["output_path"], "test/01_success.luau")
+        self.assertEqual(payload["cases"][0]["generated_aliases"], 0)
         self.assertIn(
-            "| profile | case | version | compile | decompile | recompile | statements | locals | gotos |",
+            "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
             markdown,
         )
         self.assertIn(
-            "| test | 01_success | 66 | 0 | 0 | 0 | 2 | 1 | 0 |",
+            "| test | 01_success | 66 | 0 | 0 | 0 | 2 | 1 | 0 | 0 |",
             markdown,
         )
 

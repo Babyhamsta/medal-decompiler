@@ -24,6 +24,7 @@ class CaseResult:
     diagnostic_path: Path
     generated_statements: int
     generated_locals: int
+    generated_aliases: int
     generated_gotos: int
     bytecode_version: int | None
 
