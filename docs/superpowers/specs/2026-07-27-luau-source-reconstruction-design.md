@@ -2,10 +2,11 @@
 
 ## Context
 
-The V4-V12 compatibility foundation and the 24-source truth corpus are complete.
-The current decompiler produces valid, structured Luau across the full matrix,
-but representative output still contains temporary aliases, generic names,
-avoidable nesting, and expressions that visibly reflect bytecode registers.
+The V9-V12/current-profile compiler-round-trip corpus and V4-V8 parser/format
+fixtures are complete. The current decompiler produces valid, structured Luau
+across the 240-case compiler matrix, but representative output still contains
+temporary aliases, generic names, avoidable nesting, and expressions that
+visibly reflect bytecode registers.
 
 This design covers the next quality phase. Its purpose is not merely to shorten
 output. It should reconstruct the most natural source form justified by bytecode,
@@ -206,7 +207,8 @@ Every section follows test-first development:
 3. Implement one general rewrite.
 4. Re-run the focused test.
 5. Re-run the Rust workspace and Python harness tests.
-6. Re-run the complete 240-case compile/decompile/recompile matrix.
+6. Re-run the complete V9-V12/current-profile 240-case
+   compile/decompile/recompile matrix.
 7. Compare representative simple, medium, complex, and wonky outputs.
 
 Focused tests assert both desired forms and forbidden artifacts. Examples

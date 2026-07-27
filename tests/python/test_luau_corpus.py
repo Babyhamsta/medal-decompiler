@@ -175,7 +175,8 @@ return copy
             self.decompiler,
             """
             print("local value = 1")
-            print("return value")
+            print("local alias = value")
+            print("return alias")
             """,
         )
 
@@ -242,17 +243,18 @@ return copy
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         markdown = markdown_path.read_text(encoding="utf-8")
 
+        self.assertEqual(result.cases[0].generated_aliases, 1)
         self.assertEqual(payload["totals"]["cases"], 1)
         self.assertEqual(payload["totals"]["compile_failed"], 0)
         self.assertEqual(payload["cases"][0]["bytecode_version"], ord("B"))
         self.assertEqual(payload["cases"][0]["output_path"], "test/01_success.luau")
-        self.assertEqual(payload["cases"][0]["generated_aliases"], 0)
+        self.assertEqual(payload["cases"][0]["generated_aliases"], 1)
         self.assertIn(
             "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
             markdown,
         )
         self.assertIn(
-            "| test | 01_success | 66 | 0 | 0 | 0 | 2 | 1 | 0 | 0 |",
+            "| test | 01_success | 66 | 0 | 0 | 0 | 3 | 2 | 1 | 0 |",
             markdown,
         )
 

@@ -307,7 +307,7 @@ fn decompile_function(
     let params = std::mem::take(&mut function.parameters);
     let is_variadic = function.is_variadic;
     let mut block: ast::Block = restructure::lift(function).into();
-    ast::eliminate_aliases(&mut block);
+    ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
     let block = Arc::new(Mutex::new(block));
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?

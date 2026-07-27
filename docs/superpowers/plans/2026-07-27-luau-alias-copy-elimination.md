@@ -17,7 +17,8 @@
 - `GETIMPORT` provenance may reverse compiler register scheduling toward the
   authored expression order; never extend that preference to dynamic
   `GETGLOBAL` or ordinary table/index operations.
-- Keep V4-V12 compatibility and all existing static round-trip gates green.
+- Keep V9-V12/current-profile compiler round trips and V4-V8 parser/format
+  fixtures green.
 - Work on `agent/alias-copy-elimination`; publish one PR targeting `main`; merge only after user approval.
 
 ---
@@ -722,16 +723,25 @@ return copy
     self.assertEqual(count_trivial_aliases(source), 1)
 ```
 
+Change the existing decompiler stub to emit one trivial alias:
+
+```python
+print("local value = 1")
+print("local alias = value")
+print("return alias")
+```
+
 In the existing corpus-runner report test, add:
 
 ```python
-self.assertEqual(payload["cases"][0]["generated_aliases"], 0)
+self.assertEqual(result.cases[0].generated_aliases, 1)
+self.assertEqual(payload["cases"][0]["generated_aliases"], 1)
 self.assertIn(
     "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
     markdown,
 )
 self.assertIn(
-    "| test | 01_success | 66 | 0 | 0 | 0 | 2 | 1 | 0 | 0 |",
+    "| test | 01_success | 66 | 0 | 0 | 0 | 3 | 2 | 1 | 0 |",
     markdown,
 )
 ```
@@ -883,9 +893,10 @@ Create `.github/pr-body-alias-elimination.md` with `apply_patch`:
 
 ## Verification
 
-- AST, lifter, and workspace Rust tests: 35 passed
+- AST, lifter, and workspace Rust tests: 40 passed
 - Python corpus tests: 10 passed
-- V4-V12 static round trips: 240/240
+- V9-V12 compiler round trips: 240/240
+- V4-V8 parser/format fixtures: passing
 - representative alias count: 1 -> 0
 - arbitrary scripts executed: no
 ```

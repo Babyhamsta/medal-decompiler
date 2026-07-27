@@ -17,7 +17,8 @@ The completed compile/decompile/recompile matrix is fully green:
 - primary profiles (`O1/g1`, `O2/g1`, `O2/g0`): 72/72;
 - secondary profiles (`O0/g1`, `O1/g0`, `O1/g2`): 72/72;
 - compatibility profiles (bytecode V9, V10, V11, V12): 96/96;
-- combined profile runs: 240/240;
+- V9-V12/current-profile compiler round trips: 240/240;
+- V4-V8 parser/format fixtures: passing;
 - generated `goto`/label statements: 0;
 - source compile failures: 0;
 - decompiler failures: 0;
@@ -190,14 +191,15 @@ elimination across the evaluation boundary.
 
 ### Static verification
 
-- `cargo +stable fmt --all -- --check`: passed after a mechanical formatting
-  commit.
-- `cargo +nightly test --workspace`: 35 passed, 0 failed.
+- `cargo +stable fmt --all -- --check`: passed.
+- `cargo +nightly test --workspace`: 40 passed, 0 failed.
 - `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
-- Static V4-V12 corpus: 240/240 compiled, decompiled, and recompiled; 0
-  compile failures, 0 decompile failures, 0 recompile failures, and 0 generated
-  gotos. The corpus runner invoked only the bundled compiler, the built
-  decompiler, and the bundled recompiler; no arbitrary Luau scripts ran.
+- V9-V12/current-profile compiler round trips: 240/240; 0 compile failures, 0
+  decompile failures, 0 recompile failures, and 0 generated gotos.
+- V4-V8 parser/format fixtures: passing.
+
+The corpus runner invoked only the bundled compiler, the built decompiler, and
+the bundled recompiler; no arbitrary Luau scripts ran.
 
 `--no-build` initially exposed a missing `target/debug/luau-lifter.exe` in this
 worktree (all decompiler launches returned `WinError 2`). Building the
@@ -211,7 +213,7 @@ files only. Pre-change retained artifacts contain 66 aliases across `final-all`
 (240 outputs) and 28 aliases across `final-versions` (96 outputs). Those
 snapshots overlap in profile coverage, so their 94 aliases across 336 files are
 an undeduplicated retained aggregate only; they are non-comparable to the fresh
-matrix. The fresh `alias-elimination` matrix contains 48 aliases across 240
+matrix. The fresh `final-fix` matrix contains 48 aliases across 240
 outputs. The sole like-for-like result is the matching 240-output profile set:
 66 -> 48 aliases (18 fewer, 27.3%).
 
@@ -224,7 +226,7 @@ outputs. The sole like-for-like result is the matching 240-output profile set:
 The inspected after artifacts are:
 
 ```text
-tests/luau_corpus/results/alias-elimination/V12/24_wonky_integration.luau
-tests/luau_corpus/results/alias-elimination/V12/23_register_pressure_aliases.luau
-tests/luau_corpus/results/alias-elimination/O0_g1/24_wonky_integration.luau
+tests/luau_corpus/results/final-fix/V12/24_wonky_integration.luau
+tests/luau_corpus/results/final-fix/V12/23_register_pressure_aliases.luau
+tests/luau_corpus/results/final-fix/O0_g1/24_wonky_integration.luau
 ```
