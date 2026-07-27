@@ -13,6 +13,7 @@ use std::{
 };
 
 mod assign;
+mod alias_elimination;
 mod binary;
 mod r#break;
 mod call;
@@ -44,6 +45,7 @@ mod vararg;
 mod r#while;
 
 pub use assign::*;
+pub use alias_elimination::*;
 pub use binary::*;
 pub use r#break::*;
 pub use call::*;
