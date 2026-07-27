@@ -302,12 +302,7 @@ mod tests {
             Return::new(vec![alias.into()]).into(),
         ]);
         let mut block = Block(vec![
-            crate::If::new(
-                Literal::Boolean(true).into(),
-                nested,
-                Block::default(),
-            )
-            .into(),
+            crate::If::new(Literal::Boolean(true).into(), nested, Block::default()).into(),
         ]);
 
         assert_eq!(eliminate_aliases(&mut block), 1);
