@@ -50,7 +50,13 @@ fn replace_after_safe_prefix(statement: &mut Statement, alias: &RcLocal, source:
                     *rvalue = source.clone().into();
                     return Some(true);
                 }
-                if rvalue.has_side_effects() {
+                if rvalue.has_side_effects()
+                    && !matches!(
+                        rvalue,
+                        RValue::Global(global)
+                            if global.origin() == crate::GlobalOrigin::CompilerImport
+                    )
+                {
                     crossed_effect = true;
                 }
             }
@@ -209,6 +215,24 @@ mod tests {
 
         assert_eq!(eliminate_aliases(&mut block), 0);
         assert!(block[0].values_written().contains(&&alias));
+    }
+
+    #[test]
+    fn eliminates_alias_after_compiler_import_prefix() {
+        let source = RcLocal::default();
+        let alias = RcLocal::default();
+        let call = crate::Call::new(
+            crate::Global::compiler_import(b"setmetatable".to_vec()).into(),
+            vec![alias.clone().into()],
+        );
+        let mut block = Block(vec![
+            Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+            Return::new(vec![call.into()]).into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 1);
+        assert_eq!(block.len(), 1);
+        assert!(block[0].values_read().contains(&&source));
     }
 
     #[test]
