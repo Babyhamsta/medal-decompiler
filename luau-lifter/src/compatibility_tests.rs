@@ -77,6 +77,44 @@ fn compile(mode: &str, profile: &VersionProfile, source: &Path) -> std::process:
         .unwrap()
 }
 
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn trivial_local_alias_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let Some(rest) = line.trim().strip_prefix("local ") else {
+                return false;
+            };
+            let Some((left, right)) = rest.split_once(" = ") else {
+                return false;
+            };
+            is_identifier(left) && is_identifier(right)
+        })
+        .collect()
+}
+
+#[test]
+fn wonky_v12_output_has_no_trivial_local_aliases() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let compiled = compile("binary", &PROFILES[3], &source("24_wonky_integration"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+    let aliases = trivial_local_alias_lines(&decompiled);
+
+    assert!(aliases.is_empty(), "trivial aliases remained: {aliases:#?}\n{decompiled}");
+}
+
 #[test]
 fn bundled_compiler_versions_decompile_and_recompile() {
     if !compiler().is_file() {
