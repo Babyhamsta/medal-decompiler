@@ -355,9 +355,9 @@ fn make_conditional_value(
     {
         let negated = ast::Unary::new(condition, ast::UnaryOperation::Not);
         if then_boolean {
-            ast::Unary::new(negated.into(), ast::UnaryOperation::Not).reduce_condition()
+            ast::Unary::new(negated.into(), ast::UnaryOperation::Not).into()
         } else {
-            negated.reduce_condition()
+            negated.into()
         }
     } else if else_value == condition && !condition.has_side_effects() {
         ast::Binary::new(condition, then_value, ast::BinaryOperation::And).reduce()
@@ -831,7 +831,10 @@ fn try_remove_unnecessary_condition(function: &mut Function, node: NodeIndex) ->
 
 #[cfg(test)]
 mod tests {
-    use ast::{BinaryOperation, Call, Global, Literal, Local, RValue, RcLocal};
+    use ast::{
+        BinaryOperation, Call, Global, Literal, Local, RValue, RcLocal, SideEffects, Unary,
+        UnaryOperation,
+    };
 
     use super::make_conditional_value;
 
@@ -892,6 +895,19 @@ mod tests {
         let value = make_conditional_value(condition.clone(), local("selected").into(), condition);
 
         assert!(matches!(value, RValue::Conditional(_)));
+    }
+
+    #[test]
+    fn boolean_conditional_keeps_observable_length_evaluation() {
+        let condition = Unary::new(local("object").into(), UnaryOperation::Length);
+        let value = make_conditional_value(
+            condition.into(),
+            Literal::Boolean(false).into(),
+            Literal::Boolean(true).into(),
+        );
+
+        assert_eq!(value.to_string(), "not #object");
+        assert!(value.has_side_effects());
     }
 }
 

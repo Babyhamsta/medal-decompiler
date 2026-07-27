@@ -316,6 +316,10 @@ fn inline_block_once(block: &mut Block, protected: &FxHashSet<RcLocal>) -> usize
         if block[index + 1..read_at]
             .iter()
             .any(SideEffects::has_side_effects)
+            || value.has_side_effects()
+                && block[index + 1..read_at]
+                    .iter()
+                    .any(|statement| !statement.values().is_empty())
             || block[index + 1..=read_at].iter().any(|statement| {
                 statement
                     .values_written()
@@ -822,6 +826,24 @@ mod tests {
             RValue::Binary(_)
         ));
         assert_eq!(structured_stats.inlined_temporaries, 0);
+    }
+
+    #[test]
+    fn keeps_effectful_value_before_intermediate_snapshot() {
+        let upvalue = local("upvalue");
+        let snapshot = local("snapshot");
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("mutate").into(), Vec::new()));
+        let mut block = Block(vec![
+            assign(&temporary, selected.into()),
+            assign(&snapshot, upvalue.into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
     }
 
     #[test]
