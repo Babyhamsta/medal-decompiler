@@ -208,10 +208,12 @@ binary; the recorded 240-case result above is the fresh rerun.
 
 `count_trivial_aliases` performs static text analysis of generated `.luau`
 files only. Pre-change retained artifacts contain 66 aliases across `final-all`
-(240 outputs) and 28 aliases across `final-versions` (96 additional retained
-outputs): 94 aliases across 336 retained output files. The fresh
-`alias-elimination` matrix contains 48 aliases across 240 outputs. The
-like-for-like 240-profile comparison is 66 -> 48 aliases (18 fewer, 27.3%).
+(240 outputs) and 28 aliases across `final-versions` (96 outputs). Those
+snapshots overlap in profile coverage, so their 94 aliases across 336 files are
+an undeduplicated retained aggregate only; they are non-comparable to the fresh
+matrix. The fresh `alias-elimination` matrix contains 48 aliases across 240
+outputs. The sole like-for-like result is the matching 240-output profile set:
+66 -> 48 aliases (18 fewer, 27.3%).
 
 | Representative | Before locals / aliases | After locals / aliases | Evidence |
 | --- | ---: | ---: | --- |
