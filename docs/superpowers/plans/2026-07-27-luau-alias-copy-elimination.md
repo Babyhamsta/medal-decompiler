@@ -14,6 +14,9 @@
 - All decisions must use SSA/AST identity, local reads and writes, evaluation order, closure capture, or side-effect evidence.
 - No production rule may inspect corpus filenames, exact constants, URLs, register numbers, or formatted variable names.
 - Preserve call order, metamethod-capable operations, upvalue snapshots, mutation visibility, and multiple-return behavior.
+- `GETIMPORT` provenance may reverse compiler register scheduling toward the
+  authored expression order; never extend that preference to dynamic
+  `GETGLOBAL` or ordinary table/index operations.
 - Keep V4-V12 compatibility and all existing static round-trip gates green.
 - Work on `agent/alias-copy-elimination`; publish one PR targeting `main`; merge only after user approval.
 
@@ -530,14 +533,120 @@ git commit -m "feat: collapse nested Luau copy chains"
 ### Task 5: Integrate after SSA destruction
 
 **Files:**
+- Modify: `ast/src/global.rs`
+- Modify: `ast/src/alias_elimination.rs`
+- Modify: `luau-lifter/src/lifter.rs`
 - Modify: `luau-lifter/src/lib.rs`
 - Test: `luau-lifter/src/compatibility_tests.rs`
 
 **Interfaces:**
 - Consumes: `ast::eliminate_aliases(&mut Block) -> usize`.
-- Produces: alias-cleaned function bodies before `LocalDeclarer` and naming.
+- Produces: `GlobalOrigin::{Dynamic, CompilerImport}`, preserved `GETIMPORT`
+  provenance, and alias-cleaned function bodies before `LocalDeclarer` and naming.
 
-- [ ] **Step 1: Insert the pass at the post-restructure boundary**
+- [ ] **Step 1: Add a failing compiler-import ordering test**
+
+Add one AST regression beside the existing dynamic-global barrier test:
+
+```rust
+#[test]
+fn eliminates_alias_after_compiler_import_prefix() {
+    let source = RcLocal::default();
+    let alias = RcLocal::default();
+    let call = crate::Call::new(
+        crate::Global::compiler_import(b"setmetatable".to_vec()).into(),
+        vec![alias.clone().into()],
+    );
+    let mut block = Block(vec![
+        Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+        Return::new(vec![call.into()]).into(),
+    ]);
+
+    assert_eq!(eliminate_aliases(&mut block), 1);
+    assert_eq!(block.len(), 1);
+    assert!(block[0].values_read().contains(&&source));
+}
+```
+
+Run:
+
+```powershell
+cargo +nightly test -p ast eliminates_alias_after_compiler_import_prefix -- --nocapture
+```
+
+Expected: compilation FAIL because `Global::compiler_import` does not exist.
+
+- [ ] **Step 2: Preserve global lookup provenance**
+
+Replace the tuple `Global` with:
+
+```rust
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GlobalOrigin {
+    #[default]
+    Dynamic,
+    CompilerImport,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Clone)]
+pub struct Global {
+    name: Vec<u8>,
+    origin: GlobalOrigin,
+}
+```
+
+Keep `Global::new` and `From<&str>` dynamic. Add:
+
+```rust
+pub fn compiler_import(name: Vec<u8>) -> Self {
+    Self {
+        name,
+        origin: GlobalOrigin::CompilerImport,
+    }
+}
+
+pub fn origin(&self) -> GlobalOrigin {
+    self.origin
+}
+```
+
+Update formatting to use `name`. Keep `SideEffects::has_side_effects()` true
+for both origins so other AST passes remain conservative.
+
+In `LOP_GETIMPORT` lifting, create the root with
+`Global::compiler_import`. Keep `LOP_GETGLOBAL`, Lua 5.1 globals, and test
+globals on `Global::new`/`From<&str>`.
+
+- [ ] **Step 3: Allow only compiler-import prefixes**
+
+In ordered alias replacement, change the effect barrier to:
+
+```rust
+if rvalue.has_side_effects()
+    && !matches!(
+        rvalue,
+        RValue::Global(global)
+            if global.origin() == crate::GlobalOrigin::CompilerImport
+    )
+{
+    crossed_effect = true;
+}
+```
+
+This is opcode provenance, not a name whitelist. It reverses compiler import
+scheduling toward the authored source form while ordinary `GETGLOBAL` and
+metamethod-capable indexes remain barriers.
+
+Run:
+
+```powershell
+cargo +nightly test -p ast alias_elimination::tests -- --nocapture
+```
+
+Expected: the compiler-import test PASS and the dynamic-global barrier test
+still PASS.
+
+- [ ] **Step 4: Insert the pass at the post-restructure boundary**
 
 In `decompile_function`, replace:
 
@@ -555,7 +664,7 @@ let block = Arc::new(block);
 
 Keep the pass before `LocalDeclarer::declare_locals`.
 
-- [ ] **Step 2: Run the original RED regression**
+- [ ] **Step 5: Run the original RED regression**
 
 Run:
 
@@ -565,7 +674,7 @@ cargo +nightly test -p luau-lifter wonky_v12_output_has_no_trivial_local_aliases
 
 Expected: PASS. The output must call `setmetatable` with the captured module table directly and contain no trivial local alias line.
 
-- [ ] **Step 3: Run compatibility and malformed-input tests**
+- [ ] **Step 6: Run compatibility and malformed-input tests**
 
 Run:
 
@@ -575,10 +684,10 @@ cargo +nightly test -p luau-lifter -- --nocapture
 
 Expected: all tests PASS, including V9-V12 compiler round trips and V4-V8 format fixtures.
 
-- [ ] **Step 4: Commit integration**
+- [ ] **Step 7: Commit integration**
 
 ```powershell
-git add luau-lifter/src/lib.rs luau-lifter/src/compatibility_tests.rs
+git add ast/src/global.rs ast/src/alias_elimination.rs luau-lifter/src/lifter.rs luau-lifter/src/lib.rs luau-lifter/src/compatibility_tests.rs
 git commit -m "feat: remove post-SSA Luau aliases"
 ```
 
@@ -699,13 +808,20 @@ git commit -m "feat: report generated Luau aliases"
 Run:
 
 ```powershell
-cargo fmt --all -- --check
-$env:RUSTFLAGS = "-Awarnings"
+cargo +stable fmt --all
+cargo +stable fmt --all -- --check
 cargo +nightly test --workspace
 python -m unittest discover -s tests/python -v
 ```
 
 Expected: all commands PASS.
+
+If formatting changes tracked Rust files, commit only those mechanical changes:
+
+```powershell
+git add ast/src/alias_elimination.rs ast/src/global.rs ast/src/lib.rs luau-lifter/src/compatibility_tests.rs luau-lifter/src/lib.rs luau-lifter/src/lifter.rs
+git commit -m "style: format alias elimination"
+```
 
 - [ ] **Step 2: Run the complete static corpus**
 
@@ -729,7 +845,10 @@ tests/luau_corpus/results/alias-elimination/O0_g1/24_wonky_integration.luau
 ```
 
 Confirm the `Machine.new` alias is absent and record before/after alias and local
-counts in `docs/decompiler-baseline-findings.md`.
+counts in `docs/decompiler-baseline-findings.md`. Also use
+`count_trivial_aliases` over the existing `final-all` plus `final-versions`
+artifacts and the new 240-case run to record the aggregate before/after alias
+count. This is static text analysis only.
 
 - [ ] **Step 4: Run final diff checks**
 
@@ -764,7 +883,7 @@ Create `.github/pr-body-alias-elimination.md` with `apply_patch`:
 
 ## Verification
 
-- AST, lifter, and workspace Rust tests: 30 passed
+- AST, lifter, and workspace Rust tests: 35 passed
 - Python corpus tests: 10 passed
 - V4-V12 static round trips: 240/240
 - representative alias count: 1 -> 0
