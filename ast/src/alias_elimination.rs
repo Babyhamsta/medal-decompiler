@@ -186,6 +186,22 @@ mod tests {
     }
 
     #[test]
+    fn keeps_snapshot_alias_when_index_runs_before_use() {
+        let source = RcLocal::default();
+        let alias = RcLocal::default();
+        let table = RcLocal::default();
+        let key = RcLocal::default();
+        let index = crate::Index::new(table.into(), key.into());
+        let mut block = Block(vec![
+            Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+            Return::new(vec![index.into(), alias.clone().into()]).into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 0);
+        assert!(block[0].values_written().contains(&&alias));
+    }
+
+    #[test]
     fn keeps_alias_captured_by_reference() {
         let source = RcLocal::default();
         let alias = RcLocal::default();
