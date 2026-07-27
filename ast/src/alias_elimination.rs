@@ -59,7 +59,7 @@ fn replace_after_safe_prefix(statement: &mut Statement, alias: &RcLocal, source:
         .unwrap_or(false)
 }
 
-pub fn eliminate_aliases(block: &mut Block) -> usize {
+fn eliminate_block_once(block: &mut Block) -> usize {
     let mut removed = 0;
     let mut index = 0;
     while index < block.len() {
@@ -88,6 +88,32 @@ pub fn eliminate_aliases(block: &mut Block) -> usize {
         }
         block.remove(index);
         removed += 1;
+    }
+    removed
+}
+
+pub fn eliminate_aliases(block: &mut Block) -> usize {
+    let mut removed = 0;
+    loop {
+        let changed = eliminate_block_once(block);
+        removed += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+
+    for statement in &mut block.0 {
+        removed += match statement {
+            Statement::If(value) => {
+                eliminate_aliases(&mut value.then_block.lock())
+                    + eliminate_aliases(&mut value.else_block.lock())
+            }
+            Statement::While(value) => eliminate_aliases(&mut value.block.lock()),
+            Statement::Repeat(value) => eliminate_aliases(&mut value.block.lock()),
+            Statement::NumericFor(value) => eliminate_aliases(&mut value.block.lock()),
+            Statement::GenericFor(value) => eliminate_aliases(&mut value.block.lock()),
+            _ => 0,
+        };
     }
     removed
 }
@@ -225,5 +251,44 @@ mod tests {
 
         assert_eq!(eliminate_aliases(&mut block), 0);
         assert!(block[0].values_written().contains(&&alias));
+    }
+
+    #[test]
+    fn collapses_alias_chain_to_source() {
+        let source = RcLocal::default();
+        let alias_a = RcLocal::default();
+        let alias_b = RcLocal::default();
+        let mut block = Block(vec![
+            Assign::new(vec![alias_a.clone().into()], vec![source.clone().into()]).into(),
+            Assign::new(vec![alias_b.clone().into()], vec![alias_a.clone().into()]).into(),
+            Return::new(vec![alias_b.into()]).into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 2);
+        assert_eq!(block.len(), 1);
+        assert!(block[0].values_read().contains(&&source));
+    }
+
+    #[test]
+    fn eliminates_nested_aliases_inside_structured_blocks() {
+        let source = RcLocal::default();
+        let alias = RcLocal::default();
+        let nested = Block(vec![
+            Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+            Return::new(vec![alias.into()]).into(),
+        ]);
+        let mut block = Block(vec![
+            crate::If::new(
+                Literal::Boolean(true).into(),
+                nested,
+                Block::default(),
+            )
+            .into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 1);
+        let then_block = block[0].as_if().unwrap().then_block.lock();
+        assert_eq!(then_block.len(), 1);
+        assert!(then_block[0].values_read().contains(&&source));
     }
 }
