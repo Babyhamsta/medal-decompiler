@@ -117,7 +117,7 @@ fn eliminate_block_once(block: &mut Block, protected: &FxHashSet<RcLocal>) -> us
     removed
 }
 
-fn collect_reference_captures(block: &mut Block, protected: &mut FxHashSet<RcLocal>) {
+pub(crate) fn collect_reference_captures(block: &mut Block, protected: &mut FxHashSet<RcLocal>) {
     for statement in &mut block.0 {
         statement.traverse_rvalues(&mut |rvalue| {
             if let RValue::Closure(closure) = rvalue {
