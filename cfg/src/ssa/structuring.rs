@@ -359,12 +359,12 @@ fn make_conditional_value(
         } else {
             negated.reduce_condition()
         }
-    } else if else_value == condition {
+    } else if else_value == condition && !condition.has_side_effects() {
         ast::Binary::new(condition, then_value, ast::BinaryOperation::And).reduce()
-    } else if then_value == condition {
+    } else if then_value == condition && !condition.has_side_effects() {
         ast::Binary::new(condition, else_value, ast::BinaryOperation::Or).reduce()
     } else {
-        ast::Conditional::new(condition.reduce_condition(), then_value, else_value).into()
+        ast::Conditional::new(condition, then_value, else_value).into()
     }
 }
 
@@ -831,7 +831,7 @@ fn try_remove_unnecessary_condition(function: &mut Function, node: NodeIndex) ->
 
 #[cfg(test)]
 mod tests {
-    use ast::{BinaryOperation, Literal, Local, RValue, RcLocal};
+    use ast::{BinaryOperation, Call, Global, Literal, Local, RValue, RcLocal};
 
     use super::make_conditional_value;
 
@@ -884,6 +884,14 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn conditional_value_does_not_merge_equal_effectful_branches() {
+        let condition = RValue::Call(Call::new(Global::from("probe").into(), Vec::new()));
+        let value = make_conditional_value(condition.clone(), local("selected").into(), condition);
+
+        assert!(matches!(value, RValue::Conditional(_)));
     }
 }
 

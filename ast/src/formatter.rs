@@ -121,6 +121,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                         | RValue::MethodCall(_)
                         | RValue::Select(Select::Call(_) | Select::MethodCall(_)) => true,
                         RValue::Binary(binary) => is_ambiguous(&binary.right),
+                        RValue::Conditional(conditional) => is_ambiguous(&conditional.else_value),
                         _ => false,
                     }
                 }
@@ -728,7 +729,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             if i != 0 {
                 write!(self.output, ", ")?;
             }
+            let wrap = i + 1 == assign.right.len() && matches!(rvalue, RValue::Select(_));
+            if wrap {
+                write!(self.output, "(")?;
+            }
             self.format_rvalue(rvalue)?;
+            if wrap {
+                write!(self.output, ")")?;
+            }
         }
 
         if assign.parallel {
@@ -856,7 +864,8 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Assign, Binary, BinaryOperation, Call, Global, Index, LValue, Local, RValue, RcLocal,
+        Assign, Binary, BinaryOperation, Block, Call, Conditional, Global, Index, LValue, Literal,
+        Local, RValue, RcLocal, Select, Table,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -873,6 +882,29 @@ mod tests {
         );
 
         assert_eq!(assign.to_string(), "value += increment");
+    }
+
+    #[test]
+    fn compound_formats_every_supported_operator() {
+        let operations = [
+            (BinaryOperation::Add, "+="),
+            (BinaryOperation::Sub, "-="),
+            (BinaryOperation::Mul, "*="),
+            (BinaryOperation::Div, "/="),
+            (BinaryOperation::IDiv, "//="),
+            (BinaryOperation::Mod, "%="),
+            (BinaryOperation::Pow, "^="),
+            (BinaryOperation::Concat, "..="),
+        ];
+
+        for (operation, syntax) in operations {
+            let value = local("value");
+            let assign = Assign::new(
+                vec![LValue::Local(value.clone())],
+                vec![Binary::new(value.into(), local("next").into(), operation).into()],
+            );
+            assert_eq!(assign.to_string(), format!("value {syntax} next"));
+        }
     }
 
     #[test]
@@ -939,6 +971,73 @@ mod tests {
         assert_eq!(
             assign.to_string(),
             "(fetch())[key] = (fetch())[key] + increment"
+        );
+
+        let dynamic_global = Index::new(Global::from("object").into(), local("key").into());
+        let global_assign = Assign::new(
+            vec![LValue::Index(dynamic_global.clone())],
+            vec![
+                Binary::new(
+                    dynamic_global.into(),
+                    local("increment").into(),
+                    BinaryOperation::Add,
+                )
+                .into(),
+            ],
+        );
+        let calculated_key = Binary::new(
+            local("left").into(),
+            local("right").into(),
+            BinaryOperation::Add,
+        );
+        let calculated = Index::new(local("object").into(), calculated_key.into());
+        let calculated_assign = Assign::new(
+            vec![LValue::Index(calculated.clone())],
+            vec![
+                Binary::new(
+                    calculated.into(),
+                    local("increment").into(),
+                    BinaryOperation::Add,
+                )
+                .into(),
+            ],
+        );
+
+        assert!(!global_assign.to_string().contains("+="));
+        assert!(!calculated_assign.to_string().contains("+="));
+    }
+
+    #[test]
+    fn selected_call_stays_single_result_in_assignment_tail() {
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let assign = Assign::new(
+            vec![
+                LValue::Local(local("first")),
+                LValue::Local(local("second")),
+            ],
+            vec![Literal::Number(1.0).into(), selected.into()],
+        );
+
+        assert_eq!(assign.to_string(), "first, second = 1, (produce())");
+    }
+
+    #[test]
+    fn conditional_tail_disambiguates_following_parenthesized_call() {
+        let conditional = Conditional::new(
+            local("condition").into(),
+            local("selected").into(),
+            local("fallback").into(),
+        );
+        let result = local("result");
+        let next = Call::new(Table::default().into(), Vec::new());
+        let block = Block(vec![
+            Assign::new(vec![result.into()], vec![conditional.into()]).into(),
+            next.into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "result = if condition then selected else fallback;\n({})()"
         );
     }
 }

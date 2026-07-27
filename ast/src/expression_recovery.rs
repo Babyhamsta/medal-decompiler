@@ -112,6 +112,8 @@ fn inline_candidate(statement: &Statement) -> Option<(RcLocal, RValue)> {
     if matches!(
         value,
         RValue::Local(_)
+            | RValue::Call(_)
+            | RValue::MethodCall(_)
             | RValue::Closure(_)
             | RValue::Table(_)
             | RValue::VarArg(_)
@@ -164,6 +166,53 @@ fn replace_local_before_effect(
         return Some(true);
     }
 
+    match value {
+        RValue::Binary(binary)
+            if matches!(binary.operation, BinaryOperation::And | BinaryOperation::Or) =>
+        {
+            if let Some(replaced) =
+                replace_local_before_effect(&mut binary.left, target, replacement, crossed_effect)
+            {
+                return Some(replaced);
+            }
+            if binary.right.values_read().contains(&target) {
+                return Some(false);
+            }
+            if binary.has_side_effects()
+                || replacement.has_side_effects() && !binary.values_read().is_empty()
+            {
+                *crossed_effect = true;
+            }
+            return None;
+        }
+        RValue::Conditional(conditional) => {
+            if let Some(replaced) = replace_local_before_effect(
+                &mut conditional.condition,
+                target,
+                replacement,
+                crossed_effect,
+            ) {
+                return Some(replaced);
+            }
+            if conditional.then_value.values_read().contains(&target)
+                || conditional.else_value.values_read().contains(&target)
+            {
+                return Some(false);
+            }
+            if conditional.has_side_effects()
+                || replacement.has_side_effects() && !conditional.values_read().is_empty()
+            {
+                *crossed_effect = true;
+            }
+            return None;
+        }
+        RValue::MethodCall(method_call)
+        | RValue::Select(crate::Select::MethodCall(method_call)) => {
+            return replace_in_method_call(method_call, target, replacement, crossed_effect);
+        }
+        _ => {}
+    }
+
     for child in value.rvalues_mut() {
         if let Some(replaced) =
             replace_local_before_effect(child, target, replacement, crossed_effect)
@@ -171,8 +220,33 @@ fn replace_local_before_effect(
             return Some(replaced);
         }
     }
-    if has_observable_effect(value) {
+    if has_observable_effect(value)
+        || replacement.has_side_effects() && !value.values_read().is_empty()
+    {
         *crossed_effect = true;
+    }
+    None
+}
+
+fn replace_in_method_call(
+    method_call: &mut crate::MethodCall,
+    target: &RcLocal,
+    replacement: &RValue,
+    crossed_effect: &mut bool,
+) -> Option<bool> {
+    if let Some(replaced) =
+        replace_local_before_effect(&mut method_call.value, target, replacement, crossed_effect)
+    {
+        return Some(replaced);
+    }
+
+    *crossed_effect = true;
+    for argument in &mut method_call.arguments {
+        if let Some(replaced) =
+            replace_local_before_effect(argument, target, replacement, crossed_effect)
+        {
+            return Some(replaced);
+        }
     }
     None
 }
@@ -180,16 +254,34 @@ fn replace_local_before_effect(
 fn replace_in_consumer(statement: &mut Statement, target: &RcLocal, replacement: &RValue) -> bool {
     if !matches!(
         statement,
-        Statement::Assign(_)
-            | Statement::Call(_)
-            | Statement::MethodCall(_)
-            | Statement::Return(_)
-            | Statement::SetList(_)
+        Statement::Assign(_) | Statement::Call(_) | Statement::MethodCall(_) | Statement::Return(_)
     ) {
         return false;
     }
 
     let mut crossed_effect = false;
+    if let Statement::Assign(assign) = statement {
+        for lvalue in &assign.left {
+            if lvalue.has_side_effects()
+                || replacement.has_side_effects() && !lvalue.values_read().is_empty()
+            {
+                crossed_effect = true;
+            }
+        }
+        for value in &mut assign.right {
+            if let Some(replaced) =
+                replace_local_before_effect(value, target, replacement, &mut crossed_effect)
+            {
+                return replaced;
+            }
+        }
+        return false;
+    }
+    if let Statement::MethodCall(method_call) = statement {
+        return replace_in_method_call(method_call, target, replacement, &mut crossed_effect)
+            .unwrap_or(false);
+    }
+
     for value in statement.rvalues_mut() {
         if let Some(replaced) =
             replace_local_before_effect(value, target, replacement, &mut crossed_effect)
@@ -332,8 +424,9 @@ pub fn recover_expressions_with_protected(
 #[cfg(test)]
 mod tests {
     use crate::{
-        Assign, Binary, BinaryOperation, Block, Call, Global, If, LValue, Literal, Local, RValue,
-        RcLocal, Return, Select, Unary, UnaryOperation, recover_expressions_with_protected,
+        Assign, Binary, BinaryOperation, Block, Call, Global, If, LValue, Literal, Local,
+        MethodCall, RValue, RcLocal, Return, Select, Unary, UnaryOperation,
+        recover_expressions_with_protected,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -400,6 +493,25 @@ mod tests {
                 condition.into(),
                 Block(vec![assign(&left, Literal::Boolean(true).into())]),
                 Block(vec![assign(&right, Literal::Boolean(false).into())]),
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.conditionals, 0);
+        assert!(block[0].as_if().is_some());
+    }
+
+    #[test]
+    fn keeps_conditional_when_a_branch_does_not_assign() {
+        let condition = local("condition");
+        let result = local("result");
+        let mut block = Block(vec![
+            If::new(
+                condition.into(),
+                Block(vec![assign(&result, Literal::Boolean(true).into())]),
+                Block::default(),
             )
             .into(),
         ]);
@@ -499,6 +611,28 @@ mod tests {
     }
 
     #[test]
+    fn keeps_short_circuit_with_nonempty_else_branch() {
+        let first = local("first");
+        let next = local("next");
+        let fallback = local("fallback");
+        let result = local("result");
+        let mut block = Block(vec![
+            assign(&result, first.into()),
+            If::new(
+                result.clone().into(),
+                Block(vec![assign(&result, next.into())]),
+                Block(vec![assign(&result, fallback.into())]),
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.short_circuits, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
     fn keeps_short_circuit_for_protected_target() {
         let first = local("first");
         let third = local("third");
@@ -555,6 +689,21 @@ mod tests {
     }
 
     #[test]
+    fn keeps_open_call_variant_at_return_boundary() {
+        let temporary = local("temporary");
+        let call = Call::new(Global::from("produce").into(), Vec::new());
+        let mut block = Block(vec![
+            assign(&temporary, call.into()),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
     fn keeps_call_result_when_consumer_has_an_earlier_call() {
         let temporary = local("temporary");
         let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
@@ -568,6 +717,111 @@ mod tests {
 
         assert_eq!(stats.inlined_temporaries, 0);
         assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_call_result_before_method_lookup() {
+        let object = local("object");
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let consume = MethodCall::new(
+            object.into(),
+            "consume".to_owned(),
+            vec![temporary.clone().into()],
+        );
+        let mut block = Block(vec![assign(&temporary, selected.into()), consume.into()]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_effectful_value_out_of_short_circuit_branch() {
+        let condition = local("condition");
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let consumer = Binary::new(
+            condition.into(),
+            temporary.clone().into(),
+            BinaryOperation::And,
+        );
+        let mut block = Block(vec![
+            assign(&temporary, selected.into()),
+            Return::new(vec![consumer.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_effectful_value_before_earlier_local_read() {
+        let observed = local("observed");
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("mutate").into(), Vec::new()));
+        let mut block = Block(vec![
+            assign(&temporary, selected.into()),
+            Return::new(vec![observed.into(), temporary.clone().into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_value_before_effectful_assignment_target() {
+        let key = local("key");
+        let temporary = local("temporary");
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let target = crate::Index::new(
+            Call::new(Global::from("get_table").into(), Vec::new()).into(),
+            key.into(),
+        );
+        let consumer = Assign::new(vec![LValue::Index(target)], vec![temporary.clone().into()]);
+        let mut block = Block(vec![assign(&temporary, selected.into()), consumer.into()]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_expression_across_overwrite_and_structured_boundary() {
+        let input = local("input");
+        let condition = local("condition");
+        let temporary = local("temporary");
+        let arithmetic = Binary::new(
+            input.into(),
+            Literal::Number(1.0).into(),
+            BinaryOperation::Add,
+        );
+        let mut overwritten = Block(vec![
+            assign(&temporary, arithmetic.clone().into()),
+            assign(&temporary, Literal::Number(2.0).into()),
+            Return::new(vec![temporary.clone().into()]).into(),
+        ]);
+        let mut structured = Block(vec![
+            assign(&temporary, arithmetic.into()),
+            If::new(condition.into(), Block::default(), Block::default()).into(),
+            Return::new(vec![temporary.into()]).into(),
+        ]);
+
+        let overwritten_stats = recover_expressions_with_protected(&mut overwritten, &[]);
+        let structured_stats = recover_expressions_with_protected(&mut structured, &[]);
+
+        assert_eq!(overwritten_stats.inlined_temporaries, 1);
+        assert!(matches!(
+            overwritten[0].as_assign().unwrap().right[0],
+            RValue::Binary(_)
+        ));
+        assert_eq!(structured_stats.inlined_temporaries, 0);
     }
 
     #[test]
