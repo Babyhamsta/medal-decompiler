@@ -33,6 +33,14 @@ impl Global {
     pub fn origin(&self) -> GlobalOrigin {
         self.origin
     }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    pub fn into_name(self) -> Vec<u8> {
+        self.name
+    }
 }
 
 impl LocalRw for Global {}
@@ -51,6 +59,12 @@ impl<'a> From<&'a str> for Global {
     }
 }
 
+impl From<Vec<u8>> for Global {
+    fn from(name: Vec<u8>) -> Self {
+        Self::new(name)
+    }
+}
+
 impl fmt::Display for Global {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if Formatter::<fmt::Formatter>::is_valid_name(&self.name) {
@@ -62,5 +76,20 @@ impl fmt::Display for Global {
                 Formatter::<fmt::Formatter>::escape_string(&self.name)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Global, GlobalOrigin};
+
+    #[test]
+    fn vector_conversion_preserves_dynamic_name_access() {
+        let expected = b"possibly_dynamic".to_vec();
+        let global: Global = expected.clone().into();
+
+        assert_eq!(global.origin(), GlobalOrigin::Dynamic);
+        assert_eq!(global.name(), expected);
+        assert_eq!(global.into_name(), expected);
     }
 }

@@ -111,8 +111,30 @@ fn wonky_v12_output_has_no_trivial_local_aliases() {
     assert!(compiled.status.success());
     let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
     let aliases = trivial_local_alias_lines(&decompiled);
+    let module_local = decompiled
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("local ")?;
+            let (identifier, _) = rest.split_once(" = ")?;
+            is_identifier(identifier).then_some(identifier)
+        })
+        .expect("decompiled output should declare the module local");
+    let setmetatable_body = decompiled
+        .split_once("return setmetatable({")
+        .map(|(_, body)| body)
+        .expect("decompiled output should return the setmetatable call");
+    let direct_module_argument = format!("}}, {module_local})");
 
-    assert!(aliases.is_empty(), "trivial aliases remained: {aliases:#?}\n{decompiled}");
+    assert!(
+        aliases.is_empty(),
+        "trivial aliases remained: {aliases:#?}\n{decompiled}"
+    );
+    assert!(
+        setmetatable_body
+            .lines()
+            .any(|line| line.trim() == direct_module_argument),
+        "setmetatable did not receive module local {module_local} directly\n{decompiled}"
+    );
 }
 
 #[test]
