@@ -199,6 +199,47 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         table.0.iter().any(|(_, v)| matches!(v, RValue::Table(_x)))
     }
 
+    fn stable_compound_index_component(value: &RValue) -> bool {
+        matches!(value, RValue::Local(_) | RValue::Literal(_))
+            || matches!(
+                value,
+                RValue::Global(global)
+                    if global.origin() == crate::GlobalOrigin::CompilerImport
+            )
+    }
+
+    fn compound_assignment(assign: &Assign) -> Option<(&LValue, BinaryOperation, &RValue)> {
+        if assign.prefix || assign.parallel || assign.left.len() != 1 || assign.right.len() != 1 {
+            return None;
+        }
+        let binary = assign.right[0].as_binary()?;
+        if !matches!(
+            binary.operation,
+            BinaryOperation::Add
+                | BinaryOperation::Sub
+                | BinaryOperation::Mul
+                | BinaryOperation::Div
+                | BinaryOperation::IDiv
+                | BinaryOperation::Mod
+                | BinaryOperation::Pow
+                | BinaryOperation::Concat
+        ) {
+            return None;
+        }
+
+        let target = &assign.left[0];
+        let same_target = match (target, binary.left.as_ref()) {
+            (LValue::Local(target), RValue::Local(read)) => target == read,
+            (LValue::Index(target), RValue::Index(read)) => {
+                target == read
+                    && Self::stable_compound_index_component(&target.left)
+                    && Self::stable_compound_index_component(&target.right)
+            }
+            _ => false,
+        };
+        same_target.then_some((target, binary.operation, binary.right.as_ref()))
+    }
+
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
         let compacted = table.without_shadowed_literal_fields();
         let table = &compacted;
@@ -663,6 +704,12 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             }
         }
 
+        if let Some((target, operation, value)) = Self::compound_assignment(assign) {
+            self.format_lvalue(target)?;
+            write!(self.output, " {}= ", operation)?;
+            return self.format_rvalue(value);
+        }
+
         for (i, lvalue) in assign.left.iter().enumerate() {
             if i != 0 {
                 write!(self.output, ", ")?;
@@ -803,5 +850,95 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             Statement::Return(r#return) => self.format_return(r#return),
             _ => write!(self.output, "{}", statement),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Assign, Binary, BinaryOperation, Call, Global, Index, LValue, Local, RValue, RcLocal,
+    };
+
+    fn local(name: &str) -> RcLocal {
+        RcLocal::new(Local::new(Some(name.to_owned())))
+    }
+
+    #[test]
+    fn compound_formats_local_update() {
+        let value = local("value");
+        let increment = local("increment");
+        let assign = Assign::new(
+            vec![LValue::Local(value.clone())],
+            vec![Binary::new(value.into(), increment.into(), BinaryOperation::Add).into()],
+        );
+
+        assert_eq!(assign.to_string(), "value += increment");
+    }
+
+    #[test]
+    fn compound_formats_stable_index_update() {
+        let object = local("object");
+        let key = local("key");
+        let increment = local("increment");
+        let index = Index::new(object.into(), key.into());
+        let assign = Assign::new(
+            vec![LValue::Index(index.clone())],
+            vec![Binary::new(RValue::Index(index), increment.into(), BinaryOperation::Add).into()],
+        );
+
+        assert_eq!(assign.to_string(), "object[key] += increment");
+    }
+
+    #[test]
+    fn compound_keeps_non_equivalent_assignments_expanded() {
+        let value = local("value");
+        let other = local("other");
+        let increment = local("increment");
+
+        let different_left = Assign::new(
+            vec![LValue::Local(value.clone())],
+            vec![
+                Binary::new(
+                    other.clone().into(),
+                    increment.clone().into(),
+                    BinaryOperation::Add,
+                )
+                .into(),
+            ],
+        );
+        let reversed = Assign::new(
+            vec![LValue::Local(value.clone())],
+            vec![Binary::new(other.into(), value.clone().into(), BinaryOperation::Add).into()],
+        );
+        let logical = Assign::new(
+            vec![LValue::Local(value.clone())],
+            vec![Binary::new(value.clone().into(), increment.into(), BinaryOperation::And).into()],
+        );
+        let multiple = Assign::new(
+            vec![LValue::Local(value), LValue::Local(local("second"))],
+            vec![RValue::Local(local("first")), RValue::Local(local("next"))],
+        );
+
+        assert_eq!(different_left.to_string(), "value = other + increment");
+        assert_eq!(reversed.to_string(), "value = other + value");
+        assert_eq!(logical.to_string(), "value = value and increment");
+        assert_eq!(multiple.to_string(), "value, second = first, next");
+    }
+
+    #[test]
+    fn compound_keeps_effectful_index_components_expanded() {
+        let key = local("key");
+        let increment = local("increment");
+        let object = Call::new(Global::from("fetch").into(), Vec::new());
+        let index = Index::new(object.into(), key.into());
+        let assign = Assign::new(
+            vec![LValue::Index(index.clone())],
+            vec![Binary::new(RValue::Index(index), increment.into(), BinaryOperation::Add).into()],
+        );
+
+        assert_eq!(
+            assign.to_string(),
+            "(fetch())[key] = (fetch())[key] + increment"
+        );
     }
 }
