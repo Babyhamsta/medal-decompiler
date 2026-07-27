@@ -50,9 +50,7 @@ fn replace_after_safe_prefix(statement: &mut Statement, alias: &RcLocal, source:
                     *rvalue = source.clone().into();
                     return Some(true);
                 }
-                if rvalue.has_side_effects()
-                    && !matches!(rvalue, RValue::Global(_) | RValue::Literal(_))
-                {
+                if rvalue.has_side_effects() {
                     crossed_effect = true;
                 }
             }
@@ -76,6 +74,9 @@ pub fn eliminate_aliases(block: &mut Block) -> usize {
         if block[index + 1..=read_at]
             .iter()
             .any(|statement| statement.values_written().contains(&&source))
+            || block[index + 1..read_at]
+                .iter()
+                .any(SideEffects::has_side_effects)
         {
             index += 1;
             continue;
@@ -146,6 +147,38 @@ mod tests {
         let mut block = Block(vec![
             Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
             Return::new(vec![call.into(), alias.clone().into()]).into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 0);
+        assert!(block[0].values_written().contains(&&alias));
+    }
+
+    #[test]
+    fn keeps_snapshot_alias_when_call_occurs_before_use_statement() {
+        let source = RcLocal::default();
+        let alias = RcLocal::default();
+        let call = crate::Call::new(crate::Global::from("mutate").into(), Vec::new());
+        let mut block = Block(vec![
+            Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+            call.into(),
+            Return::new(vec![alias.clone().into()]).into(),
+        ]);
+
+        assert_eq!(eliminate_aliases(&mut block), 0);
+        assert!(block[0].values_written().contains(&&alias));
+    }
+
+    #[test]
+    fn keeps_snapshot_alias_when_global_lookup_runs_before_use() {
+        let source = RcLocal::default();
+        let alias = RcLocal::default();
+        let mut block = Block(vec![
+            Assign::new(vec![alias.clone().into()], vec![source.clone().into()]).into(),
+            Return::new(vec![
+                crate::Global::from("possibly_dynamic").into(),
+                alias.clone().into(),
+            ])
+            .into(),
         ]);
 
         assert_eq!(eliminate_aliases(&mut block), 0);
