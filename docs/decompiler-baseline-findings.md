@@ -257,7 +257,7 @@ allocation differs.
 
 ### Static verification
 
-- `cargo +nightly test --workspace --offline`: 76 passed, 0 failed.
+- `cargo +nightly test --workspace --offline`: 78 passed, 0 failed.
 - `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
 - V9-V12/current-profile compiler round trips: 240/240; 0 source compile
   failures, 0 decompile failures, 0 recompile failures, and 0 generated gotos.

@@ -33,7 +33,7 @@
 - Produces: `RValue::Conditional(Conditional)`.
 - Preserves: recursive `LocalRw`, `Traverse`, and `SideEffects` behavior.
 
-- [ ] **Step 1: Write failing formatter and traversal tests**
+- [x] **Step 1: Write failing formatter and traversal tests**
 
 Construct literal and local-backed conditional expressions and assert:
 
@@ -46,7 +46,7 @@ assert_eq!(
 
 Also assert that all three operands contribute reads and side effects.
 
-- [ ] **Step 2: Run the focused test and verify the missing node fails**
+- [x] **Step 2: Run the focused test and verify the missing node fails**
 
 Run:
 
@@ -56,7 +56,7 @@ cargo +nightly test -p ast conditional --offline
 
 Expected: compile failure because `Conditional` and `RValue::Conditional` do not exist.
 
-- [ ] **Step 3: Implement the node and formatter**
+- [x] **Step 3: Implement the node and formatter**
 
 Add boxed `condition`, `then_value`, and `else_value` fields. Format nested else-side conditional expressions using `elseif`; otherwise emit:
 
@@ -66,7 +66,7 @@ if condition then thenValue else elseValue
 
 Treat the expression as lower precedence than binary operators so embedding remains unambiguous.
 
-- [ ] **Step 4: Run focused and AST tests**
+- [x] **Step 4: Run focused and AST tests**
 
 Run:
 
@@ -76,7 +76,7 @@ cargo +nightly test -p ast --offline
 
 Expected: all AST tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ast/src/conditional.rs ast/src/lib.rs ast/src/formatter.rs
@@ -98,7 +98,7 @@ git commit -m "feat: add Luau conditional expressions"
 - Produces: counters for recovered conditionals, short circuits, and inlined temporaries.
 - Consumes: incoming upvalues supplied by `decompile_function`.
 
-- [ ] **Step 1: Write a failing conditional-assignment test**
+- [x] **Step 1: Write a failing conditional-assignment test**
 
 Build:
 
@@ -118,7 +118,7 @@ if condition then false else fallback()
 
 The falsy branch proves this is a real conditional expression, not the unsafe `condition and false or fallback()` encoding.
 
-- [ ] **Step 2: Write failing safety tests**
+- [x] **Step 2: Write failing safety tests**
 
 Assert no fold when:
 
@@ -127,7 +127,7 @@ Assert no fold when:
 - a branch omits the assignment;
 - a branch expression captures or reads the assigned local during a declaration-sensitive initialization.
 
-- [ ] **Step 3: Run and verify the focused failures**
+- [x] **Step 3: Run and verify the focused failures**
 
 Run:
 
@@ -137,11 +137,11 @@ cargo +nightly test -p ast expression_recovery --offline
 
 Expected: compile failure because the pass does not exist.
 
-- [ ] **Step 4: Implement conditional folding**
+- [x] **Step 4: Implement conditional folding**
 
 Recursively visit structured blocks. Replace an `If` only when both branches contain exactly one one-local/one-value assignment to the same local. Move the condition and branch values into `RValue::Conditional`, and keep the local identity unchanged for later declaration placement.
 
-- [ ] **Step 5: Write and verify a failing short-circuit-chain test**
+- [x] **Step 5: Write and verify a failing short-circuit-chain test**
 
 Build:
 
@@ -160,11 +160,11 @@ result = first and second and third
 
 Add negative tests for a non-empty else branch, a different target, a target read inside `third`, and reference-captured/incoming upvalues.
 
-- [ ] **Step 6: Implement short-circuit folding**
+- [x] **Step 6: Implement short-circuit folding**
 
 Require adjacent statements, exact target identity, an empty else block, and no target read or protected capture in the appended expression. Preserve operand order by appending the expression to the right of the existing value.
 
-- [ ] **Step 7: Integrate the pass**
+- [x] **Step 7: Integrate the pass**
 
 Call expression recovery immediately after:
 
@@ -174,7 +174,7 @@ ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
 
 and before `LocalDeclarer`.
 
-- [ ] **Step 8: Run focused and workspace tests**
+- [x] **Step 8: Run focused and workspace tests**
 
 Run:
 
@@ -185,7 +185,7 @@ cargo +nightly test --workspace --offline
 
 Expected: all tests pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add ast/src/expression_recovery.rs ast/src/lib.rs luau-lifter/src/lib.rs
@@ -205,7 +205,7 @@ git commit -m "feat: recover Luau conditional expressions"
 - Extends: `recover_expressions_with_protected`.
 - Preserves: `RValue::Select` when an assignment captured exactly one call result.
 
-- [ ] **Step 1: Write failing direct-use tests**
+- [x] **Step 1: Write failing direct-use tests**
 
 Cover:
 
@@ -223,7 +223,7 @@ return temporary
 
 Assert the first becomes `return arithmetic`; assert the second becomes `return (produce())`, not `return produce()`.
 
-- [ ] **Step 2: Write failing ordering tests**
+- [x] **Step 2: Write failing ordering tests**
 
 Keep the temporary when inlining would move it after:
 
@@ -233,7 +233,7 @@ Keep the temporary when inlining would move it after:
 - a write to any local read by the candidate;
 - an incoming or reference-captured upvalue boundary.
 
-- [ ] **Step 3: Run and verify the failures**
+- [x] **Step 3: Run and verify the failures**
 
 Run:
 
@@ -243,11 +243,11 @@ cargo +nightly test -p ast expression_recovery --offline
 
 Expected: assertions fail because non-alias expressions are not inlined.
 
-- [ ] **Step 4: Implement ordered single-use inlining**
+- [x] **Step 4: Implement ordered single-use inlining**
 
 Require one local target, one later read, no target overwrite, no source-local write, and no structured-control boundary. Move the expression only across effect-free statements and only into the consumer prefix before any observable expression. Preserve the original `Call` versus `Select::Call` variant.
 
-- [ ] **Step 5: Make return formatting preserve single-result selection**
+- [x] **Step 5: Make return formatting preserve single-result selection**
 
 Wrap a final `RValue::Select` in a return list:
 
@@ -257,7 +257,7 @@ return (produce())
 
 Do not wrap non-final values because Luau already selects one result there.
 
-- [ ] **Step 6: Run focused and AST tests**
+- [x] **Step 6: Run focused and AST tests**
 
 Run:
 
@@ -267,7 +267,7 @@ cargo +nightly test -p ast --offline
 
 Expected: all AST tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add ast/src/expression_recovery.rs ast/src/formatter.rs
@@ -286,7 +286,7 @@ git commit -m "feat: inline single-use Luau expressions"
 - Preserves: `Assign` as the semantic AST node.
 - Produces: compound syntax for `Add`, `Sub`, `Mul`, `Div`, `IDiv`, `Mod`, `Pow`, and `Concat`.
 
-- [ ] **Step 1: Write failing local and indexed formatting tests**
+- [x] **Step 1: Write failing local and indexed formatting tests**
 
 Assert:
 
@@ -302,7 +302,7 @@ value += increment
 
 and a structurally identical local-backed `table[key]` update formats with `+=`.
 
-- [ ] **Step 2: Write failing rejection tests**
+- [x] **Step 2: Write failing rejection tests**
 
 Keep ordinary assignment for:
 
@@ -312,7 +312,7 @@ Keep ordinary assignment for:
 - `and` and `or`;
 - indexed object/key expressions containing calls, indexing, or metamethod-capable calculations.
 
-- [ ] **Step 3: Run and verify the focused failures**
+- [x] **Step 3: Run and verify the focused failures**
 
 Run:
 
@@ -322,11 +322,11 @@ cargo +nightly test -p ast formatter::tests::compound --offline
 
 Expected: existing formatter emits `=`.
 
-- [ ] **Step 4: Implement formatter detection**
+- [x] **Step 4: Implement formatter detection**
 
 Match only `left = left <op> right`. Local targets are safe. Indexed targets require structurally equal reads and effect-free local/global/literal object and key components so compound syntax does not change evaluation count.
 
-- [ ] **Step 5: Run AST tests and compile a syntax probe**
+- [x] **Step 5: Run AST tests and compile a syntax probe**
 
 Run:
 
@@ -337,7 +337,7 @@ cargo +nightly test -p ast --offline
 
 Expected: tests and static compilation pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add ast/src/formatter.rs
@@ -356,7 +356,7 @@ git commit -m "feat: format safe Luau compound assignments"
 - Consumes: the same 240 source/profile pairs as the alias baseline.
 - Produces: exact before/after counts and representative source/output comparisons.
 
-- [ ] **Step 1: Run focused corpus cases**
+- [x] **Step 1: Run focused corpus cases**
 
 Run:
 
@@ -368,7 +368,7 @@ python tools/run_luau_corpus.py --profiles all --case 24_wonky_integration --no-
 
 Expected: 30/30 compile, decompile, and recompile checks pass.
 
-- [ ] **Step 2: Run the full static matrix**
+- [x] **Step 2: Run the full static matrix**
 
 Run:
 
@@ -380,15 +380,15 @@ python tools/run_luau_corpus.py --profiles all --no-build --output tests/luau_co
 
 Expected: all Rust/Python tests pass; 240/240 corpus rows pass; generated gotos remain zero.
 
-- [ ] **Step 3: Compare output**
+- [x] **Step 3: Compare output**
 
 Record total locals/statements/lines plus counts of recovered conditional expressions, compound assignments, and split short-circuit assignment/`if` pairs. Review cases 02, 04, 10, 11, and 24 across O0/g1, O1/g1, O2/g1, O2/g0, V9, and V12.
 
-- [ ] **Step 4: Document evidence**
+- [x] **Step 4: Document evidence**
 
 Add only comparable before/after counts, safety boundaries, remaining compiler-erased ambiguity, and representative snippets to `docs/decompiler-baseline-findings.md`.
 
-- [ ] **Step 5: Final review**
+- [x] **Step 5: Final review**
 
 Review the complete diff for corpus-specific logic, evaluation-order changes, closure/upvalue capture changes, and multi-return regressions. Repair every Critical or Important finding and repeat the affected gates.
 
