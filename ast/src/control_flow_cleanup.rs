@@ -135,18 +135,33 @@ fn flatten_terminal_branches(block: &mut Block, stats: &mut ControlFlowCleanupSt
     }
 }
 
-fn recover_loop_tail_guard(block: &mut Block, stats: &mut ControlFlowCleanupStats) {
+fn recover_loop_tail_guard(block: &mut Block, stats: &mut ControlFlowCleanupStats) -> bool {
     let Some(last) = block.last_mut() else {
-        return;
+        return false;
     };
     let Some(r#if) = last.as_if_mut() else {
-        return;
+        return false;
     };
-    if !r#if.else_block.lock().is_empty()
-        || r#if.then_block.lock().is_empty()
-        || block_terminates(&r#if.then_block.lock())
-    {
-        return;
+
+    let then_block = r#if.then_block.lock();
+    let complex_body = then_block.len() >= 2
+        || then_block.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::If(_)
+                    | Statement::While(_)
+                    | Statement::Repeat(_)
+                    | Statement::NumericFor(_)
+                    | Statement::GenericFor(_)
+            )
+        });
+    let should_preserve = !r#if.else_block.lock().is_empty()
+        || then_block.is_empty()
+        || block_terminates(&then_block)
+        || !complex_body;
+    drop(then_block);
+    if should_preserve {
+        return false;
     }
 
     invert_condition_in_place(&mut r#if.condition);
@@ -154,16 +169,19 @@ fn recover_loop_tail_guard(block: &mut Block, stats: &mut ControlFlowCleanupStat
     r#if.then_block.lock().push(Continue {}.into());
     block.0.extend(body);
     stats.loop_guards += 1;
+    true
 }
 
 fn clean_block(block: &mut Block, loop_body: bool, stats: &mut ControlFlowCleanupStats) {
-    for statement in &mut block.0 {
-        clean_statement(statement, stats);
-    }
-    normalize_empty_branches(block, stats);
-    flatten_terminal_branches(block, stats);
-    if loop_body {
-        recover_loop_tail_guard(block, stats);
+    loop {
+        for statement in &mut block.0 {
+            clean_statement(statement, stats);
+        }
+        normalize_empty_branches(block, stats);
+        flatten_terminal_branches(block, stats);
+        if !loop_body || !recover_loop_tail_guard(block, stats) {
+            break;
+        }
     }
 }
 
@@ -176,8 +194,8 @@ pub fn cleanup_control_flow(block: &mut Block) -> ControlFlowCleanupStats {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Assign, Block, Call, Global, If, LValue, Literal, Local, RValue, RcLocal, Return,
-        Statement, UnaryOperation, While,
+        Assign, Binary, BinaryOperation, Block, Call, Global, If, Index, LValue, Literal, Local,
+        RValue, RcLocal, Return, Statement, UnaryOperation, While,
     };
 
     use super::cleanup_control_flow;
@@ -272,16 +290,27 @@ mod tests {
     fn removes_only_pure_empty_conditionals() {
         let condition = local("condition");
         let effectful = Call::new(Global::from("observe").into(), Vec::new());
+        let indexed = Index::new(
+            Global::from("object").into(),
+            Literal::String(b"enabled".to_vec()).into(),
+        );
+        let compared = Binary::new(
+            Global::from("left").into(),
+            Global::from("right").into(),
+            BinaryOperation::Equal,
+        );
         let mut block = Block(vec![
             If::new(condition.into(), Block::default(), Block::default()).into(),
             If::new(effectful.into(), Block::default(), Block::default()).into(),
+            If::new(indexed.into(), Block::default(), Block::default()).into(),
+            If::new(compared.into(), Block::default(), Block::default()).into(),
         ]);
 
         let stats = cleanup_control_flow(&mut block);
 
         assert_eq!(stats.removed_empty, 1);
-        assert_eq!(block.len(), 1);
-        assert!(block[0].as_if().is_some());
+        assert_eq!(block.len(), 3);
+        assert!(block.iter().all(|statement| statement.as_if().is_some()));
     }
 
     #[test]
@@ -291,7 +320,7 @@ mod tests {
         let loop_body = Block(vec![
             If::new(
                 enabled.clone().into(),
-                Block(vec![assign(&value, 1.0)]),
+                Block(vec![assign(&value, 1.0), assign(&value, 2.0)]),
                 Block::default(),
             )
             .into(),
@@ -304,13 +333,14 @@ mod tests {
         let loop_body = block[0].as_while().unwrap().block.lock();
 
         assert_eq!(stats.loop_guards, 1);
-        assert_eq!(loop_body.len(), 2);
+        assert_eq!(loop_body.len(), 3);
         let guard = loop_body[0].as_if().unwrap();
         assert!(guard.then_block.lock()[0].as_continue().is_some());
         assert!(matches!(&guard.condition, RValue::Unary(unary)
                 if unary.operation == UnaryOperation::Not
                     && matches!(unary.value.as_ref(), RValue::Local(local) if local == &enabled)));
         assert!(loop_body[1].as_assign().is_some());
+        assert!(loop_body[2].as_assign().is_some());
     }
 
     #[test]
@@ -324,7 +354,7 @@ mod tests {
         let loop_body = Block(vec![
             If::new(
                 condition.into(),
-                Block(vec![assign(&value, 1.0)]),
+                Block(vec![assign(&value, 1.0), assign(&value, 2.0)]),
                 Block::default(),
             )
             .into(),
@@ -361,5 +391,68 @@ mod tests {
         assert_eq!(stats.loop_guards, 0);
         assert_eq!(loop_body.len(), 1);
         assert!(loop_body[0].as_if().is_some());
+    }
+
+    #[test]
+    fn keeps_simple_loop_tail_conditional() {
+        let condition = local("condition");
+        let value = local("value");
+        let loop_body = Block(vec![
+            If::new(
+                condition.into(),
+                Block(vec![assign(&value, 1.0)]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+        let mut block = Block(vec![
+            While::new(Literal::Boolean(true).into(), loop_body).into(),
+        ]);
+
+        let stats = cleanup_control_flow(&mut block);
+        let loop_body = block[0].as_while().unwrap().block.lock();
+
+        assert_eq!(stats.loop_guards, 0);
+        assert_eq!(loop_body.len(), 1);
+        assert!(loop_body[0].as_if().is_some());
+    }
+
+    #[test]
+    fn cleans_nested_loop_tails_to_a_fixed_point() {
+        let outer = local("outer");
+        let inner = local("inner");
+        let value = local("value");
+        let nested = If::new(
+            inner.into(),
+            Block(vec![assign(&value, 2.0), assign(&value, 3.0)]),
+            Block::default(),
+        );
+        let loop_body = Block(vec![
+            If::new(
+                outer.into(),
+                Block(vec![assign(&value, 1.0), nested.into()]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+        let mut block = Block(vec![
+            While::new(Literal::Boolean(true).into(), loop_body).into(),
+        ]);
+
+        let stats = cleanup_control_flow(&mut block);
+        let loop_body = block[0].as_while().unwrap().block.lock();
+
+        assert_eq!(stats.loop_guards, 2);
+        assert_eq!(loop_body.len(), 5);
+        assert!(
+            loop_body[0].as_if().unwrap().then_block.lock()[0]
+                .as_continue()
+                .is_some()
+        );
+        assert!(
+            loop_body[2].as_if().unwrap().then_block.lock()[0]
+                .as_continue()
+                .is_some()
+        );
     }
 }
