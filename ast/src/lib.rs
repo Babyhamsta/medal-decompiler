@@ -15,6 +15,7 @@ use std::{
 mod alias_elimination;
 mod assign;
 mod binary;
+mod binding_validation;
 mod r#break;
 mod call;
 mod class;
@@ -52,6 +53,7 @@ mod r#while;
 pub use alias_elimination::*;
 pub use assign::*;
 pub use binary::*;
+pub use binding_validation::*;
 pub use r#break::*;
 pub use call::*;
 pub use class::*;

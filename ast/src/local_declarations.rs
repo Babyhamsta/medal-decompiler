@@ -20,30 +20,46 @@ pub struct LocalDeclarer {
     block_to_node: FxHashMap<ByAddress<Arc<Mutex<Block>>>, NodeIndex>,
     graph: DiGraph<(Option<Arc<Mutex<Block>>>, usize), ()>,
     local_usages: IndexMap<RcLocal, FxHashMap<NodeIndex, usize>>,
+    intrinsic_declarations: FxHashSet<RcLocal>,
     declarations: FxHashMap<ByAddress<Arc<Mutex<Block>>>, BTreeMap<usize, IndexSet<RcLocal>>>,
 }
 
 impl LocalDeclarer {
+    fn record_usage(&mut self, local: RcLocal, node: NodeIndex, stat_index: usize) {
+        self.local_usages
+            .entry(local)
+            .or_default()
+            .entry(node)
+            .and_modify(|first| *first = (*first).min(stat_index))
+            .or_insert(stat_index);
+    }
+
     fn visit(&mut self, block: Arc<Mutex<Block>>, stat_index: usize) -> NodeIndex {
         let node = self.graph.add_node((Some(block.clone()), stat_index));
         self.block_to_node.insert(block.clone().into(), node);
         for (stat_index, stat) in block.lock().iter().enumerate() {
-            // for loops already declare their own locals :)
-            if !matches!(
-                stat,
-                Statement::Class(_) | Statement::GenericFor(_) | Statement::NumericFor(_)
-            ) {
-                // we only visit locals written because locals are guaranteed to be written
-                // before they are read.
-                // TODO: move to seperate function and visit breadth-first?
-                for local in stat.values_written() {
-                    self.local_usages
-                        .entry(local.clone())
-                        .or_default()
-                        .entry(node)
-                        .or_insert(stat_index);
+            match stat {
+                Statement::Class(class) => {
+                    self.intrinsic_declarations.insert(class.target.clone());
+                }
+                Statement::GenericFor(for_) => {
+                    self.intrinsic_declarations
+                        .extend(for_.res_locals.iter().cloned());
+                }
+                Statement::NumericFor(for_) => {
+                    self.intrinsic_declarations.insert(for_.counter.clone());
+                }
+                _ => {}
+            }
+
+            // A repeat condition shares the body's lexical scope, so recording it
+            // against the parent would incorrectly hoist body locals.
+            if !matches!(stat, Statement::Repeat(_)) {
+                for local in stat.values() {
+                    self.record_usage(local.clone(), node, stat_index);
                 }
             }
+
             match stat {
                 Statement::If(r#if) => {
                     let if_node = self.graph.add_node((None, stat_index));
@@ -60,6 +76,10 @@ impl LocalDeclarer {
                 Statement::Repeat(repeat) => {
                     let child = self.visit(r#repeat.block.clone(), stat_index);
                     self.graph.add_edge(node, child, ());
+                    let condition_index = repeat.block.lock().len();
+                    for local in repeat.condition.values_read() {
+                        self.record_usage(local.clone(), child, condition_index);
+                    }
                 }
                 Statement::NumericFor(numeric_for) => {
                     let child = self.visit(r#numeric_for.block.clone(), stat_index);
@@ -83,7 +103,7 @@ impl LocalDeclarer {
         let root_node = self.visit(root_block, 0);
         let dominators = simple_fast(&self.graph, root_node);
         for (local, usages) in self.local_usages {
-            if locals_to_ignore.contains(&local) {
+            if locals_to_ignore.contains(&local) || self.intrinsic_declarations.contains(&local) {
                 continue;
             }
             let (mut node, mut first_stat_index) = if usages.len() == 1 {
@@ -99,25 +119,22 @@ impl LocalDeclarer {
                     common_dominators = common_dominators.intersect(node_dominators);
                 }
                 let common_dominator = common_dominators[0];
-                if let Some((_, first_stat_index)) =
-                    usages.into_iter().find(|&(n, _)| n == common_dominator)
+                let mut first_stat_index = usages.get(&common_dominator).copied();
+                for child in self
+                    .graph
+                    .neighbors_directed(common_dominator, Direction::Outgoing)
                 {
-                    (common_dominator, first_stat_index)
-                } else {
-                    // find the left-most dominated node
-                    let mut first_stat_index = None;
-                    for child in self
-                        .graph
-                        .neighbors_directed(common_dominator, Direction::Outgoing)
+                    if node_dominators
+                        .iter()
+                        .any(|usage_dominators| usage_dominators.contains(&child))
                     {
-                        for node_dominators in &node_dominators {
-                            if node_dominators.contains(&child) {
-                                first_stat_index = Some(self.graph.node_weight(child).unwrap().1);
-                            }
-                        }
+                        let child_index = self.graph.node_weight(child).unwrap().1;
+                        first_stat_index = Some(
+                            first_stat_index.map_or(child_index, |first| first.min(child_index)),
+                        );
                     }
-                    (common_dominator, first_stat_index.unwrap())
                 }
+                (common_dominator, first_stat_index.unwrap())
             };
             while let (block, parent_stat_index) = self.graph.node_weight(node).unwrap()
                 && block.is_none()
@@ -148,23 +165,20 @@ impl LocalDeclarer {
         for (ByAddress(block), declarations) in self.declarations {
             let mut block = block.lock();
             for (stat_index, mut locals) in declarations.into_iter().rev() {
-                match &mut block[stat_index] {
-                    Statement::Assign(assign)
-                        if assign
+                if let Some(Statement::Assign(assign)) = block.get_mut(stat_index)
+                    && assign
+                        .left
+                        .iter()
+                        .all(|l| l.as_local().is_some_and(|l| locals.contains(l)))
+                {
+                    locals.retain(|l| {
+                        !assign
                             .left
                             .iter()
-                            .all(|l| l.as_local().is_some_and(|l| locals.contains(l))) =>
-                    {
-                        locals.retain(|l| {
-                            !assign
-                                .left
-                                .iter()
-                                .map(|l| l.as_local().unwrap())
-                                .contains(l)
-                        });
-                        assign.prefix = true;
-                    }
-                    _ => {}
+                            .map(|l| l.as_local().unwrap())
+                            .contains(l)
+                    });
+                    assign.prefix = true;
                 }
                 if !locals.is_empty() {
                     let mut declaration =
@@ -174,5 +188,84 @@ impl LocalDeclarer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rustc_hash::FxHashSet;
+
+    use super::LocalDeclarer;
+    use crate::{Assign, Block, Literal, Local, RValue, RcLocal, Repeat, Return, Statement};
+    use parking_lot::Mutex;
+    use triomphe::Arc;
+
+    fn local(name: &str) -> RcLocal {
+        RcLocal::new(Local::new(Some(name.to_owned())))
+    }
+
+    fn declarations(block: &Block) -> BTreeSet<RcLocal> {
+        block
+            .iter()
+            .filter_map(Statement::as_assign)
+            .filter(|assign| assign.prefix)
+            .flat_map(|assign| {
+                assign
+                    .left
+                    .iter()
+                    .filter_map(|value| value.as_local())
+                    .cloned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeat_condition_uses_the_body_scope() {
+        let incoming = local("incoming");
+        let snapshot = local("snapshot");
+        let repeat = Repeat::new(
+            RValue::Local(snapshot.clone()),
+            Block(vec![
+                Assign::new(vec![snapshot.clone().into()], vec![incoming.clone().into()]).into(),
+            ]),
+        );
+        let repeat_body = repeat.block.clone();
+        let root = Arc::new(Mutex::new(Block(vec![repeat.into()])));
+
+        LocalDeclarer::default().declare_locals(root.clone(), &FxHashSet::from_iter([incoming]));
+
+        assert!(declarations(&root.lock()).is_empty());
+        let body = repeat_body.lock();
+        assert!(body[0].as_assign().unwrap().prefix);
+        assert_eq!(declarations(&body), BTreeSet::from([snapshot]));
+    }
+
+    #[test]
+    fn loop_carried_value_used_after_repeat_is_declared_before_it() {
+        let incoming = local("incoming");
+        let carried = local("carried");
+        let repeat = Repeat::new(
+            RValue::Local(carried.clone()),
+            Block(vec![
+                Assign::new(
+                    vec![carried.clone().into()],
+                    vec![Literal::Boolean(true).into()],
+                )
+                .into(),
+            ]),
+        );
+        let root = Arc::new(Mutex::new(Block(vec![
+            repeat.into(),
+            Return::new(vec![carried.clone().into()]).into(),
+        ])));
+
+        LocalDeclarer::default().declare_locals(root.clone(), &FxHashSet::from_iter([incoming]));
+
+        let root = root.lock();
+        assert_eq!(declarations(&root), BTreeSet::from([carried]));
+        assert!(root[0].as_assign().unwrap().prefix);
+        assert!(root[0].as_assign().unwrap().right.is_empty());
     }
 }

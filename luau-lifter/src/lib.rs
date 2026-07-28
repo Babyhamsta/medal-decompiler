@@ -366,11 +366,22 @@ fn decompile_function(
 
     let block = Arc::new(Mutex::new(block));
     catch_phase(DecompilePhase::Declaration, Some(function_id), None, || {
+        let initially_visible = upvalues_in.iter().chain(params.iter()).cloned().collect();
         LocalDeclarer::default().declare_locals(
             // TODO: why does block.clone() not work?
             Arc::clone(&block),
-            &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+            &initially_visible,
         );
+        ast::validate_bindings(&block.lock(), &initially_visible)
+    })?
+    .map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Declaration,
+            Some(function_id),
+            None,
+            "every local reference resolves to its lexical binding",
+            error.to_string(),
+        )
     })?;
 
     catch_phase(DecompilePhase::AstRecovery, Some(function_id), None, || {
