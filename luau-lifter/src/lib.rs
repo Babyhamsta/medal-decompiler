@@ -30,7 +30,7 @@ use petgraph::algo::dominators::simple_fast;
 use rayon::prelude::*;
 
 use anyhow::anyhow;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 use walkdir::WalkDir;
 
@@ -177,8 +177,8 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, String> 
     if block_contains_unsupported_jump(&mut body) {
         return Err("control-flow structuring left unsupported goto or label nodes".to_owned());
     }
-    name_locals(&mut body, true);
     ast::recover_function_syntax(&mut body);
+    name_locals(&mut body, false);
     Ok(body.to_string())
 }
 
@@ -331,10 +331,27 @@ fn link_upvalues(
     body: &mut ast::Block,
     upvalues: &mut FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>>,
 ) {
+    let mut promoted_names = FxHashMap::<ast::RcLocal, FxHashSet<String>>::default();
+    link_upvalues_in_scope(body, upvalues, &mut promoted_names);
+    for (target, names) in promoted_names {
+        if names.len() == 1 {
+            let mut target = target.0.0.lock();
+            if target.0.is_none() {
+                target.0 = names.into_iter().next();
+            }
+        }
+    }
+}
+
+fn link_upvalues_in_scope(
+    body: &mut ast::Block,
+    upvalues: &mut FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>>,
+    promoted_names: &mut FxHashMap<ast::RcLocal, FxHashSet<String>>,
+) {
     for stat in &mut body.0 {
         stat.traverse_rvalues(&mut |rvalue| {
             if let ast::RValue::Closure(closure) = rvalue {
-                let old_upvalues = &upvalues[&closure.function];
+                let old_upvalues = upvalues[&closure.function].clone();
                 let mut function = closure.function.lock();
                 // TODO: inefficient, try constructing a map of all up -> new up first
                 // and then call replace_locals on main body
@@ -351,25 +368,40 @@ fn link_upvalues(
                     local_map.insert(old.clone(), new.clone());
                 }
                 link_upvalues(&mut function.body, upvalues);
+                for (old, new) in
+                    old_upvalues
+                        .iter()
+                        .zip(closure.upvalues.iter().map(|u| match u {
+                            ast::Upvalue::Copy(l) | ast::Upvalue::Ref(l) => l,
+                        }))
+                {
+                    let debug_name = old.0.0.lock().0.clone();
+                    if let Some(name) =
+                        debug_name.filter(|name| ast::is_valid_identifier(name.as_bytes()))
+                        && new.0.0.lock().0.is_none()
+                    {
+                        promoted_names.entry(new.clone()).or_default().insert(name);
+                    }
+                }
                 replace_locals(&mut function.body, &local_map);
             }
         });
         match stat {
             ast::Statement::If(r#if) => {
-                link_upvalues(&mut r#if.then_block.lock(), upvalues);
-                link_upvalues(&mut r#if.else_block.lock(), upvalues);
+                link_upvalues_in_scope(&mut r#if.then_block.lock(), upvalues, promoted_names);
+                link_upvalues_in_scope(&mut r#if.else_block.lock(), upvalues, promoted_names);
             }
             ast::Statement::While(r#while) => {
-                link_upvalues(&mut r#while.block.lock(), upvalues);
+                link_upvalues_in_scope(&mut r#while.block.lock(), upvalues, promoted_names);
             }
             ast::Statement::Repeat(repeat) => {
-                link_upvalues(&mut repeat.block.lock(), upvalues);
+                link_upvalues_in_scope(&mut repeat.block.lock(), upvalues, promoted_names);
             }
             ast::Statement::NumericFor(numeric_for) => {
-                link_upvalues(&mut numeric_for.block.lock(), upvalues);
+                link_upvalues_in_scope(&mut numeric_for.block.lock(), upvalues, promoted_names);
             }
             ast::Statement::GenericFor(generic_for) => {
-                link_upvalues(&mut generic_for.block.lock(), upvalues);
+                link_upvalues_in_scope(&mut generic_for.block.lock(), upvalues, promoted_names);
             }
             _ => {}
         }

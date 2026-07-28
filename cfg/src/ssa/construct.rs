@@ -621,6 +621,53 @@ impl<'a> SsaConstructor<'a> {
 
         // TODO: loop until returns false?
         remove_unnecessary_params(self.function, &mut self.local_map);
+
+        for (derived, original) in &self.old_locals {
+            let original_name = original.0.0.lock().0.clone();
+            if let Some(name) =
+                original_name.filter(|name| ast::is_valid_identifier(name.as_bytes()))
+            {
+                let mut derived = derived.0.0.lock();
+                if derived.0.is_none() {
+                    derived.0 = Some(name);
+                }
+            }
+        }
+
+        let mut coalesced_names = FxHashMap::<RcLocal, FxHashSet<String>>::default();
+        for (source, target) in &self.local_map {
+            let mut target = target;
+            while let Some(next) = self.local_map.get(target) {
+                target = next;
+            }
+            if let Some(name) = source
+                .0
+                .0
+                .lock()
+                .0
+                .clone()
+                .filter(|name| ast::is_valid_identifier(name.as_bytes()))
+            {
+                coalesced_names
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(name);
+            }
+        }
+        for (target, mut names) in coalesced_names {
+            if let Some(name) = target
+                .0
+                .0
+                .lock()
+                .0
+                .clone()
+                .filter(|name| ast::is_valid_identifier(name.as_bytes()))
+            {
+                names.insert(name);
+            }
+            target.0.0.lock().0 = (names.len() == 1).then(|| names.into_iter().next().unwrap());
+        }
+
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
         (

@@ -35,6 +35,17 @@ enum RedOrBlue {
 
 type CongruenceClass = BTreeMap<(usize, ParamOrStatIndex), RcLocal>;
 
+fn fresh_with_preferred_name(local: &RcLocal) -> RcLocal {
+    let name = local
+        .0
+        .0
+        .lock()
+        .0
+        .clone()
+        .filter(|name| ast::is_valid_identifier(name.as_bytes()));
+    RcLocal::new(ast::Local::new(name))
+}
+
 // Benoit Boissinot, Alain Darte, Fabrice Rastello, Benoît Dupont de Dinechin, Christophe Guillon.
 // Revisiting Out-of-SSA Translation for Correctness, Code Quality, and Efficiency. [Research Report]
 // 2008, pp.14. inria-00349925v3
@@ -797,7 +808,7 @@ impl<'a> Destructor<'a> {
         let mut param_map = FxHashMap::default();
         if let Some((_, BlockEdge { arguments, .. })) = self.function.edges_to_block(node).next() {
             for param in arguments.iter().map(|(p, _)| p) {
-                let temp_param = RcLocal::default();
+                let temp_param = fresh_with_preferred_name(param);
                 if let Some(group) = self.upvalue_to_group.get(param) {
                     self.upvalue_to_group
                         .insert(temp_param.clone(), group.clone());
@@ -857,7 +868,10 @@ impl<'a> Destructor<'a> {
                 };
 
                 for (param, arg) in args {
-                    let temp_local = RcLocal::default();
+                    let temp_local = match arg {
+                        ast::RValue::Local(arg) => fresh_with_preferred_name(arg),
+                        _ => fresh_with_preferred_name(param),
+                    };
                     if let ast::RValue::Local(arg) = arg
                         && let Some(group) = self.upvalue_to_group.get(arg)
                     {

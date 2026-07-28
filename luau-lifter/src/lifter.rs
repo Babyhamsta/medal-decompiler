@@ -11,7 +11,8 @@ use triomphe::Arc;
 
 use super::{
     deserializer::{
-        constant::Constant as BytecodeConstant, function::Function as BytecodeFunction,
+        constant::Constant as BytecodeConstant,
+        function::{DebugLocal, Function as BytecodeFunction},
     },
     instruction::Instruction,
     op_code::OpCode,
@@ -21,6 +22,21 @@ use cfg::{
     block::{BlockEdge, BranchType},
     function::Function,
 };
+
+fn whole_function_debug_local(
+    locals: &[DebugLocal],
+    register: usize,
+    instruction_count: usize,
+) -> Option<&DebugLocal> {
+    let mut candidates = locals.iter().filter(|local| {
+        local.register as usize == register
+            && local.start_pc == 0
+            && local.end_pc == instruction_count
+            && local.start_pc < local.end_pc
+    });
+    let local = candidates.next()?;
+    candidates.next().is_none().then_some(local)
+}
 
 pub struct Lifter<'a> {
     function_list: &'a Vec<BytecodeFunction>,
@@ -91,14 +107,17 @@ impl<'a> Lifter<'a> {
             )
             .1;
 
-        for _ in 0..self.function_list[self.function.id].num_upvalues {
-            self.upvalues.push(ast::RcLocal::default());
+        for index in 0..self.function_list[self.function.id].num_upvalues as usize {
+            let name = self.function_list[self.function.id]
+                .debug_upvalues
+                .get(index)
+                .and_then(|name| self.debug_name(*name));
+            self.upvalues.push(ast::RcLocal::new(ast::Local::new(name)));
         }
 
         for i in 0..self.function_list[self.function.id].num_parameters {
-            let parameter = ast::RcLocal::default();
+            let parameter = self.register(i as usize);
             self.function.parameters.push(parameter.clone());
-            self.register_map.insert(i as usize, parameter);
         }
 
         self.function.is_variadic = self.function_list[self.function.id].is_vararg;
@@ -1354,14 +1373,7 @@ impl<'a> Lifter<'a> {
                             _ => unreachable!(),
                         };
                         let func_name_index = self.function_list[func_index].function_name;
-                        let func_name = if func_name_index == 0 {
-                            None
-                        } else {
-                            Some(
-                                String::from_utf8_lossy(&self.string_table[func_name_index - 1])
-                                    .into_owned(),
-                            )
-                        };
+                        let func_name = self.debug_name(func_name_index);
 
                         let func = &self.function_list[func_index];
                         let mut upvalues_passed = Vec::with_capacity(func.num_upvalues.into());
@@ -1443,7 +1455,30 @@ impl<'a> Lifter<'a> {
     }
 
     fn register(&mut self, index: usize) -> ast::RcLocal {
-        self.register_map.entry(index).or_default().clone()
+        if let Some(local) = self.register_map.get(&index) {
+            return local.clone();
+        }
+
+        let local = ast::RcLocal::new(ast::Local::new(self.debug_name_for_register(index)));
+        self.register_map.insert(index, local.clone());
+        local
+    }
+
+    fn debug_name(&self, string_index: usize) -> Option<String> {
+        let bytes = self.string_table.get(string_index.checked_sub(1)?)?;
+        ast::is_valid_identifier(bytes)
+            .then(|| String::from_utf8(bytes.clone()).ok())
+            .flatten()
+    }
+
+    fn debug_name_for_register(&self, register: usize) -> Option<String> {
+        let function = &self.function_list[self.function.id];
+        let local = whole_function_debug_local(
+            &function.debug_locals,
+            register,
+            function.instructions.len(),
+        )?;
+        self.debug_name(local.name)
     }
 
     fn constant(&mut self, index: usize) -> ast::Literal {
@@ -1523,5 +1558,30 @@ impl<'a> Lifter<'a> {
             ),
             Instruction::E { op_code, .. } => matches!(op_code, OpCode::LOP_JUMPX),
         }
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::{DebugLocal, whole_function_debug_local};
+
+    fn debug_local(start_pc: usize, end_pc: usize, register: u8) -> DebugLocal {
+        DebugLocal {
+            name: 1,
+            start_pc,
+            end_pc,
+            register,
+        }
+    }
+
+    #[test]
+    fn accepts_only_one_full_function_debug_lifetime() {
+        assert!(whole_function_debug_local(&[debug_local(0, 8, 2)], 2, 8).is_some());
+        assert!(whole_function_debug_local(&[debug_local(1, 8, 2)], 2, 8).is_none());
+        assert!(whole_function_debug_local(&[debug_local(0, 0, 2)], 2, 8).is_none());
+        assert!(
+            whole_function_debug_local(&[debug_local(0, 8, 2), debug_local(0, 8, 2)], 2, 8)
+                .is_none()
+        );
     }
 }

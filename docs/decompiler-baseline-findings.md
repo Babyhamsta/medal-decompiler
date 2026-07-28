@@ -439,3 +439,78 @@ sources. Simple generic-for conditionals are byte-for-byte unchanged from the
 input branch. The local before/after reports are generated, ignored artifacts
 at `tests/luau_corpus/results/control-flow-before/` and
 `tests/luau_corpus/results/control-flow-after/`.
+
+## Dynamic naming
+
+Naming now runs after function recovery and uses general AST/debug evidence
+rather than fixture names or register-number rules:
+
+- valid function and upvalue debug names survive lifting and SSA;
+- a register debug name is accepted only when exactly one valid record covers
+  the whole function, preventing a scoped name from leaking across register
+  reuse;
+- conflicting, invalid, reserved, or colliding names fall back safely;
+- numeric loops, recognized `pairs`/`ipairs` loops, returned tables, invoked
+  parameters, and callback collections receive conservative role names;
+- unknown generic iterators and ambiguous roles keep generated names;
+- generated closure/upvalue fallbacks no longer expose `_u_` implementation
+  markers;
+- a captured outer `self` cannot produce a colon method whose omitted receiver
+  is renamed and therefore unbound.
+
+The conservative whole-function rule intentionally leaves scoped debug locals
+unclaimed until the lifter has program-counter-aware local identities. This
+loses some available spelling evidence but prevents misleading names and
+semantic rebinding.
+
+### Static verification
+
+- `cargo +nightly test --workspace --offline`: 116 passed, 0 failed.
+- `python -m unittest discover -s tests/python -p 'test_*.py'`: 10 passed,
+  0 failed.
+- All profiles and compatibility versions: 260/260; 0 source compile failures,
+  0 decompile failures, 0 recompile failures, and 0 generated gotos.
+- Focused `O1/g0`, `O1/g1`, and `O1/g2` product-style outputs recompile.
+- Three independent semantic, naming, and corpus reviews passed after every
+  Critical and Important finding was repaired.
+- The corpus tools compiled, decompiled, and recompiled files only. They did
+  not execute authored or generated Luau.
+
+### Comparable corpus metrics
+
+Both snapshots contain the same 26 sources and 10 profiles. Generated-name
+counts are identifier-reference occurrences matching `vN`, `pN`, `v_u_N`, or
+`p_u_N`. Role references use the selected conservative role vocabulary.
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Generated nonblank lines | 6,813 | 6,813 | unchanged |
+| Generated locals | 1,189 | 1,189 | unchanged |
+| Trivial aliases | 72 | 72 | unchanged |
+| Generated-name references | 9,018 | 7,212 | -1,806 (-20.0%) |
+| Generated upvalue-marker references | 2,693 | 0 | -2,693 (-100.0%) |
+| Conservative role references | 224 | 1,062 | +838 |
+| `O1/g2` generated-name references | 891 | 302 | -589 (-66.1%) |
+| Aggregate tab indentation | 10,868 | 10,868 | unchanged |
+| Maximum tab indentation | 6 | 6 | unchanged |
+| Generated gotos | 0 | 0 | unchanged |
+
+Representative `O1/g2` output now retains source-level structure and names:
+
+```luau
+local function mergeOptions(overrides)
+	for key, value in pairs(overrides) do
+		result[key] = value
+	end
+	return result
+end
+
+function Controller:use(callback)
+	self.middleware[#self.middleware + 1] = callback
+	return self
+end
+```
+
+The local before/after reports are generated, ignored artifacts at
+`tests/luau_corpus/results/naming-before/` and
+`tests/luau_corpus/results/dynamic-naming-after/`.
