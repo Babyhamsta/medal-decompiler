@@ -12,6 +12,7 @@ from .model import RuntimeResult
 
 
 RESULT_PREFIX = "SEMANTIC_RESULT "
+SEMANTIC_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ def run_semantic_probe(
     subject: Path,
     probe: Path,
     workspace: Path,
+    timeout_seconds: float = SEMANTIC_TIMEOUT_SECONDS,
 ) -> RuntimeResult:
     command = runtime_command(
         runtime,
@@ -96,6 +98,13 @@ def run_semantic_probe(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return RuntimeResult(
+            exit_code=-1,
+            normalized_result=None,
+            stderr=f"semantic runtime timed out after {timeout_seconds:g} seconds",
         )
     except OSError as error:
         return RuntimeResult(

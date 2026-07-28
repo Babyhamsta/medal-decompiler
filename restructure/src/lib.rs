@@ -1,6 +1,6 @@
 #![feature(let_chains)]
 
-use ast::{LocalRw, Reduce};
+use ast::{LocalRw, Reduce, Traverse};
 use cfg::{block::BranchType, function::Function};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -463,8 +463,15 @@ fn single_iteration_loop_replacement(while_: &ast::While) -> Option<Vec<ast::Sta
             }
         })?;
 
+    if contains_outer_loop_transfer(&body[..guard_index]) {
+        return None;
+    }
+
     let mut suffix: ast::Block = body[guard_index + 1..].to_vec().into();
     if !strip_guaranteed_loop_exit(&mut suffix) {
+        return None;
+    }
+    if contains_outer_loop_transfer(&suffix) {
         return None;
     }
 
@@ -474,6 +481,22 @@ fn single_iteration_loop_replacement(while_: &ast::While) -> Option<Vec<ast::Sta
             .push(ast::If::new(execute_suffix_condition, suffix, ast::Block::default()).into());
     }
     Some(replacement)
+}
+
+fn contains_outer_loop_transfer(statements: &[ast::Statement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        ast::Statement::Break(_) | ast::Statement::Continue(_) => true,
+        ast::Statement::If(if_) => {
+            contains_outer_loop_transfer(&if_.then_block.lock())
+                || contains_outer_loop_transfer(&if_.else_block.lock())
+        }
+        // Break and continue inside a nested loop target that nested loop.
+        ast::Statement::While(_)
+        | ast::Statement::Repeat(_)
+        | ast::Statement::NumericFor(_)
+        | ast::Statement::GenericFor(_) => false,
+        _ => false,
+    })
 }
 
 fn strip_guaranteed_loop_exit(block: &mut ast::Block) -> bool {
@@ -506,20 +529,113 @@ fn condition_proven_true(condition: &ast::RValue, statements: &[ast::Statement])
         | (ast::RValue::Literal(literal), ast::RValue::Local(local)) => (local, literal),
         _ => return false,
     };
-    statements.iter().rev().find_map(|statement| {
+    for statement in statements.iter().rev() {
         if statement.values_written().contains(&local) {
-            statement
-                .as_assign()
-                .filter(|assign| assign.left.len() == 1 && assign.right.len() == 1)
-                .and_then(|assign| {
-                    (assign.left[0].as_local() == Some(local)
-                        && assign.right[0].as_literal() == Some(literal))
-                    .then_some(true)
-                })
-        } else {
-            None
+            return statement.as_assign().is_some_and(|assign| {
+                assign.left.len() == 1
+                    && assign.right.len() == 1
+                    && assign.left[0].as_local() == Some(local)
+                    && assign.right[0].as_literal() == Some(literal)
+            });
         }
-    }) == Some(true)
+        if statement_may_change_local(statement, local) || statement_may_invoke_callback(statement)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+fn statement_may_change_local(statement: &ast::Statement, local: &ast::RcLocal) -> bool {
+    if statement.values_written().contains(&local) {
+        return true;
+    }
+    match statement {
+        ast::Statement::If(if_) => {
+            if_.then_block
+                .lock()
+                .iter()
+                .any(|statement| statement_may_change_local(statement, local))
+                || if_
+                    .else_block
+                    .lock()
+                    .iter()
+                    .any(|statement| statement_may_change_local(statement, local))
+        }
+        ast::Statement::While(while_) => while_
+            .block
+            .lock()
+            .iter()
+            .any(|statement| statement_may_change_local(statement, local)),
+        ast::Statement::Repeat(repeat) => repeat
+            .block
+            .lock()
+            .iter()
+            .any(|statement| statement_may_change_local(statement, local)),
+        ast::Statement::NumericFor(for_) => for_
+            .block
+            .lock()
+            .iter()
+            .any(|statement| statement_may_change_local(statement, local)),
+        ast::Statement::GenericFor(for_) => for_
+            .block
+            .lock()
+            .iter()
+            .any(|statement| statement_may_change_local(statement, local)),
+        _ => false,
+    }
+}
+
+fn rvalue_may_invoke_callback(value: &ast::RValue) -> bool {
+    matches!(
+        value,
+        ast::RValue::Call(_)
+            | ast::RValue::MethodCall(_)
+            | ast::RValue::Select(ast::Select::Call(_) | ast::Select::MethodCall(_))
+    ) || value.rvalues().into_iter().any(rvalue_may_invoke_callback)
+}
+
+fn statement_may_invoke_callback(statement: &ast::Statement) -> bool {
+    if matches!(
+        statement,
+        ast::Statement::Call(_) | ast::Statement::MethodCall(_)
+    ) || statement
+        .rvalues()
+        .into_iter()
+        .any(rvalue_may_invoke_callback)
+    {
+        return true;
+    }
+    match statement {
+        ast::Statement::If(if_) => {
+            if_.then_block
+                .lock()
+                .iter()
+                .any(statement_may_invoke_callback)
+                || if_
+                    .else_block
+                    .lock()
+                    .iter()
+                    .any(statement_may_invoke_callback)
+        }
+        ast::Statement::While(while_) => while_
+            .block
+            .lock()
+            .iter()
+            .any(statement_may_invoke_callback),
+        ast::Statement::Repeat(repeat) => repeat
+            .block
+            .lock()
+            .iter()
+            .any(statement_may_invoke_callback),
+        ast::Statement::NumericFor(for_) => {
+            for_.block.lock().iter().any(statement_may_invoke_callback)
+        }
+        ast::Statement::GenericFor(for_) => {
+            for_.block.lock().iter().any(statement_may_invoke_callback)
+        }
+        _ => false,
+    }
 }
 
 fn collect_region_terminal_returns(
@@ -682,8 +798,8 @@ mod tests {
         relocate_unreachable_terminal_returns,
     };
     use ast::{
-        Assign, Binary, BinaryOperation, If, LValue, Literal, Local, RValue, RcLocal, Return,
-        Statement,
+        Assign, Binary, BinaryOperation, Call, Global, If, LValue, Literal, Local, RValue, RcLocal,
+        Return, Statement,
     };
     use cfg::{
         block::{BlockEdge, BranchType},
@@ -869,5 +985,68 @@ mod tests {
         assert!(block.iter().all(|statement| statement.as_while().is_none()));
         assert_eq!(block.len(), 3);
         assert!(block[1].as_if().is_some());
+    }
+
+    #[test]
+    fn continue_in_prefix_prevents_single_iteration_flattening() {
+        let mut block = ast::Block(vec![
+            ast::While::new(
+                Literal::Boolean(true).into(),
+                ast::Block(vec![
+                    If::new(
+                        Call::new(Global::from("retry").into(), Vec::new()).into(),
+                        ast::Block(vec![ast::Continue {}.into()]),
+                        Default::default(),
+                    )
+                    .into(),
+                    If::new(
+                        Call::new(Global::from("stop").into(), Vec::new()).into(),
+                        ast::Block(vec![ast::Break {}.into()]),
+                        Default::default(),
+                    )
+                    .into(),
+                    ast::Break {}.into(),
+                ]),
+            )
+            .into(),
+        ]);
+
+        assert_eq!(flatten_single_iteration_loops(&mut block), 0);
+        assert!(block[0].as_while().is_some());
+    }
+
+    #[test]
+    fn intervening_call_invalidates_literal_exit_proof() {
+        let state = local("state");
+        let mut block = ast::Block(vec![
+            ast::While::new(
+                Literal::Boolean(true).into(),
+                ast::Block(vec![
+                    If::new(
+                        Literal::Boolean(false).into(),
+                        ast::Block(vec![ast::Break {}.into()]),
+                        Default::default(),
+                    )
+                    .into(),
+                    assign(&state, Literal::String(b"done".to_vec()).into()),
+                    Call::new(Global::from("mutateCapturedState").into(), Vec::new()).into(),
+                    If::new(
+                        Binary::new(
+                            state.clone().into(),
+                            Literal::String(b"done".to_vec()).into(),
+                            BinaryOperation::Equal,
+                        )
+                        .into(),
+                        ast::Block(vec![ast::Break {}.into()]),
+                        Default::default(),
+                    )
+                    .into(),
+                ]),
+            )
+            .into(),
+        ]);
+
+        assert_eq!(flatten_single_iteration_loops(&mut block), 0);
+        assert!(block[0].as_while().is_some());
     }
 }

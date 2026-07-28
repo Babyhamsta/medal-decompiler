@@ -22,6 +22,7 @@ from tools.luau_corpus.process import (
 from tools.luau_corpus.report import write_json_summary, write_markdown_summary
 from tools.luau_corpus.semantic import (
     TRUSTED_SEMANTIC_PROBES,
+    run_semantic_probe,
     runtime_command,
 )
 from tools.run_luau_corpus import run_failed, select_profiles
@@ -121,6 +122,28 @@ end
                 completed.stdout.strip(),
                 "SEMANTIC_RESULT p3[s1:x;n;t2{s1:a;d1;s1:b;d2;}]",
             )
+
+    def test_semantic_runner_times_out_instead_of_blocking_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime.py"
+            runtime.write_text(
+                "import time\ntime.sleep(1)\n",
+                encoding="utf-8",
+            )
+
+            result = run_semantic_probe(
+                runtime,
+                root / "runner.luau",
+                root / "subject.luau",
+                root / "probe.luau",
+                root,
+                timeout_seconds=0.01,
+            )
+
+        self.assertEqual(result.exit_code, -1)
+        self.assertIsNone(result.normalized_result)
+        self.assertIn("timed out", result.stderr)
 
     def test_trusted_probes_produce_literal_source_results(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
@@ -504,6 +527,40 @@ return copy
         self.assertFalse(run_failed(mismatched, semantic=False))
         self.assertTrue(run_failed(mismatched, semantic=True))
         self.assertFalse(run_failed(unchecked, semantic=True))
+
+    def test_exit_policy_rejects_empty_or_reduced_expected_matrix(self) -> None:
+        empty = run_corpus(
+            workspace=self.root,
+            output_root=self.root / "empty-selection",
+            profiles=(CompileProfile("test", 1, 1),),
+            case_filter="definitely_missing",
+            compiler=self.compiler,
+            decompiler=self.decompiler,
+            semantic=True,
+        )
+        expected = frozenset(
+            {
+                ("01_success", "test"),
+                ("02_compile_fail", "test"),
+            }
+        )
+
+        self.assertTrue(
+            run_failed(
+                empty,
+                semantic=True,
+                expected_cases=frozenset(),
+                expected_semantic=frozenset(),
+            )
+        )
+        self.assertTrue(
+            run_failed(
+                empty,
+                semantic=True,
+                expected_cases=expected,
+                expected_semantic=frozenset(),
+            )
+        )
 
     def test_compile_failure_is_recorded_without_stopping_next_case(self) -> None:
         output = self.root / "output"
