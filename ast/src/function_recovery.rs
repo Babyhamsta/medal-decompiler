@@ -42,19 +42,23 @@ fn receiver_score_block(block: &Block, receiver: &RcLocal) -> usize {
     block
         .iter()
         .map(|statement| {
-            let direct = statement
-                .rvalues()
-                .into_iter()
-                .map(|value| receiver_score_rvalue(value, receiver))
-                .sum::<usize>()
-                + match statement {
-                    Statement::Assign(assign) => assign
-                        .left
-                        .iter()
-                        .map(|value| receiver_score_lvalue(value, receiver))
-                        .sum(),
-                    _ => 0,
-                };
+            let direct =
+                statement
+                    .rvalues()
+                    .into_iter()
+                    .map(|value| receiver_score_rvalue(value, receiver))
+                    .sum::<usize>()
+                    + match statement {
+                        Statement::Assign(assign) => assign
+                            .left
+                            .iter()
+                            .map(|value| receiver_score_lvalue(value, receiver))
+                            .sum(),
+                        Statement::Return(r#return) => usize::from(r#return.values.iter().any(
+                            |value| matches!(value, RValue::Local(local) if local == receiver),
+                        )),
+                        _ => 0,
+                    };
             let nested = match statement {
                 Statement::If(r#if) => {
                     receiver_score_block(&r#if.then_block.lock(), receiver)
@@ -142,7 +146,7 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     let Some(receiver) = function.parameters.first().cloned() else {
         return false;
     };
-    if receiver_score_block(&function.body, &receiver) < 2 {
+    if receiver_score_block(&function.body, &receiver) < 3 {
         return false;
     }
 
@@ -318,6 +322,42 @@ mod tests {
 
         assert_eq!(stats.methods, 0);
         assert!(output.starts_with("function Module.identity(value)"));
+    }
+
+    #[test]
+    fn keeps_static_helper_with_single_target_write() {
+        let module = local("Module");
+        let target_parameter = local("target");
+        let value = local("value");
+        let target_field = Index::new(
+            target_parameter.clone().into(),
+            Literal::String(b"value".to_vec()).into(),
+        );
+        let body = Block(vec![
+            Assign::new(
+                vec![LValue::Index(target_field)],
+                vec![value.clone().into()],
+            )
+            .into(),
+        ]);
+        let target = Index::new(module.into(), Literal::String(b"configure".to_vec()).into());
+        let mut block = Block(vec![
+            Assign::new(
+                vec![LValue::Index(target)],
+                vec![closure(
+                    Some("configure"),
+                    vec![target_parameter, value],
+                    body,
+                )],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_function_syntax(&mut block);
+        let output = block.to_string();
+
+        assert_eq!(stats.methods, 0);
+        assert!(output.starts_with("function Module.configure(target, value)"));
     }
 
     #[test]

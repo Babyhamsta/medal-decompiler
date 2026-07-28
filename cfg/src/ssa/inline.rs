@@ -84,7 +84,9 @@ fn fold_table_fields(block: &mut ast::Block) -> usize {
                 break;
             };
 
-            if key.values_read().contains(&&object_local)
+            if key.has_side_effects()
+                || value.has_side_effects()
+                || key.values_read().contains(&&object_local)
                 || value.values_read().contains(&&object_local)
             {
                 break;
@@ -745,6 +747,23 @@ mod tests {
                 &object,
                 Literal::String(b"status".to_vec()).into(),
                 Literal::Boolean(true).into(),
+            ),
+        ]);
+
+        assert_eq!(fold_table_fields(&mut block), 0);
+        assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn keeps_effectful_field_value_after_table_assignment() {
+        let object = local("state");
+        let observe = Call::new(RValue::from(Global::from("observe")), Vec::new());
+        let mut block = Block(vec![
+            Assign::new(vec![object.clone().into()], vec![Table::default().into()]).into(),
+            field_assignment(
+                &object,
+                Literal::String(b"value".to_vec()).into(),
+                observe.into(),
             ),
         ]);
 

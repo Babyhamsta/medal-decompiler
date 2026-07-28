@@ -176,24 +176,23 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn are_table_keys_sequential(table: &Table) -> bool {
-        if table.0.is_empty() || table.0.iter().all(|(k, _)| k.is_none()) {
-            return true;
-        }
-
-        let keys_vec = table
-            .0
-            .iter()
-            .filter(|(k, _)| !k.is_none())
-            .map(|(k, _)| k)
-            .collect_vec();
-        if keys_vec.is_empty() {
-            false
-        } else {
-            keys_vec.iter().enumerate().all(|(i, k)| {
-                matches!(k, Some(RValue::Literal(Literal::Number(x)))
-                        if (x - 1f64) as usize == i)
-            })
-        }
+        let mut implicit_key = 0usize;
+        table.0.iter().enumerate().all(|(index, (key, _))| {
+            let expected = index + 1;
+            match key {
+                None => {
+                    implicit_key += 1;
+                    implicit_key == expected
+                }
+                Some(RValue::Literal(Literal::Number(key))) => {
+                    key.is_finite() && *key == expected as f64
+                }
+                Some(RValue::Literal(Literal::Integer(key))) => {
+                    usize::try_from(*key).is_ok_and(|key| key == expected)
+                }
+                _ => false,
+            }
+        })
     }
 
     fn contains_table(table: &Table) -> bool {
@@ -701,35 +700,46 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if assign.left.len() == 1
             && assign.right.len() == 1
             && let RValue::Closure(closure) = &assign.right[0]
-            && closure.function.lock().name.is_some()
         {
             let left = &assign.left[0];
-            if assign.prefix || left.as_global().is_some() || {
-                if let LValue::Index(index) = left {
-                    let mut index = index;
-                    let mut valid = true;
-                    loop {
-                        if let box RValue::Literal(Literal::String(key)) = &index.right
-                            && Self::is_valid_name(key)
-                        {
-                            match index.left {
-                                box RValue::Index(ref i) => {
-                                    index = i;
-                                    continue;
+            let recursive_local = assign.prefix
+                && left.as_local().is_some_and(|local| {
+                    closure.upvalues.iter().any(|upvalue| {
+                        matches!(
+                            upvalue,
+                            crate::Upvalue::Copy(captured) | crate::Upvalue::Ref(captured)
+                                if captured == local
+                        )
+                    })
+                });
+            if (closure.function.lock().name.is_some() || recursive_local)
+                && (assign.prefix || left.as_global().is_some() || {
+                    if let LValue::Index(index) = left {
+                        let mut index = index;
+                        let mut valid = true;
+                        loop {
+                            if let box RValue::Literal(Literal::String(key)) = &index.right
+                                && Self::is_valid_name(key)
+                            {
+                                match index.left {
+                                    box RValue::Index(ref i) => {
+                                        index = i;
+                                        continue;
+                                    }
+                                    box RValue::Global(_) | box RValue::Local(_) => {}
+                                    _ => valid = false,
                                 }
-                                box RValue::Global(_) | box RValue::Local(_) => {}
-                                _ => valid = false,
+                            } else {
+                                valid = false;
                             }
-                        } else {
-                            valid = false;
+                            break;
                         }
-                        break;
+                        valid
+                    } else {
+                        false
                     }
-                    valid
-                } else {
-                    false
-                }
-            } {
+                })
+            {
                 return self.format_named_function(left, closure);
             }
         }
@@ -892,9 +902,13 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 
 #[cfg(test)]
 mod tests {
+    use by_address::ByAddress;
+    use parking_lot::Mutex;
+    use triomphe::Arc;
+
     use crate::{
-        Assign, Binary, BinaryOperation, Block, Call, Conditional, Global, Index, LValue, Literal,
-        Local, RValue, RcLocal, Select, Table,
+        Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
+        Index, LValue, Literal, Local, RValue, RcLocal, Select, Table, Upvalue,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1076,5 +1090,45 @@ mod tests {
         let table = Table(vec![(Some(Literal::Number(1.0).into()), selected.into())]);
 
         assert_eq!(table.to_string(), "{ (produce()) }");
+    }
+
+    #[test]
+    fn explicit_key_collision_after_positional_prefix_stays_explicit() {
+        let table = Table(vec![
+            (None, Literal::String(b"first".to_vec()).into()),
+            (
+                Some(Literal::Number(1.0).into()),
+                Literal::String(b"replacement".to_vec()).into(),
+            ),
+        ]);
+
+        assert_eq!(
+            table.to_string(),
+            "{\n\t\"first\",\n\t[1] = \"replacement\"\n}"
+        );
+    }
+
+    #[test]
+    fn fractional_numeric_table_key_stays_explicit() {
+        let table = Table(vec![(
+            Some(Literal::Number(1.5).into()),
+            Literal::String(b"value".to_vec()).into(),
+        )]);
+
+        assert_eq!(table.to_string(), "{\n\t[1.5] = \"value\"\n}");
+    }
+
+    #[test]
+    fn unnamed_recursive_local_closure_uses_scoped_function_declaration() {
+        let recurse = local("recurse");
+        let function = Arc::new(Mutex::new(Function::default()));
+        let closure = Closure {
+            function: ByAddress(function),
+            upvalues: vec![Upvalue::Ref(recurse.clone())],
+        };
+        let mut assign = Assign::new(vec![LValue::Local(recurse)], vec![RValue::Closure(closure)]);
+        assign.prefix = true;
+
+        assert!(assign.to_string().starts_with("local function recurse()"));
     }
 }
