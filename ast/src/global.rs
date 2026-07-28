@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::{LocalRw, SideEffects, Traverse, formatter::Formatter};
+use crate::{
+    IdentifierContext, LocalRw, SideEffects, Traverse, formatter::Formatter, is_valid_identifier_in,
+};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GlobalOrigin {
@@ -67,12 +69,12 @@ impl From<Vec<u8>> for Global {
 
 impl fmt::Display for Global {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if Formatter::<fmt::Formatter>::is_valid_name(&self.name) {
+        if is_valid_identifier_in(&self.name, IdentifierContext::GlobalExpression) {
             write!(f, "{}", std::str::from_utf8(&self.name).unwrap())
         } else {
             write!(
                 f,
-                "__FENV[\"{}\"]",
+                "getfenv(0)[\"{}\"]",
                 Formatter::<fmt::Formatter>::escape_string(&self.name)
             )
         }
@@ -91,5 +93,14 @@ mod tests {
         assert_eq!(global.origin(), GlobalOrigin::Dynamic);
         assert_eq!(global.name(), expected);
         assert_eq!(global.into_name(), expected);
+    }
+
+    #[test]
+    fn contextual_global_is_direct_and_unspellable_global_uses_runtime_environment() {
+        assert_eq!(Global::from("type").to_string(), "type");
+        assert_eq!(
+            Global::new(b"bad-name".to_vec()).to_string(),
+            "getfenv(0)[\"bad-name\"]"
+        );
     }
 }

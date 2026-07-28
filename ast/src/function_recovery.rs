@@ -132,7 +132,7 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     let RValue::Literal(Literal::String(method)) = target.right.as_ref() else {
         return false;
     };
-    if !Formatter::<String>::is_valid_name(method) {
+    if !Formatter::<String>::is_valid_name_in(method, crate::IdentifierContext::MethodName) {
         return false;
     }
     let RValue::Closure(closure) = &assign.right[0] else {

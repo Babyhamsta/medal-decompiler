@@ -42,6 +42,42 @@ impl BindingIdentity {
             register,
         }
     }
+
+    pub const fn reference_class(&self) -> ReferenceClass {
+        match self {
+            Self::Local { .. }
+            | Self::SyntheticLocal { .. }
+            | Self::Parameter { .. }
+            | Self::Upvalue { .. } => ReferenceClass::Local,
+            Self::Global(_) | Self::Import(_) => ReferenceClass::Global,
+            Self::Member(_) => ReferenceClass::Member,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceClass {
+    Local,
+    Global,
+    Member,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BindingMismatch {
+    pub expected: ReferenceClass,
+    pub actual: ReferenceClass,
+}
+
+pub fn validate_reference_binding(
+    expected: &BindingIdentity,
+    actual: ReferenceClass,
+) -> Result<(), BindingMismatch> {
+    let expected = expected.reference_class();
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(BindingMismatch { expected, actual })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -294,7 +330,10 @@ impl Provenance {
 mod tests {
     use ast::{Local, RcLocal};
 
-    use super::{BindingIdentity, DebugLifetime, Provenance, RegisterFamily, SourceOrigin};
+    use super::{
+        BindingIdentity, DebugLifetime, Provenance, ReferenceClass, RegisterFamily, SourceOrigin,
+        validate_reference_binding,
+    };
 
     #[test]
     fn reused_register_definitions_keep_disjoint_debug_lifetimes() {
@@ -344,5 +383,15 @@ mod tests {
             provenance.binding(&merged),
             Some(&BindingIdentity::local(0, 1))
         );
+    }
+
+    #[test]
+    fn binding_validator_rejects_local_lowered_as_global() {
+        let error =
+            validate_reference_binding(&BindingIdentity::local(2, 4), ReferenceClass::Global)
+                .unwrap_err();
+
+        assert_eq!(error.expected, ReferenceClass::Local);
+        assert_eq!(error.actual, ReferenceClass::Global);
     }
 }

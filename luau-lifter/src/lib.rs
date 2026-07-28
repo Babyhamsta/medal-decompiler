@@ -250,6 +250,9 @@ fn decompile_function(
         catch_phase(DecompilePhase::Ssa, Some(function_id), None, || {
             let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
                 cfg::ssa::construct(&mut function, &upvalues_in);
+            function
+                .validate_reference_bindings()
+                .expect("SSA must preserve reference binding classes");
             let upvalue_passed_groups = upvalue_passed_groups
                 .into_iter()
                 .map(|members| {
@@ -309,6 +312,9 @@ fn decompile_function(
             }
             ssa::construct::apply_local_map(&mut function, local_map);
         }
+        function
+            .validate_reference_bindings()
+            .expect("structuring must preserve reference binding classes");
     })?;
 
     catch_phase(

@@ -272,7 +272,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 if !sequential_keys {
                     if let Some(key) = key {
                         if let RValue::Literal(Literal::String(field)) = key
-                            && Self::is_valid_name(field)
+                            && Self::is_valid_name_in(field, crate::IdentifierContext::TableField)
                         {
                             write!(self.output, "{} = ", std::str::from_utf8(field).unwrap())?;
                         } else {
@@ -411,7 +411,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if is_method
             && let LValue::Index(index) = name
             && let RValue::Literal(Literal::String(method)) = index.right.as_ref()
-            && Self::is_valid_name(method)
+            && Self::is_valid_name_in(method, crate::IdentifierContext::MethodName)
         {
             write!(self.output, "function ")?;
             self.format_rvalue(&index.left)?;
@@ -538,8 +538,8 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         Ok(())
     }
-    pub(crate) fn is_valid_name(name: &[u8]) -> bool {
-        crate::is_valid_identifier(name)
+    pub(crate) fn is_valid_name_in(name: &[u8], context: crate::IdentifierContext) -> bool {
+        crate::is_valid_identifier_in(name, context)
     }
 
     // TODO: PERF: Cow like from_utf8_lossy
@@ -602,7 +602,9 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
 
         match index.right.as_ref() {
-            RValue::Literal(super::Literal::String(field)) if Self::is_valid_name(field) => {
+            RValue::Literal(super::Literal::String(field))
+                if Self::is_valid_name_in(field, crate::IdentifierContext::MemberName) =>
+            {
                 write!(self.output, ".{}", std::str::from_utf8(field).unwrap())
             }
             _ => {
@@ -701,7 +703,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                         let mut valid = true;
                         loop {
                             if let box RValue::Literal(Literal::String(key)) = &index.right
-                                && Self::is_valid_name(key)
+                                && Self::is_valid_name_in(key, crate::IdentifierContext::MemberName)
                             {
                                 match index.left {
                                     box RValue::Index(ref i) => {

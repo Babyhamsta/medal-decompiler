@@ -1,6 +1,6 @@
 use ast::{LocalRw, RcLocal};
 use contracts::requires;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use petgraph::{
     Direction,
@@ -10,7 +10,10 @@ use petgraph::{
 
 use crate::{
     block::{BlockEdge, BranchType},
-    provenance::{BindingIdentity, OriginSet, Provenance, RegisterFamily},
+    provenance::{
+        BindingIdentity, BindingMismatch, OriginSet, Provenance, ReferenceClass, RegisterFamily,
+        validate_reference_binding,
+    },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -47,6 +50,36 @@ impl Function {
 
     pub fn provenance(&self) -> &Provenance {
         &self.provenance
+    }
+
+    pub fn validate_reference_bindings(&self) -> Result<(), BindingMismatch> {
+        let mut locals = self.parameters.iter().cloned().collect::<FxHashSet<_>>();
+        for (node, block) in self.blocks() {
+            locals.extend(
+                block
+                    .iter()
+                    .flat_map(|statement| statement.values())
+                    .cloned(),
+            );
+            for edge in self.edges(node) {
+                for (parameter, argument) in &edge.weight().arguments {
+                    locals.insert(parameter.clone());
+                    locals.extend(argument.values().into_iter().cloned());
+                }
+            }
+        }
+        for local in locals {
+            let mut bindings = self.provenance.bindings(&local);
+            if bindings.is_empty()
+                && let Some(binding) = self.bindings.get(&local)
+            {
+                bindings.insert(binding.clone());
+            }
+            for binding in bindings {
+                validate_reference_binding(&binding, ReferenceClass::Local)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn set_binding(&mut self, local: RcLocal, binding: BindingIdentity) {
