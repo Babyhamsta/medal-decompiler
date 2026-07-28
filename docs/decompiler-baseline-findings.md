@@ -17,7 +17,8 @@ The completed compile/decompile/recompile matrix is fully green:
 - primary profiles (`O1/g1`, `O2/g1`, `O2/g0`): 72/72;
 - secondary profiles (`O0/g1`, `O1/g0`, `O1/g2`): 72/72;
 - compatibility profiles (bytecode V9, V10, V11, V12): 96/96;
-- combined profile runs: 240/240;
+- V9-V12/current-profile compiler round trips: 240/240;
+- V4-V8 parser/format fixtures: passing;
 - generated `goto`/label statements: 0;
 - source compile failures: 0;
 - decompiler failures: 0;
@@ -171,3 +172,61 @@ Bundled compiler cannot emit versions V4-V8. Those require format-level fixtures
 Proposed rules depend on serialized version, official tag/opcode discriminants, declared record sizes, instruction encoding, and semantic opcode families. They do not inspect corpus filenames, literals, URLs, register numbers, or exact instruction sequences.
 
 Version discriminants and payload layouts are required bytecode protocol data, not script-specific exceptions. Equivalent opcodes are grouped by semantics, and instruction length comes from exhaustive opcode metadata so any script using that opcode follows the same path.
+
+## Alias Copy Elimination Verification (2026-07-27)
+
+The post-SSA alias pass removes only statically proven, single-use local copies.
+It recurses through structured blocks but retains a copy when a source write, an
+effectful evaluation prefix, or a reference capture could change snapshot
+semantics.
+
+### Provenance and ordering policy
+
+`GETIMPORT` roots retain `CompilerImport` provenance. Only that compiler-origin
+import prefix may be reordered toward authored expression order. This is opcode
+provenance, not a global-name whitelist. `GETGLOBAL` roots remain dynamic;
+ordinary table/index operations remain metamethod-capable dynamic boundaries.
+They therefore do not receive import-prefix reordering and block unsafe alias
+elimination across the evaluation boundary.
+
+### Static verification
+
+- `cargo +stable fmt --all -- --check`: passed.
+- `cargo +nightly test --workspace`: 40 passed, 0 failed.
+- `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
+- V9-V12/current-profile compiler round trips: 240/240; 0 compile failures, 0
+  decompile failures, 0 recompile failures, and 0 generated gotos.
+- V4-V8 parser/format fixtures: passing.
+
+The corpus runner invoked only the bundled compiler, the built decompiler, and
+the bundled recompiler; no arbitrary Luau scripts ran.
+
+`--no-build` initially exposed a missing `target/debug/luau-lifter.exe` in this
+worktree (all decompiler launches returned `WinError 2`). Building the
+decompiler with `cargo +nightly build -p luau-lifter` restored the expected
+binary; the recorded 240-case result above is the fresh rerun.
+
+### Alias metrics and representative output
+
+`count_trivial_aliases` performs static text analysis of generated `.luau`
+files only. Pre-change retained artifacts contain 66 aliases across `final-all`
+(240 outputs) and 28 aliases across `final-versions` (96 outputs). Those
+snapshots overlap in profile coverage, so their 94 aliases across 336 files are
+an undeduplicated retained aggregate only; they are non-comparable to the fresh
+matrix. The fresh `final-fix` matrix contains 48 aliases across 240
+outputs. The sole like-for-like result is the matching 240-output profile set:
+66 -> 48 aliases (18 fewer, 27.3%).
+
+| Representative | Before locals / aliases | After locals / aliases | Evidence |
+| --- | ---: | ---: | --- |
+| V12 `24_wonky_integration` | 9 / 1 | 8 / 0 | `local v3 = v_u_1` disappeared; `setmetatable(..., v_u_1)` now uses the `Machine` table directly. |
+| V12 `23_register_pressure_aliases` | 33 / 0 | 33 / 0 | Register-pressure locals are not trivial local-to-local aliases and remain intact. |
+| O0/g1 `24_wonky_integration` | 8 / 0 | 8 / 0 | No qualifying alias existed, so output remains unchanged. |
+
+The inspected after artifacts are:
+
+```text
+tests/luau_corpus/results/final-fix/V12/24_wonky_integration.luau
+tests/luau_corpus/results/final-fix/V12/23_register_pressure_aliases.luau
+tests/luau_corpus/results/final-fix/O0_g1/24_wonky_integration.luau
+```

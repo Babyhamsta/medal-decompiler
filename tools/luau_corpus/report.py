@@ -27,6 +27,7 @@ def _case_payload(case: CaseResult, root: Path) -> dict[str, object]:
         "diagnostic_path": _relative(case.diagnostic_path, root),
         "generated_statements": case.generated_statements,
         "generated_locals": case.generated_locals,
+        "generated_aliases": case.generated_aliases,
         "generated_gotos": case.generated_gotos,
         "bytecode_version": case.bytecode_version,
     }
@@ -79,8 +80,8 @@ def write_markdown_summary(result: RunResult) -> Path:
             f"{totals['recompile_failed']}."
         ),
         "",
-        "| profile | case | version | compile | decompile | recompile | statements | locals | gotos |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for case in sorted(
         result.cases,
@@ -93,6 +94,7 @@ def write_markdown_summary(result: RunResult) -> Path:
             f"{case.decompile_exit if case.decompile_exit is not None else '-'} | "
             f"{case.recompile_exit if case.recompile_exit is not None else '-'} | "
             f"{case.generated_statements} | {case.generated_locals} | "
+            f"{case.generated_aliases} | "
             f"{case.generated_gotos} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

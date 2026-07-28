@@ -1,14 +1,45 @@
-use derive_more::From;
 use std::fmt;
 
 use crate::{LocalRw, SideEffects, Traverse, formatter::Formatter};
 
-#[derive(Debug, From, PartialEq, Eq, PartialOrd, Clone)]
-pub struct Global(pub Vec<u8>);
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GlobalOrigin {
+    #[default]
+    Dynamic,
+    CompilerImport,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Clone)]
+pub struct Global {
+    name: Vec<u8>,
+    origin: GlobalOrigin,
+}
 
 impl Global {
     pub fn new(name: Vec<u8>) -> Self {
-        Self(name)
+        Self {
+            name,
+            origin: GlobalOrigin::Dynamic,
+        }
+    }
+
+    pub fn compiler_import(name: Vec<u8>) -> Self {
+        Self {
+            name,
+            origin: GlobalOrigin::CompilerImport,
+        }
+    }
+
+    pub fn origin(&self) -> GlobalOrigin {
+        self.origin
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    pub fn into_name(self) -> Vec<u8> {
+        self.name
     }
 }
 
@@ -28,16 +59,37 @@ impl<'a> From<&'a str> for Global {
     }
 }
 
+impl From<Vec<u8>> for Global {
+    fn from(name: Vec<u8>) -> Self {
+        Self::new(name)
+    }
+}
+
 impl fmt::Display for Global {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if Formatter::<fmt::Formatter>::is_valid_name(&self.0) {
-            write!(f, "{}", std::str::from_utf8(&self.0).unwrap())
+        if Formatter::<fmt::Formatter>::is_valid_name(&self.name) {
+            write!(f, "{}", std::str::from_utf8(&self.name).unwrap())
         } else {
             write!(
                 f,
                 "__FENV[\"{}\"]",
-                Formatter::<fmt::Formatter>::escape_string(&self.0)
+                Formatter::<fmt::Formatter>::escape_string(&self.name)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Global, GlobalOrigin};
+
+    #[test]
+    fn vector_conversion_preserves_dynamic_name_access() {
+        let expected = b"possibly_dynamic".to_vec();
+        let global: Global = expected.clone().into();
+
+        assert_eq!(global.origin(), GlobalOrigin::Dynamic);
+        assert_eq!(global.name(), expected);
+        assert_eq!(global.into_name(), expected);
     }
 }

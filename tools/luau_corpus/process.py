@@ -63,6 +63,22 @@ def _output_metrics(output: str) -> tuple[int, int, int]:
     return len(nonblank), local_count, goto_count
 
 
+def _is_identifier(value: str) -> bool:
+    return value.isidentifier()
+
+
+def count_trivial_aliases(source: str) -> int:
+    count = 0
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("local "):
+            continue
+        assignment = stripped.removeprefix("local ").split(" = ", maxsplit=1)
+        if len(assignment) == 2 and all(_is_identifier(part) for part in assignment):
+            count += 1
+    return count
+
+
 def run_corpus(
     workspace: Path,
     output_root: Path,
@@ -181,6 +197,7 @@ def run_corpus(
                 encoding="utf-8",
             )
             statements, locals_count, gotos = _output_metrics(output_text)
+            aliases = count_trivial_aliases(output_text)
             results.append(
                 CaseResult(
                     case_name=source.stem,
@@ -193,6 +210,7 @@ def run_corpus(
                     diagnostic_path=diagnostic_path,
                     generated_statements=statements,
                     generated_locals=locals_count,
+                    generated_aliases=aliases,
                     generated_gotos=gotos,
                     bytecode_version=bytecode_version,
                 )

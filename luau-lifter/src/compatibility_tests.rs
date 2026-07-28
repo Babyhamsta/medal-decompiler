@@ -77,6 +77,66 @@ fn compile(mode: &str, profile: &VersionProfile, source: &Path) -> std::process:
         .unwrap()
 }
 
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn trivial_local_alias_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let Some(rest) = line.trim().strip_prefix("local ") else {
+                return false;
+            };
+            let Some((left, right)) = rest.split_once(" = ") else {
+                return false;
+            };
+            is_identifier(left) && is_identifier(right)
+        })
+        .collect()
+}
+
+#[test]
+fn wonky_v12_output_has_no_trivial_local_aliases() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let compiled = compile("binary", &PROFILES[3], &source("24_wonky_integration"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+    let aliases = trivial_local_alias_lines(&decompiled);
+    let module_local = decompiled
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("local ")?;
+            let (identifier, _) = rest.split_once(" = ")?;
+            is_identifier(identifier).then_some(identifier)
+        })
+        .expect("decompiled output should declare the module local");
+    let setmetatable_body = decompiled
+        .split_once("return setmetatable({")
+        .map(|(_, body)| body)
+        .expect("decompiled output should return the setmetatable call");
+    let direct_module_argument = format!("}}, {module_local})");
+
+    assert!(
+        aliases.is_empty(),
+        "trivial aliases remained: {aliases:#?}\n{decompiled}"
+    );
+    assert!(
+        setmetatable_body
+            .lines()
+            .any(|line| line.trim() == direct_module_argument),
+        "setmetatable did not receive module local {module_local} directly\n{decompiled}"
+    );
+}
+
 #[test]
 fn bundled_compiler_versions_decompile_and_recompile() {
     if !compiler().is_file() {

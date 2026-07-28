@@ -858,7 +858,7 @@ impl<'a> Lifter<'a> {
                         let target = self.register(a as _);
                         let import_len = (aux >> 30) & 3;
                         assert!(import_len <= 3);
-                        let mut import_expression: ast::RValue = ast::Global::new(
+                        let mut import_expression: ast::RValue = ast::Global::compiler_import(
                             self.constant(((aux >> 20) & 1023) as usize)
                                 .into_string()
                                 .unwrap(),

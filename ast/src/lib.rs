@@ -12,6 +12,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+mod alias_elimination;
 mod assign;
 mod binary;
 mod r#break;
@@ -43,6 +44,7 @@ mod unary;
 mod vararg;
 mod r#while;
 
+pub use alias_elimination::*;
 pub use assign::*;
 pub use binary::*;
 pub use r#break::*;
