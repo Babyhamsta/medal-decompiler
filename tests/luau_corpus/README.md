@@ -1,8 +1,9 @@
 # Luau Truth Corpus
 
-This corpus contains 24 standalone Luau sources, from basic literals and
+This corpus contains 26 standalone Luau sources, from basic literals and
 assignments through closures, state machines, register pressure, and a combined
-wonky integration case.
+wonky integration case. The final two cases add a product-style controller and
+adversarial closure/table dataflow without executing either script.
 
 Run the primary quality matrix:
 
