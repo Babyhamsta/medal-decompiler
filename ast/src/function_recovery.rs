@@ -29,7 +29,7 @@ fn receiver_score_lvalue(value: &LValue, receiver: &RcLocal) -> usize {
         LValue::Index(index) => {
             let direct_score = usize::from(
                 matches!(index.left.as_ref(), RValue::Local(local) if local == receiver),
-            ) * 2;
+            );
             direct_score
                 + receiver_score_rvalue(&index.left, receiver)
                 + receiver_score_rvalue(&index.right, receiver)
@@ -146,7 +146,7 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     let Some(receiver) = function.parameters.first().cloned() else {
         return false;
     };
-    if receiver_score_block(&function.body, &receiver) < 3 {
+    if receiver_score_block(&function.body, &receiver) < 2 {
         return false;
     }
 

@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::iter;
 use std::{
     borrow::Cow,
@@ -369,25 +368,6 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             //     self.indent()?;
             //     writeln!(self.output, "-- line defined: {}", closure.line_defined.as_ref().unwrap())?;
             // }
-            if !closure.upvalues.is_empty() {
-                self.indent()?;
-                write!(self.output, "-- upvalues: ")?;
-                let mut it = closure.upvalues.iter().peekable();
-                while let Some(uv) = it.next() {
-                    match uv {
-                        crate::Upvalue::Copy(copy) => {
-                            write!(self.output, "(copy) {}", copy)?;
-                        }
-                        crate::Upvalue::Ref(lref) => {
-                            write!(self.output, "(ref) {}", lref)?;
-                        }
-                    }
-                    if it.peek().is_some() {
-                        write!(self.output, ", ")?;
-                    }
-                }
-                writeln!(self.output)?;
-            }
             self.indentation_level -= 1;
 
             self.format_block(&function.body)?;
@@ -752,7 +732,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             if i != 0 {
                 write!(self.output, ", ")?;
             }
-            let wrap = i + 1 == assign.right.len() && matches!(rvalue, RValue::Select(_));
+            let remaining_targets = assign.left.len().saturating_sub(i);
+            let wrap = i + 1 == assign.right.len()
+                && remaining_targets > 1
+                && matches!(rvalue, RValue::Select(_));
             if wrap {
                 write!(self.output, "(")?;
             }
@@ -1046,7 +1029,17 @@ mod tests {
             vec![Literal::Number(1.0).into(), selected.into()],
         );
 
-        assert_eq!(assign.to_string(), "first, second = 1, (produce())");
+        assert_eq!(assign.to_string(), "first, second = 1, produce()");
+
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let assign = Assign::new(
+            vec![
+                LValue::Local(local("first")),
+                LValue::Local(local("second")),
+            ],
+            vec![selected.into()],
+        );
+        assert_eq!(assign.to_string(), "first, second = (produce())");
     }
 
     #[test]

@@ -620,6 +620,7 @@ impl GraphStructurer {
         }
 
         let snapshot = self.function.new_synthetic_local(&carried);
+        snapshot.0.0.lock().0 = Some("previous".to_owned());
         condition.replace_values_read(&carried, &snapshot);
         let mut body = std::mem::take(self.function.block_mut(header).unwrap());
         body.pop();
