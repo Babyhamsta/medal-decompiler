@@ -268,7 +268,9 @@ allocation differs.
 
 Both snapshots contain the same 24 sources and 10 profiles. The corpus runner
 counts nonblank generated `.luau` lines. Conditional and compound counts use
-the canonical single-line syntax emitted by the formatter.
+the canonical single-line syntax emitted by the formatter. Split short-circuit
+pairs are adjacent assignments followed by a matching `if local` or
+`if not local` block that reassigns the same local.
 
 | Metric | Before | After | Change |
 | --- | ---: | ---: | ---: |
@@ -277,6 +279,7 @@ the canonical single-line syntax emitted by the formatter.
 | Trivial aliases | 48 | 32 | -16 (-33.3%) |
 | Conditional expressions | 0 | 148 | +148 |
 | Compound assignments | 0 | 138 | +138 |
+| Split short-circuit assignment/`if` pairs | 8 | 0 | -8 (-100.0%) |
 | Generated gotos | 0 | 0 | unchanged |
 
 Representative changes include:
