@@ -588,13 +588,19 @@ impl<'a> Lifter<'a> {
                                                 (a..a + c - 1)
                                                     .map(|r| self.register(r as _).into())
                                                     .collect(),
-                                                vec![ast::RValue::Select(call.into())],
+                                                vec![ast::Select::MethodCall(call).into_rvalue(
+                                                    ast::ResultDemand::Exact((c - 1) as usize),
+                                                )],
                                             )
                                             .into(),
                                         );
                                     }
                                 } else {
-                                    top = Some((call.into(), a));
+                                    top = Some((
+                                        ast::Select::MethodCall(call)
+                                            .into_rvalue(ast::ResultDemand::Open),
+                                        a,
+                                    ));
                                 }
                             }
                             instruction => unreachable!("{:?}", instruction),
@@ -624,13 +630,18 @@ impl<'a> Lifter<'a> {
                                         (a..a + c - 1)
                                             .map(|r| self.register(r as _).into())
                                             .collect(),
-                                        vec![ast::RValue::Select(call.into())],
+                                        vec![ast::Select::Call(call).into_rvalue(
+                                            ast::ResultDemand::Exact((c - 1) as usize),
+                                        )],
                                     )
                                     .into(),
                                 );
                             }
                         } else {
-                            top = Some((call.into(), a));
+                            top = Some((
+                                ast::Select::Call(call).into_rvalue(ast::ResultDemand::Open),
+                                a,
+                            ));
                         }
                     }
                     OpCode::LOP_CLOSEUPVALS => {
@@ -794,18 +805,25 @@ impl<'a> Lifter<'a> {
                     ),
                     OpCode::LOP_GETVARARGS => {
                         let vararg = ast::VarArg {};
-                        if b != 0 {
+                        if b > 1 {
                             statements.push(
                                 ast::Assign::new(
                                     (a..a + b - 1)
                                         .map(|r| self.register(r as _).into())
                                         .collect(),
-                                    vec![ast::RValue::Select(vararg.into())],
+                                    vec![
+                                        ast::Select::VarArg(vararg).into_rvalue(
+                                            ast::ResultDemand::Exact((b - 1) as usize),
+                                        ),
+                                    ],
                                 )
                                 .into(),
                             );
-                        } else {
-                            top = Some((vararg.into(), a));
+                        } else if b == 0 {
+                            top = Some((
+                                ast::Select::VarArg(vararg).into_rvalue(ast::ResultDemand::Open),
+                                a,
+                            ));
                         }
                     }
                     OpCode::LOP_NOP => {}

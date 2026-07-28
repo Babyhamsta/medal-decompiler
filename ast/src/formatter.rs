@@ -890,7 +890,8 @@ mod tests {
 
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
-        Index, LValue, Literal, Local, RValue, RcLocal, Select, Table, Upvalue,
+        Index, LValue, Literal, Local, MethodCall, RValue, RcLocal, ResultDemand, Return, Select,
+        Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1044,6 +1045,64 @@ mod tests {
         );
 
         assert_eq!(assign.to_string(), "first, second = 1, (produce())");
+    }
+
+    #[test]
+    fn result_demand_matrix_preserves_fixed_and_open_list_semantics() {
+        let selected_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Exact(1));
+        let exact_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Exact(2));
+        let call_assign = Assign::new(
+            vec![
+                LValue::Local(local("first")),
+                LValue::Local(local("second")),
+            ],
+            vec![exact_call],
+        );
+
+        let exact_method = Select::MethodCall(MethodCall::new(
+            local("object").into(),
+            "produce".to_owned(),
+            Vec::new(),
+        ))
+        .into_rvalue(ResultDemand::Exact(1));
+        let method_return = Return::new(vec![exact_method]);
+        let open_method = Select::MethodCall(MethodCall::new(
+            local("object").into(),
+            "produce".to_owned(),
+            Vec::new(),
+        ))
+        .into_rvalue(ResultDemand::Open);
+        let open_method_return = Return::new(vec![open_method]);
+
+        let exact_vararg = Select::VarArg(VarArg).into_rvalue(ResultDemand::Exact(3));
+        let vararg_assign = Assign::new(
+            vec![
+                LValue::Local(local("a")),
+                LValue::Local(local("b")),
+                LValue::Local(local("c")),
+            ],
+            vec![exact_vararg],
+        );
+        let open_vararg = Select::VarArg(VarArg).into_rvalue(ResultDemand::Open);
+        let open_vararg_return = Return::new(vec![Literal::Number(1.0).into(), open_vararg]);
+
+        let open_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Open);
+        let open_return = Return::new(vec![Literal::Number(1.0).into(), open_call]);
+
+        assert_eq!(
+            Return::new(vec![selected_call]).to_string(),
+            "return (produce())"
+        );
+        assert_eq!(call_assign.to_string(), "first, second = produce()");
+        assert_eq!(method_return.to_string(), "return (object:produce())");
+        assert_eq!(open_method_return.to_string(), "return object:produce()");
+        assert_eq!(vararg_assign.to_string(), "a, b, c = ...");
+        assert_eq!(open_vararg_return.to_string(), "return 1, ...");
+        assert_eq!(open_return.to_string(), "return 1, produce()");
+        assert!(!ResultDemand::Exact(0).has_values());
     }
 
     #[test]
