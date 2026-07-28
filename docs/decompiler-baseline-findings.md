@@ -387,3 +387,55 @@ end
 The local before/after reports are generated, ignored artifacts at
 `tests/luau_corpus/results/function-table-before/` and
 `tests/luau_corpus/results/function-table-after/`.
+
+## Control-flow cleanup
+
+The control-flow pass runs after expression recovery and before local
+declarations. It uses AST structure and side-effect evidence rather than
+source names or fixture patterns:
+
+- nested single-`else` conditionals continue to format dynamically as
+  `elseif`;
+- empty `then` branches are inverted without rewriting relational operators;
+- empty conditionals are removed only when evaluating the condition is
+  provably unobservable;
+- terminal `return`, `break`, `continue`, `goto`, or fully terminal nested
+  branches become guard clauses;
+- complex loop-tail conditionals become `continue` guards, while simple
+  one-statement tail conditionals retain their source-like `if` shape;
+- loop cleanup reaches a local fixed point when one recovered guard exposes a
+  nested eligible guard.
+
+### Static verification
+
+- `cargo +nightly test --workspace --offline`: 106 passed, 0 failed.
+- `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
+- All profiles and compatibility versions: 260/260; 0 source compile failures,
+  0 decompile failures, 0 recompile failures, and 0 generated gotos.
+- Three independent reviews passed after both Important findings were repaired.
+- The corpus tools compiled, decompiled, and recompiled files only. They did
+  not execute authored or generated Luau.
+
+### Comparable corpus metrics
+
+Both snapshots contain the same 26 sources and 10 profiles.
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Generated nonblank lines | 6,851 | 6,813 | -38 |
+| Generated locals | 1,189 | 1,189 | unchanged |
+| Trivial aliases | 72 | 72 | unchanged |
+| `if` branches | 343 | 343 | unchanged |
+| `elseif` branches | 60 | 60 | unchanged |
+| Standalone `else` branches | 108 | 50 | -58 |
+| Recovered `continue` guards | 0 | 20 | +20 |
+| Empty textual branches | 0 | 0 | unchanged |
+| Aggregate tab indentation | 11,360 | 10,868 | -492 |
+| Maximum tab indentation | 6 | 6 | unchanged |
+| Generated gotos | 0 | 0 | unchanged |
+
+Only 50 of 260 outputs changed, across the five control-flow-heavy truth
+sources. Simple generic-for conditionals are byte-for-byte unchanged from the
+input branch. The local before/after reports are generated, ignored artifacts
+at `tests/luau_corpus/results/control-flow-before/` and
+`tests/luau_corpus/results/control-flow-after/`.
