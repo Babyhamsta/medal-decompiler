@@ -193,6 +193,21 @@ fn apply_local_map_to_values_referenced<T: LocalRw + Traverse>(
 
 // does not replace locals in child closures
 pub fn apply_local_map(function: &mut Function, local_map: FxHashMap<RcLocal, RcLocal>) {
+    let mut provenance_groups = FxHashMap::<RcLocal, FxHashSet<RcLocal>>::default();
+    for source in local_map.keys() {
+        let mut target = &local_map[source];
+        while let Some(next) = local_map.get(target) {
+            target = next;
+        }
+        provenance_groups
+            .entry(target.clone())
+            .or_default()
+            .extend([source.clone(), target.clone()]);
+    }
+    for (target, sources) in provenance_groups {
+        function.merge_local_provenance(target, sources.iter());
+    }
+
     for param in &mut function.parameters {
         if let Some(mut new_param) = local_map.get(param) {
             // TODO: make sure this doesnt cycle if theres a li -> li entry
@@ -257,6 +272,7 @@ impl<'a> SsaConstructor<'a> {
         local: &RcLocal,
         param_local: RcLocal,
     ) -> RcLocal {
+        let mut argument_locals = Vec::new();
         for (source, edge) in self
             .function
             .graph()
@@ -265,6 +281,7 @@ impl<'a> SsaConstructor<'a> {
             .collect::<Vec<_>>()
         {
             let argument_local = self.find_local(source, local);
+            argument_locals.push(argument_local.clone());
             self.function
                 .graph_mut()
                 .edge_weight_mut(edge)
@@ -272,6 +289,8 @@ impl<'a> SsaConstructor<'a> {
                 .arguments
                 .push((param_local.clone(), argument_local.into()));
         }
+        self.function
+            .merge_local_provenance(param_local.clone(), argument_locals.iter());
         // TODO: fix lol
         // self.try_remove_trivial_param(node, param_local)
         param_local
@@ -363,7 +382,7 @@ impl<'a> SsaConstructor<'a> {
             // search globally
             if !self.sealed_blocks.contains(&node) {
                 // TODO: this code is repeated multiple times, create new_local function
-                let param_local = RcLocal::default();
+                let param_local = self.function.new_merge_local(local);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -377,7 +396,7 @@ impl<'a> SsaConstructor<'a> {
             } else if let Ok(pred) = self.function.predecessor_blocks(node).exactly_one() {
                 self.find_local(pred, local)
             } else {
-                let param_local = RcLocal::default();
+                let param_local = self.function.new_merge_local(local);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -484,6 +503,7 @@ impl<'a> SsaConstructor<'a> {
         // TODO: REFACTOR: extend
         for local in &read {
             let new_local = self.find_local(node, local);
+            self.function.record_use(&new_local, node, stat_index);
             map.insert(local.clone(), new_local);
         }
         for (local_index, local) in read.into_iter().enumerate() {
@@ -523,7 +543,7 @@ impl<'a> SsaConstructor<'a> {
                     && let Some(local) = assign.left[0].as_local().cloned()
                     && assign.right[0].as_closure().is_some()
                 {
-                    let new_local = RcLocal::default();
+                    let new_local = self.function.new_ssa_definition(&local, node, stat_index);
                     self.old_locals.insert(new_local.clone(), local.clone());
                     if let Some(upvalues) = self.new_upvalues_in.get_mut(&local) {
                         upvalues.insert(new_local.clone());
@@ -549,7 +569,7 @@ impl<'a> SsaConstructor<'a> {
                     self.read(node, stat_index);
                     // write
                     for (local_index, local) in written.iter().enumerate() {
-                        let new_local = RcLocal::default();
+                        let new_local = self.function.new_ssa_definition(local, node, stat_index);
                         self.old_locals.insert(new_local.clone(), local.clone());
                         if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                             upvalues.insert(new_local.clone());
@@ -731,4 +751,66 @@ pub fn construct(
         upvalues_passed: FxHashMap::default(),
     }
     .construct()
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use ast::{Assign, Literal, Local, RcLocal};
+    use rustc_hash::FxHashMap;
+
+    use crate::{
+        function::Function,
+        provenance::{BindingIdentity, DebugLifetime, RegisterFamily, SourceOrigin},
+    };
+
+    use super::apply_local_map;
+
+    #[test]
+    fn ssa_destruction_coalescing_retains_all_definition_origins() {
+        let physical = RcLocal::new(Local::default());
+        let mut function = Function::new(4);
+        let node = function.new_block();
+        function.set_entry(node);
+        function.block_mut(node).unwrap().extend([
+            Assign::new(
+                vec![physical.clone().into()],
+                vec![Literal::Number(1.0).into()],
+            )
+            .into(),
+            Assign::new(
+                vec![physical.clone().into()],
+                vec![Literal::Number(2.0).into()],
+            )
+            .into(),
+        ]);
+        function.set_statement_origins(
+            node,
+            vec![
+                [SourceOrigin::new(4, 2, Some(10), "LOADN")].into(),
+                [SourceOrigin::new(4, 8, Some(20), "LOADN")].into(),
+            ],
+        );
+        function.set_register_family(
+            physical.clone(),
+            RegisterFamily::new(
+                4,
+                1,
+                BindingIdentity::local(4, 1),
+                vec![
+                    DebugLifetime::new(b"first".to_vec(), 1, 4),
+                    DebugLifetime::new(b"second".to_vec(), 7, 10),
+                ],
+            ),
+        );
+
+        let first = function.new_ssa_definition(&physical, node, 0);
+        let second = function.new_ssa_definition(&physical, node, 1);
+        apply_local_map(
+            &mut function,
+            FxHashMap::from_iter([(second, first.clone())]),
+        );
+
+        assert_eq!(function.provenance().origins(&first).len(), 2);
+        assert_eq!(function.provenance().bindings(&first).len(), 2);
+    }
 }

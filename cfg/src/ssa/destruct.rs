@@ -35,17 +35,6 @@ enum RedOrBlue {
 
 type CongruenceClass = BTreeMap<(usize, ParamOrStatIndex), RcLocal>;
 
-fn fresh_with_preferred_name(local: &RcLocal) -> RcLocal {
-    let name = local
-        .0
-        .0
-        .lock()
-        .0
-        .clone()
-        .filter(|name| ast::is_valid_identifier(name.as_bytes()));
-    RcLocal::new(ast::Local::new(name))
-}
-
 // Benoit Boissinot, Alain Darte, Fabrice Rastello, Benoît Dupont de Dinechin, Christophe Guillon.
 // Revisiting Out-of-SSA Translation for Correctness, Code Quality, and Efficiency. [Research Report]
 // 2008, pp.14. inria-00349925v3
@@ -806,15 +795,24 @@ impl<'a> Destructor<'a> {
     // i.e., no variable that is defined by a Phi-function is used in a 'later' phi-function.
     fn lift_block_params(&mut self, node: NodeIndex) {
         let mut param_map = FxHashMap::default();
-        if let Some((_, BlockEdge { arguments, .. })) = self.function.edges_to_block(node).next() {
-            for param in arguments.iter().map(|(p, _)| p) {
-                let temp_param = fresh_with_preferred_name(param);
-                if let Some(group) = self.upvalue_to_group.get(param) {
-                    self.upvalue_to_group
-                        .insert(temp_param.clone(), group.clone());
-                }
-                param_map.insert(param.clone(), temp_param);
+        let params = self
+            .function
+            .edges_to_block(node)
+            .next()
+            .map(|(_, edge)| {
+                edge.arguments
+                    .iter()
+                    .map(|(param, _)| param.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for param in params {
+            let temp_param = self.function.new_synthetic_local(&param);
+            if let Some(group) = self.upvalue_to_group.get(&param) {
+                self.upvalue_to_group
+                    .insert(temp_param.clone(), group.clone());
             }
+            param_map.insert(param, temp_param);
         }
 
         if !param_map.is_empty() {
@@ -852,6 +850,24 @@ impl<'a> Destructor<'a> {
                 .collect::<Vec<_>>();
 
             for &edge in &edges_to_node {
+                let synthetic_sources = self
+                    .function
+                    .graph()
+                    .edge_weight(edge)
+                    .unwrap()
+                    .arguments
+                    .iter()
+                    .map(|(param, argument)| {
+                        argument
+                            .as_local()
+                            .cloned()
+                            .unwrap_or_else(|| param.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let temp_locals = synthetic_sources
+                    .iter()
+                    .map(|source| self.function.new_synthetic_local(source))
+                    .collect::<Vec<_>>();
                 let args = self
                     .function
                     .graph_mut()
@@ -867,11 +883,7 @@ impl<'a> Destructor<'a> {
                     parallel: true,
                 };
 
-                for (param, arg) in args {
-                    let temp_local = match arg {
-                        ast::RValue::Local(arg) => fresh_with_preferred_name(arg),
-                        _ => fresh_with_preferred_name(param),
-                    };
+                for ((param, arg), temp_local) in args.zip(temp_locals) {
                     if let ast::RValue::Local(arg) = arg
                         && let Some(group) = self.upvalue_to_group.get(arg)
                     {

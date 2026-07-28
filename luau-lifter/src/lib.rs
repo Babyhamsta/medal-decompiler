@@ -250,13 +250,20 @@ fn decompile_function(
         catch_phase(DecompilePhase::Ssa, Some(function_id), None, || {
             let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
                 cfg::ssa::construct(&mut function, &upvalues_in);
+            let upvalue_passed_groups = upvalue_passed_groups
+                .into_iter()
+                .map(|members| {
+                    let source = members
+                        .iter()
+                        .next()
+                        .cloned()
+                        .expect("upvalue group must contain a source local");
+                    (function.new_synthetic_local(&source), members)
+                })
+                .collect::<Vec<_>>();
             let upvalue_to_group = upvalue_in_groups
                 .into_iter()
-                .chain(
-                    upvalue_passed_groups
-                        .into_iter()
-                        .map(|m| (ast::RcLocal::default(), m)),
-                )
+                .chain(upvalue_passed_groups)
                 .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
                 .collect::<IndexMap<_, _>>();
             // TODO: do we even need this?
