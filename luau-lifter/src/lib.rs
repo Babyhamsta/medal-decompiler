@@ -278,44 +278,61 @@ fn decompile_function(
             (local_count, upvalue_to_group, local_to_group)
         })?;
 
-    // TODO: REFACTOR: some way to write a macro that states
-    // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
-    // structure_for_loops and remove_unnecessary_params must run again.
-    // if structure_compound_conditionals results in change then dominators and post dominators
-    // must be recalculated.
-    // etc.
-    // the macro could also maybe generate an optimal ordering?
-    catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
-        let mut changed = true;
-        while changed {
-            changed = false;
-
+    let recovery_report = catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
+        let mut scheduler = cfg::recovery::PassScheduler::new(32);
+        scheduler.add_pass("structure-jumps", |function| {
             let dominators = simple_fast(function.graph(), function.entry().unwrap());
-            changed |= structure_jumps(&mut function, &dominators);
-
-            ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
-
-            if structure_conditionals(&mut function)
-            // || {
-            //     let post_dominators = post_dominators(function.graph_mut());
-            //     structure_for_loops(&mut function, &dominators, &post_dominators)
-            // }
-            // we can't structure method calls like this because of __namecall
-            // || structure_method_calls(&mut function)
-            {
-                changed = true;
+            if structure_jumps(function, &dominators) {
+                cfg::recovery::PassChange::cfg().union(cfg::recovery::PassChange::ast())
+            } else {
+                cfg::recovery::PassChange::none()
             }
+        });
+        scheduler.add_pass("inline", |function| {
+            let before = cfg::recovery::structural_fingerprint(function);
+            ssa::inline::inline(function, &local_to_group, &upvalue_to_group);
+            if cfg::recovery::structural_fingerprint(function) != before {
+                cfg::recovery::PassChange::dataflow().union(cfg::recovery::PassChange::ast())
+            } else {
+                cfg::recovery::PassChange::none()
+            }
+        });
+        scheduler.add_pass("structure-conditionals", |function| {
+            if structure_conditionals(function) {
+                cfg::recovery::PassChange::cfg()
+                    .union(cfg::recovery::PassChange::dataflow())
+                    .union(cfg::recovery::PassChange::ast())
+            } else {
+                cfg::recovery::PassChange::none()
+            }
+        });
+        scheduler.add_pass("remove-unnecessary-params", |function| {
             let mut local_map = FxHashMap::default();
-            // TODO: loop until returns false?
-            if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
-                changed = true;
+            if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
+                ssa::construct::apply_local_map(function, local_map);
+                cfg::recovery::PassChange::cfg()
+                    .union(cfg::recovery::PassChange::dataflow())
+                    .union(cfg::recovery::PassChange::ast())
+            } else {
+                cfg::recovery::PassChange::none()
             }
-            ssa::construct::apply_local_map(&mut function, local_map);
-        }
+        });
+        let report = scheduler.run(&mut function)?;
         function
             .validate_reference_bindings()
             .expect("structuring must preserve reference binding classes");
+        Ok::<_, cfg::recovery::SchedulerError>(report)
+    })?
+    .map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Structure,
+            Some(function_id),
+            None,
+            "deterministic reconstruction",
+            error.to_string(),
+        )
     })?;
+    let recovery_facts = recovery_report.facts;
 
     catch_phase(
         DecompilePhase::SsaDestruction,
@@ -331,6 +348,7 @@ fn decompile_function(
             .destruct();
         },
     )?;
+    debug_assert_eq!(recovery_facts.function_id(), function_id);
 
     let (params, is_variadic, mut block) =
         catch_phase(DecompilePhase::Restructure, Some(function_id), None, || {

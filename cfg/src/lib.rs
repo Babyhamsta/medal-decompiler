@@ -9,4 +9,5 @@ pub mod dot;
 pub mod function;
 pub mod pattern;
 pub mod provenance;
+pub mod recovery;
 pub mod ssa;
