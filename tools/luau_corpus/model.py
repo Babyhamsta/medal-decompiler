@@ -13,6 +13,13 @@ class CompileProfile:
 
 
 @dataclass(frozen=True)
+class RuntimeResult:
+    exit_code: int
+    normalized_result: str | None
+    stderr: str
+
+
+@dataclass(frozen=True)
 class CaseResult:
     case_name: str
     profile: str
@@ -27,6 +34,9 @@ class CaseResult:
     generated_aliases: int
     generated_gotos: int
     bytecode_version: int | None
+    source_runtime: RuntimeResult | None = None
+    generated_runtime: RuntimeResult | None = None
+    semantic_match: bool | None = None
 
 
 @dataclass(frozen=True)

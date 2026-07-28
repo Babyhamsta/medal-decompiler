@@ -336,6 +336,139 @@ return copy
             encoding="utf-8",
         )
 
+    def _add_case(self, name: str) -> None:
+        (self.cases / f"{name}.luau").write_text(
+            "return 1\n",
+            encoding="utf-8",
+        )
+
+    def _write_runtime(self, body: str) -> Path:
+        runtime = self.tools / "luau_runtime_stub.py"
+        self._write_executable(runtime, body)
+        return runtime
+
+    def test_semantic_mode_executes_only_allowlisted_cases(self) -> None:
+        self._add_case("04_calls_multireturn")
+        self._add_case("99_untrusted")
+        invocation_log = self.root / "runtime-invocations.txt"
+        runtime = self._write_runtime(
+            f"""
+            import pathlib
+            import sys
+
+            subject = sys.argv[-2]
+            with pathlib.Path({str(invocation_log)!r}).open(
+                "a",
+                encoding="utf-8",
+            ) as output:
+                output.write(subject + "\\n")
+
+            if "/cases/" in subject:
+                print("SEMANTIC_RESULT p1[d1;]")
+            else:
+                print("SEMANTIC_RESULT p1[d2;]")
+            """
+        )
+
+        result = run_corpus(
+            workspace=self.root,
+            output_root=self.root / "semantic",
+            profiles=(CompileProfile("test", 1, 1),),
+            compiler=self.compiler,
+            decompiler=self.decompiler,
+            semantic=True,
+            runtime=runtime,
+        )
+
+        by_name = {case.case_name: case for case in result.cases}
+        trusted = by_name["04_calls_multireturn"]
+        untrusted = by_name["99_untrusted"]
+        runtime_invocations = invocation_log.read_text(
+            encoding="utf-8",
+        ).splitlines()
+
+        self.assertEqual(len(runtime_invocations), 2)
+        self.assertTrue(
+            all(
+                "04_calls_multireturn" in invocation
+                for invocation in runtime_invocations
+            )
+        )
+        self.assertIsNone(untrusted.source_runtime)
+        self.assertIsNone(untrusted.generated_runtime)
+        self.assertIsNone(untrusted.semantic_match)
+        self.assertEqual(trusted.source_runtime.exit_code, 0)
+        self.assertEqual(trusted.generated_runtime.exit_code, 0)
+        self.assertFalse(trusted.semantic_match)
+        self.assertIn(
+            "[source-runtime]\nexit=0\nresult=p1[d1;]",
+            trusted.diagnostic_path.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "[generated-runtime]\nexit=0\nresult=p1[d2;]",
+            trusted.diagnostic_path.read_text(encoding="utf-8"),
+        )
+
+        json_path = write_json_summary(result)
+        markdown_path = write_markdown_summary(result)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        markdown = markdown_path.read_text(encoding="utf-8")
+        trusted_payload = next(
+            case
+            for case in payload["cases"]
+            if case["case_name"] == "04_calls_multireturn"
+        )
+
+        self.assertEqual(payload["totals"]["semantic_checked"], 1)
+        self.assertEqual(payload["totals"]["semantic_mismatched"], 1)
+        self.assertEqual(trusted_payload["source_runtime_exit"], 0)
+        self.assertEqual(
+            trusted_payload["generated_runtime_result"],
+            "p1[d2;]",
+        )
+        self.assertFalse(trusted_payload["semantic_match"])
+        self.assertIn("| source run | generated run | semantic |", markdown)
+
+    def test_generated_runtime_failure_does_not_stop_later_probe(self) -> None:
+        self._add_case("04_calls_multireturn")
+        self._add_case("05_varargs")
+        runtime = self._write_runtime(
+            """
+            import sys
+
+            subject = sys.argv[-2]
+            if "04_calls_multireturn" in subject and "/cases/" not in subject:
+                print("generated runtime rejected", file=sys.stderr)
+                raise SystemExit(7)
+
+            case = (
+                "04_calls_multireturn"
+                if "04_calls_multireturn" in subject
+                else "05_varargs"
+            )
+            print(f"SEMANTIC_RESULT {case}")
+            """
+        )
+
+        result = run_corpus(
+            workspace=self.root,
+            output_root=self.root / "runtime-failure",
+            profiles=(CompileProfile("test", 1, 1),),
+            compiler=self.compiler,
+            decompiler=self.decompiler,
+            semantic=True,
+            runtime=runtime,
+        )
+
+        by_name = {case.case_name: case for case in result.cases}
+
+        self.assertEqual(
+            by_name["04_calls_multireturn"].generated_runtime.exit_code,
+            7,
+        )
+        self.assertFalse(by_name["04_calls_multireturn"].semantic_match)
+        self.assertTrue(by_name["05_varargs"].semantic_match)
+
     def test_compile_failure_is_recorded_without_stopping_next_case(self) -> None:
         output = self.root / "output"
 
@@ -396,12 +529,15 @@ return copy
         self.assertEqual(payload["cases"][0]["bytecode_version"], ord("B"))
         self.assertEqual(payload["cases"][0]["output_path"], "test/01_success.luau")
         self.assertEqual(payload["cases"][0]["generated_aliases"], 1)
+        self.assertEqual(payload["totals"]["semantic_checked"], 0)
+        self.assertIsNone(payload["cases"][0]["source_runtime_exit"])
+        self.assertIsNone(payload["cases"][0]["semantic_match"])
         self.assertIn(
-            "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
+            "| profile | case | version | compile | decompile | recompile | source run | generated run | semantic | statements | locals | aliases | gotos |",
             markdown,
         )
         self.assertIn(
-            "| test | 01_success | 66 | 0 | 0 | 0 | 3 | 2 | 1 | 0 |",
+            "| test | 01_success | 66 | 0 | 0 | 0 | - | - | - | 3 | 2 | 1 | 0 |",
             markdown,
         )
 

@@ -30,6 +30,27 @@ def _case_payload(case: CaseResult, root: Path) -> dict[str, object]:
         "generated_aliases": case.generated_aliases,
         "generated_gotos": case.generated_gotos,
         "bytecode_version": case.bytecode_version,
+        "source_runtime_exit": (
+            case.source_runtime.exit_code
+            if case.source_runtime is not None
+            else None
+        ),
+        "source_runtime_result": (
+            case.source_runtime.normalized_result
+            if case.source_runtime is not None
+            else None
+        ),
+        "generated_runtime_exit": (
+            case.generated_runtime.exit_code
+            if case.generated_runtime is not None
+            else None
+        ),
+        "generated_runtime_result": (
+            case.generated_runtime.normalized_result
+            if case.generated_runtime is not None
+            else None
+        ),
+        "semantic_match": case.semantic_match,
     }
 
 
@@ -43,6 +64,28 @@ def _totals(result: RunResult) -> dict[str, int]:
         ),
         "recompile_failed": sum(
             case.decompile_exit == 0 and case.recompile_exit != 0
+            for case in result.cases
+        ),
+        "semantic_checked": sum(
+            case.semantic_match is not None for case in result.cases
+        ),
+        "semantic_mismatched": sum(
+            case.semantic_match is False for case in result.cases
+        ),
+        "source_runtime_failed": sum(
+            case.source_runtime is not None
+            and (
+                case.source_runtime.exit_code != 0
+                or case.source_runtime.normalized_result is None
+            )
+            for case in result.cases
+        ),
+        "generated_runtime_failed": sum(
+            case.generated_runtime is not None
+            and (
+                case.generated_runtime.exit_code != 0
+                or case.generated_runtime.normalized_result is None
+            )
             for case in result.cases
         ),
     }
@@ -80,8 +123,8 @@ def write_markdown_summary(result: RunResult) -> Path:
             f"{totals['recompile_failed']}."
         ),
         "",
-        "| profile | case | version | compile | decompile | recompile | statements | locals | aliases | gotos |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| profile | case | version | compile | decompile | recompile | source run | generated run | semantic | statements | locals | aliases | gotos |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
     ]
     for case in sorted(
         result.cases,
@@ -93,6 +136,9 @@ def write_markdown_summary(result: RunResult) -> Path:
             f"{case.compile_exit} | "
             f"{case.decompile_exit if case.decompile_exit is not None else '-'} | "
             f"{case.recompile_exit if case.recompile_exit is not None else '-'} | "
+            f"{case.source_runtime.exit_code if case.source_runtime is not None else '-'} | "
+            f"{case.generated_runtime.exit_code if case.generated_runtime is not None else '-'} | "
+            f"{'pass' if case.semantic_match is True else 'fail' if case.semantic_match is False else '-'} | "
             f"{case.generated_statements} | {case.generated_locals} | "
             f"{case.generated_aliases} | "
             f"{case.generated_gotos} |"

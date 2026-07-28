@@ -4,7 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .model import CaseResult, CompileProfile, RunResult
+from .model import CaseResult, CompileProfile, RunResult, RuntimeResult
+from .semantic import (
+    TRUSTED_SEMANTIC_PROBES,
+    run_semantic_probe,
+)
 
 
 def _executable_prefix(executable: Path) -> tuple[str, ...]:
@@ -56,6 +60,15 @@ def _diagnostic_section(stage: str, exit_code: int, stderr: bytes) -> str:
     return f"[{stage}]\nexit={exit_code}{suffix}\n"
 
 
+def _runtime_diagnostic_section(stage: str, result: RuntimeResult) -> str:
+    lines = [f"[{stage}]", f"exit={result.exit_code}"]
+    if result.normalized_result is not None:
+        lines.append(f"result={result.normalized_result}")
+    if result.stderr:
+        lines.append(result.stderr)
+    return "\n".join(lines) + "\n"
+
+
 def _output_metrics(output: str) -> tuple[int, int, int]:
     nonblank = [line for line in output.splitlines() if line.strip()]
     local_count = sum(line.lstrip().startswith("local ") for line in nonblank)
@@ -86,11 +99,17 @@ def run_corpus(
     case_filter: str | None = None,
     compiler: Path | None = None,
     decompiler: Path | None = None,
+    semantic: bool = False,
+    runtime: Path | None = None,
 ) -> RunResult:
     workspace = workspace.resolve()
     output_root = output_root.resolve()
     compiler = (compiler or workspace / ".tools/luau-windows/luau-compile.exe").resolve()
     decompiler = (decompiler or workspace / "target/debug/luau-lifter.exe").resolve()
+    runtime = (runtime or workspace / ".tools/luau-windows/luau.exe").resolve()
+    semantic_runner = (
+        workspace / "tests/luau_corpus/probes/runner.luau"
+    ).resolve()
     case_paths = sorted((workspace / "tests/luau_corpus/cases").glob("*.luau"))
     if case_filter:
         folded_filter = case_filter.casefold()
@@ -137,6 +156,9 @@ def run_corpus(
             saved_bytecode: Path | None = None
             saved_output: Path | None = None
             bytecode_version: int | None = None
+            source_runtime = None
+            generated_runtime = None
+            semantic_match: bool | None = None
 
             if compiled is not None and compile_exit == 0:
                 if compiled.stdout:
@@ -192,6 +214,50 @@ def run_corpus(
                             )
                         )
 
+            probe = TRUSTED_SEMANTIC_PROBES.get(source.stem)
+            if (
+                semantic
+                and probe is not None
+                and compile_exit == 0
+                and decompile_exit == 0
+                and recompile_exit == 0
+                and saved_output is not None
+            ):
+                probe_path = (workspace / probe.probe_path).resolve()
+                source_runtime = run_semantic_probe(
+                    runtime,
+                    semantic_runner,
+                    source.resolve(),
+                    probe_path,
+                    workspace,
+                )
+                generated_runtime = run_semantic_probe(
+                    runtime,
+                    semantic_runner,
+                    saved_output.resolve(),
+                    probe_path,
+                    workspace,
+                )
+                semantic_match = (
+                    source_runtime.exit_code == 0
+                    and generated_runtime.exit_code == 0
+                    and source_runtime.normalized_result is not None
+                    and source_runtime.normalized_result
+                    == generated_runtime.normalized_result
+                )
+                diagnostic_parts.append(
+                    _runtime_diagnostic_section(
+                        "source-runtime",
+                        source_runtime,
+                    )
+                )
+                diagnostic_parts.append(
+                    _runtime_diagnostic_section(
+                        "generated-runtime",
+                        generated_runtime,
+                    )
+                )
+
             diagnostic_path.write_text(
                 "\n".join(diagnostic_parts),
                 encoding="utf-8",
@@ -213,6 +279,9 @@ def run_corpus(
                     generated_aliases=aliases,
                     generated_gotos=gotos,
                     bytecode_version=bytecode_version,
+                    source_runtime=source_runtime,
+                    generated_runtime=generated_runtime,
+                    semantic_match=semantic_match,
                 )
             )
 
