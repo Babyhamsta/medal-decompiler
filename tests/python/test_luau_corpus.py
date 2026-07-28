@@ -24,7 +24,7 @@ from tools.luau_corpus.semantic import (
     TRUSTED_SEMANTIC_PROBES,
     runtime_command,
 )
-from tools.run_luau_corpus import select_profiles
+from tools.run_luau_corpus import run_failed, select_profiles
 
 
 class ProfileTests(unittest.TestCase):
@@ -468,6 +468,42 @@ return copy
         )
         self.assertFalse(by_name["04_calls_multireturn"].semantic_match)
         self.assertTrue(by_name["05_varargs"].semantic_match)
+
+    def test_semantic_exit_policy_only_blocks_checked_mismatches(self) -> None:
+        self._add_case("04_calls_multireturn")
+        runtime = self._write_runtime(
+            """
+            import sys
+
+            subject = sys.argv[-2]
+            result = "source" if "/cases/" in subject else "generated"
+            print(f"SEMANTIC_RESULT {result}")
+            """
+        )
+        mismatched = run_corpus(
+            workspace=self.root,
+            output_root=self.root / "exit-policy-mismatch",
+            profiles=(CompileProfile("test", 1, 1),),
+            case_filter="04_calls",
+            compiler=self.compiler,
+            decompiler=self.decompiler,
+            semantic=True,
+            runtime=runtime,
+        )
+        unchecked = run_corpus(
+            workspace=self.root,
+            output_root=self.root / "exit-policy-unchecked",
+            profiles=(CompileProfile("test", 1, 1),),
+            case_filter="success",
+            compiler=self.compiler,
+            decompiler=self.decompiler,
+            semantic=True,
+            runtime=runtime,
+        )
+
+        self.assertFalse(run_failed(mismatched, semantic=False))
+        self.assertTrue(run_failed(mismatched, semantic=True))
+        self.assertFalse(run_failed(unchecked, semantic=True))
 
     def test_compile_failure_is_recorded_without_stopping_next_case(self) -> None:
         output = self.root / "output"

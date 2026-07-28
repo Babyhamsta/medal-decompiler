@@ -12,6 +12,7 @@ if str(WORKSPACE) not in sys.path:
 from tools.luau_corpus import (
     COMPATIBILITY_PROFILES,
     PRIMARY_PROFILES,
+    RunResult,
     SECONDARY_PROFILES,
 )
 from tools.luau_corpus.process import run_corpus
@@ -38,6 +39,12 @@ def _arguments() -> argparse.Namespace:
         type=Path,
         default=Path("target/debug/luau-lifter.exe"),
     )
+    parser.add_argument(
+        "--runtime",
+        type=Path,
+        default=Path(".tools/luau-windows/luau.exe"),
+    )
+    parser.add_argument("--semantic", action="store_true")
     parser.add_argument("--no-build", action="store_true")
     return parser.parse_args()
 
@@ -49,6 +56,27 @@ def select_profiles(name: str) -> tuple:
         "compatibility": COMPATIBILITY_PROFILES,
         "all": PRIMARY_PROFILES + SECONDARY_PROFILES + COMPATIBILITY_PROFILES,
     }[name]
+
+
+def run_failed(result: RunResult, semantic: bool) -> bool:
+    static_failure = any(
+        case.compile_exit != 0
+        or case.decompile_exit != 0
+        or case.recompile_exit != 0
+        for case in result.cases
+    )
+    if static_failure or not semantic:
+        return static_failure
+
+    return any(
+        (
+            case.source_runtime is not None
+            or case.generated_runtime is not None
+            or case.semantic_match is not None
+        )
+        and case.semantic_match is not True
+        for case in result.cases
+    )
 
 
 def main() -> int:
@@ -69,25 +97,26 @@ def main() -> int:
         if args.decompiler.is_absolute()
         else WORKSPACE / args.decompiler
     )
+    runtime = (
+        args.runtime
+        if args.runtime.is_absolute()
+        else WORKSPACE / args.runtime
+    )
     result = run_corpus(
         workspace=WORKSPACE,
         output_root=output,
         profiles=profiles,
         case_filter=args.case_filter,
         decompiler=decompiler,
+        semantic=args.semantic,
+        runtime=runtime,
     )
     json_path = write_json_summary(result)
     markdown_path = write_markdown_summary(result)
     print(f"Wrote {json_path}")
     print(f"Wrote {markdown_path}")
 
-    failed = any(
-        case.compile_exit != 0
-        or case.decompile_exit != 0
-        or case.recompile_exit != 0
-        for case in result.cases
-    )
-    return 1 if failed else 0
+    return 1 if run_failed(result, args.semantic) else 0
 
 
 if __name__ == "__main__":
