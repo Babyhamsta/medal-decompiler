@@ -20,10 +20,157 @@ from tools.luau_corpus.process import (
     run_corpus,
 )
 from tools.luau_corpus.report import write_json_summary, write_markdown_summary
+from tools.luau_corpus.semantic import (
+    TRUSTED_SEMANTIC_PROBES,
+    runtime_command,
+)
 from tools.run_luau_corpus import select_profiles
 
 
 class ProfileTests(unittest.TestCase):
+    def test_semantic_probe_manifest_is_explicit_and_limited(self) -> None:
+        self.assertEqual(
+            tuple(TRUSTED_SEMANTIC_PROBES),
+            (
+                "04_calls_multireturn",
+                "05_varargs",
+                "13_repeat_until",
+                "15_generic_for",
+                "20_pcall_style_flow",
+                "21_state_machine",
+            ),
+        )
+        self.assertNotIn(
+            "27_orchestration_engine",
+            TRUSTED_SEMANTIC_PROBES,
+        )
+
+    def test_runtime_command_passes_subject_and_probe_after_program_args(
+        self,
+    ) -> None:
+        command = runtime_command(
+            Path("luau"),
+            Path("probes/runner.luau"),
+            "../cases/04_calls_multireturn",
+            "./04_calls_multireturn",
+        )
+
+        self.assertEqual(
+            command,
+            (
+                "luau",
+                "probes/runner.luau",
+                "-a",
+                "../cases/04_calls_multireturn",
+                "./04_calls_multireturn",
+            ),
+        )
+
+    def test_real_semantic_runner_preserves_nil_and_sorts_table_keys(
+        self,
+    ) -> None:
+        workspace = Path(__file__).resolve().parents[2]
+        runtime = workspace / ".tools" / "luau-windows" / "luau.exe"
+        if not runtime.exists():
+            self.skipTest("bundled Luau runtime is absent")
+
+        probe_root = workspace / "tests" / "luau_corpus" / "probes"
+        probe_root.mkdir(exist_ok=True)
+
+        with tempfile.TemporaryDirectory(dir=probe_root) as temporary:
+            modules = Path(temporary)
+            (modules / "subject.luau").write_text(
+                """\
+return function()
+    return "x", nil, { b = 2, a = 1 }
+end
+""",
+                encoding="utf-8",
+            )
+            (modules / "probe.luau").write_text(
+                """\
+return function(subject)
+    return subject()
+end
+""",
+                encoding="utf-8",
+            )
+            relative_root = f"./{modules.name}"
+            command = runtime_command(
+                runtime,
+                probe_root / "runner.luau",
+                f"{relative_root}/subject",
+                f"{relative_root}/probe",
+            )
+
+            outputs = [
+                subprocess.run(
+                    command,
+                    cwd=workspace,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+
+        for completed in outputs:
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout.strip(),
+                "SEMANTIC_RESULT p3[s1:x;n;t2{s1:a;d1;s1:b;d2;}]",
+            )
+
+    def test_trusted_probes_produce_literal_source_results(self) -> None:
+        workspace = Path(__file__).resolve().parents[2]
+        runtime = workspace / ".tools" / "luau-windows" / "luau.exe"
+        if not runtime.exists():
+            self.skipTest("bundled Luau runtime is absent")
+
+        runner = workspace / "tests" / "luau_corpus" / "probes" / "runner.luau"
+        expected = {
+            "04_calls_multireturn": "p2[s5:q=5:4;d12;]",
+            "05_varargs": (
+                "p11[s1:p;d4;d1;d2;d3;"
+                "t3{d1;d2;d2;d3;d3;d4;}"
+                "d4;d1;d2;d3;t3{d1;d2;d2;d3;d3;d4;}]"
+            ),
+            "13_repeat_until": "p2[d10;d6;]",
+            "15_generic_for": (
+                "p1[t8{d1;d4;d2;d8;d3;d20;d4;d12;"
+                "d5;d6;d6;d2;d7;d0;s4:name;s4:kept;}]"
+            ),
+            "20_pcall_style_flow": (
+                "p3[p2[d7;d8;]p2[d9;s9:recovered;]"
+                "p2[n;s13:still missing;]]"
+            ),
+            "21_state_machine": "p3[s4:done;d1;d3;]",
+        }
+
+        for case_name, normalized in expected.items():
+            with self.subTest(case=case_name):
+                command = runtime_command(
+                    runtime,
+                    runner,
+                    f"../cases/{case_name}",
+                    f"./{case_name}",
+                )
+                completed = subprocess.run(
+                    command,
+                    cwd=workspace,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout.strip(),
+                    f"SEMANTIC_RESULT {normalized}",
+                )
+
     def test_all_profile_selection_includes_compatibility_versions(self) -> None:
         self.assertEqual(
             select_profiles("all"),
