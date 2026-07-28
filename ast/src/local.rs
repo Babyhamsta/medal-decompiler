@@ -13,6 +13,28 @@ use triomphe::Arc;
 #[derive(Debug, Default, From, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct Local(pub Option<String>);
 
+pub fn is_valid_identifier(name: &[u8]) -> bool {
+    if name.is_empty()
+        || !name.iter().enumerate().all(|(index, character)| {
+            (index != 0 && character.is_ascii_digit())
+                || character.is_ascii_alphabetic()
+                || *character == b'_'
+        })
+    {
+        return false;
+    }
+
+    const RESERVED_KEYWORDS: &[&str] = &[
+        "and", "break", "class", "continue", "do", "else", "elseif", "end", "export", "false",
+        "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+        "then", "true", "type", "until", "while",
+    ];
+
+    std::str::from_utf8(name)
+        .ok()
+        .is_some_and(|name| !RESERVED_KEYWORDS.contains(&name))
+}
+
 impl Local {
     pub fn new(name: Option<String>) -> Self {
         Self(name)

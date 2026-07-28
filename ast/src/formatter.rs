@@ -539,25 +539,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
     pub(crate) fn is_valid_name(name: &[u8]) -> bool {
-        if !(name
-            .iter()
-            .enumerate()
-            .all(|(i, &c)| (i != 0 && c.is_ascii_digit()) || c.is_ascii_alphabetic() || c == b'_'))
-        {
-            return false;
-        }
-        // TODO: Consider adding "goto" to reserved keywords
-        const RESERVED_KEYWORDS: &[&str] = &[
-            "and", "break", "class", "do", "else", "elseif", "end", "false", "for", "function",
-            "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
-            "while",
-        ];
-
-        let name_str = std::str::from_utf8(name).unwrap_or("");
-        if RESERVED_KEYWORDS.contains(&name_str) {
-            return false;
-        }
-        return true;
+        crate::is_valid_identifier(name)
     }
 
     // TODO: PERF: Cow like from_utf8_lossy

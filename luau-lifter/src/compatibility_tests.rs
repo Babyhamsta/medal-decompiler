@@ -65,16 +65,25 @@ fn version_source(case: &str) -> PathBuf {
         .join(format!("{case}.luau"))
 }
 
-fn compile(mode: &str, profile: &VersionProfile, source: &Path) -> std::process::Output {
+fn compile_with_debug(
+    mode: &str,
+    profile: &VersionProfile,
+    source: &Path,
+    debug_level: u8,
+) -> std::process::Output {
     Command::new(compiler())
         .current_dir(workspace())
         .arg(format!("--{mode}"))
         .arg("-O1")
-        .arg("-g1")
+        .arg(format!("-g{debug_level}"))
         .arg(format!("--fflags={}", profile.flags))
         .arg(source)
         .output()
         .unwrap()
+}
+
+fn compile(mode: &str, profile: &VersionProfile, source: &Path) -> std::process::Output {
+    compile_with_debug(mode, profile, source, 1)
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -185,6 +194,70 @@ fn product_controller_recovers_methods_and_keeps_callback_assignment() {
         "{}",
         String::from_utf8_lossy(&recompiled.stderr)
     );
+
+    let stripped = compile_with_debug("binary", profile, &source("25_product_controller"), 0);
+    assert!(stripped.status.success());
+    let stripped_decompiled = crate::try_decompile_bytecode(&stripped.stdout, 1).unwrap();
+    assert!(
+        !stripped_decompiled.contains("local callbacks = {}"),
+        "{stripped_decompiled}"
+    );
+    assert!(
+        !stripped_decompiled.contains("callbacks.__index = callbacks"),
+        "{stripped_decompiled}"
+    );
+
+    let stripped_output = workspace().join("target/compatibility-tests/product-controller-g0.luau");
+    fs::write(&stripped_output, stripped_decompiled).unwrap();
+    let stripped_recompiled = compile_with_debug("null", profile, &stripped_output, 0);
+    assert!(
+        stripped_recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stripped_recompiled.stderr)
+    );
+}
+
+#[test]
+fn debug_level_two_names_survive_lifting_and_ssa() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let profile = &PROFILES[3];
+    let compiled = compile_with_debug("binary", profile, &source("25_product_controller"), 2);
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+
+    assert!(
+        decompiled.contains("local function mergeOptions(overrides)"),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled.contains("for key, value in pairs(overrides) do"),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled.contains("function Controller:use(callback)"),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled.contains("function Controller:dispatch(action, payload)"),
+        "{decompiled}"
+    );
+    assert!(decompiled.contains("self.middleware"), "{decompiled}");
+    assert!(!decompiled.contains("self2"), "{decompiled}");
+    assert!(!decompiled.contains("_u_"), "{decompiled}");
+
+    let output = workspace().join("target/compatibility-tests/product-controller-g2.luau");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, decompiled).unwrap();
+    let recompiled = compile_with_debug("null", profile, &output, 2);
+    assert!(
+        recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recompiled.stderr)
+    );
 }
 
 #[test]
@@ -198,6 +271,19 @@ fn adversarial_dataflow_preserves_capture_and_multireturn_boundaries() {
     let compiled = compile("binary", profile, &source("26_adversarial_dataflow"));
     assert!(compiled.status.success());
     let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+    assert!(
+        decompiled.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("local callback = ") && line.contains(" or ")
+        }) && decompiled.contains("return callback(...)"),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.trim_start().starts_with("for key, value in pairs(")),
+        "{decompiled}"
+    );
     let lines = decompiled.lines().map(str::trim).collect::<Vec<_>>();
 
     let seeded = lines
