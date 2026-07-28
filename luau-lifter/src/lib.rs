@@ -1,4 +1,5 @@
 mod deserializer;
+mod error;
 mod instruction;
 mod lifter;
 mod op_code;
@@ -21,25 +22,17 @@ use cfg::{
 };
 use indexmap::IndexMap;
 
+use error::catch_phase;
+pub use error::{DecompileError, DecompilePhase};
 use lifter::Lifter;
 
 //use cfg_ir::{dot, function::Function, ssa};
 use clap::Parser;
 use parking_lot::Mutex;
 use petgraph::algo::dominators::simple_fast;
-use rayon::prelude::*;
 
-use anyhow::anyhow;
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
-use walkdir::WalkDir;
-
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-    time::Instant,
-};
 
 use deserializer::bytecode::Bytecode;
 
@@ -64,53 +57,50 @@ struct Args {
     verbose: bool,
 }
 
-pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
-    match try_decompile_bytecode(bytecode, encode_key) {
-        Ok(output) => output,
-        Err(error) => error
-            .lines()
-            .map(|line| format!("-- decompiler error: {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String, DecompileError> {
+    try_decompile_bytecode(bytecode, encode_key)
 }
 
-pub fn try_decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+pub fn try_decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String, DecompileError> {
+    catch_phase(DecompilePhase::Unknown, None, None, || {
         try_decompile_bytecode_inner(bytecode, encode_key)
-    }))
-    .map_err(panic_message)
-    .and_then(|result| result)
+    })?
 }
 
-fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
-    let parsed = deserializer::deserialize(bytecode, encode_key)?;
+fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<String, DecompileError> {
+    let parsed = deserializer::deserialize(bytecode, encode_key).map_err(|detail| {
+        DecompileError::new(
+            DecompilePhase::Deserialize,
+            None,
+            None,
+            "valid Luau bytecode",
+            detail,
+        )
+    })?;
     let Bytecode::Chunk(chunk) = parsed else {
         let Bytecode::Error(message) = parsed else {
             unreachable!()
         };
-        return Err(message);
+        return Err(DecompileError::new(
+            DecompilePhase::Deserialize,
+            None,
+            None,
+            "valid Luau bytecode",
+            message,
+        ));
     };
 
     decompile_chunk(chunk)
 }
 
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else {
-        "decompiler panicked with an unknown error".to_owned()
-    }
-}
-
-fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, String> {
+fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, DecompileError> {
     let mut lifted = Vec::new();
     let mut stack = vec![(Arc::<Mutex<ast::Function>>::default(), chunk.main)];
     while let Some((ast_func, func_id)) = stack.pop() {
         let (function, upvalues, child_functions) =
-            Lifter::lift(&chunk.functions, &chunk.string_table, func_id);
+            catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
+                Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
+            })?;
         lifted.push((ast_func, function, upvalues));
         stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
     }
@@ -119,67 +109,31 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, String> 
     let mut upvalues = lifted
         .into_iter()
         .map(|(ast_function, function, upvalues_in)| {
-            use std::{backtrace::Backtrace, cell::RefCell, fmt::Write, panic};
-
-            thread_local! {
-                static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
-            }
-
-            let function_id = function.id;
-            let mut args =
-                std::panic::AssertUnwindSafe(Some((ast_function.clone(), function, upvalues_in)));
-
-            let prev_hook = panic::take_hook();
-            panic::set_hook(Box::new(|_| {
-                let trace = Backtrace::capture();
-                BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
-            }));
-            let result = panic::catch_unwind(move || {
-                let (ast_function, function, upvalues_in) = args.take().unwrap();
-                decompile_function(ast_function, function, upvalues_in)
-            });
-            panic::set_hook(prev_hook);
-
-            match result {
-                Ok(r) => r,
-                Err(e) => {
-                    let panic_information = match e.downcast::<String>() {
-                        Ok(v) => *v,
-                        Err(e) => match e.downcast::<&str>() {
-                            Ok(v) => v.to_string(),
-                            _ => "Unknown Source of Error".to_owned(),
-                        },
-                    };
-
-                    let mut message = String::new();
-                    writeln!(message, "failed to decompile").unwrap();
-                    // writeln!(message, "function {} panicked at '{}'", function_id, panic_information).unwrap();
-                    // if let Some(backtrace) = BACKTRACE.with(|b| b.borrow_mut().take()) {
-                    //     write!(message, "stack backtrace:\n{}", backtrace).unwrap();
-                    // }
-
-                    ast_function.lock().body.extend(
-                        message
-                            .trim_end()
-                            .split('\n')
-                            .map(|s| ast::Comment::new(s.to_string()).into()),
-                    );
-                    (ByAddress(ast_function), Vec::new())
-                }
-            }
+            decompile_function(ast_function, function, upvalues_in)
         })
-        .collect::<FxHashMap<_, _>>();
+        .collect::<Result<FxHashMap<_, _>, DecompileError>>()?;
 
     let main = ByAddress(main);
     upvalues.remove(&main);
-    let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
-    link_upvalues(&mut body, &mut upvalues);
+    let mut body = catch_phase(DecompilePhase::Link, None, None, || {
+        let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
+        link_upvalues(&mut body, &mut upvalues);
+        body
+    })?;
     if block_contains_unsupported_jump(&mut body) {
-        return Err("control-flow structuring left unsupported goto or label nodes".to_owned());
+        return Err(DecompileError::new(
+            DecompilePhase::Validate,
+            None,
+            None,
+            "structured control flow",
+            "control-flow structuring left unsupported goto or label nodes",
+        ));
     }
-    ast::recover_function_syntax(&mut body);
-    name_locals(&mut body, false);
-    Ok(body.to_string())
+    catch_phase(DecompilePhase::Format, None, None, || {
+        ast::recover_function_syntax(&mut body);
+        name_locals(&mut body, false);
+        body.to_string()
+    })
 }
 
 fn block_contains_unsupported_jump(block: &mut ast::Block) -> bool {
@@ -241,28 +195,79 @@ mod output_tests {
     }
 }
 
+#[cfg(test)]
+mod structured_error_tests {
+    use super::{DecompileError, DecompilePhase, catch_phase, decompile_bytecode};
+
+    #[test]
+    fn structured_error_display_includes_available_context() {
+        let error = DecompileError::new(
+            DecompilePhase::Declaration,
+            Some(7),
+            Some(12),
+            "stable binding identity",
+            "local escaped as a global",
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "[declaration] function=7 instruction=12 \
+             invariant=stable binding identity: local escaped as a global"
+        );
+    }
+
+    #[test]
+    fn phase_boundary_converts_panic_without_emitting_source() {
+        let error = catch_phase(DecompilePhase::Ssa, Some(7), Some(12), || {
+            panic!("bad merge")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.phase, DecompilePhase::Ssa);
+        assert_eq!(error.function_id, Some(7));
+        assert_eq!(error.instruction, Some(12));
+        assert_eq!(error.invariant, "panic-free decompilation");
+        assert_eq!(error.detail, "bad merge");
+    }
+
+    #[test]
+    fn invalid_bytecode_returns_deserialize_error() {
+        let error = decompile_bytecode(&[0xff], 1).unwrap_err();
+
+        assert_eq!(error.phase, DecompilePhase::Deserialize);
+        assert_eq!(error.invariant, "valid Luau bytecode");
+        assert!(!error.to_string().starts_with("--"));
+    }
+}
+
 fn decompile_function(
     ast_function: Arc<Mutex<ast::Function>>,
     mut function: Function,
     upvalues_in: Vec<ast::RcLocal>,
-) -> (ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>) {
-    let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
-        cfg::ssa::construct(&mut function, &upvalues_in);
-    let upvalue_to_group = upvalue_in_groups
-        .into_iter()
-        .chain(
-            upvalue_passed_groups
+) -> Result<(ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>), DecompileError> {
+    let function_id = function.id;
+    let (local_count, upvalue_to_group, local_to_group) =
+        catch_phase(DecompilePhase::Ssa, Some(function_id), None, || {
+            let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
+                cfg::ssa::construct(&mut function, &upvalues_in);
+            let upvalue_to_group = upvalue_in_groups
                 .into_iter()
-                .map(|m| (ast::RcLocal::default(), m)),
-        )
-        .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
-        .collect::<IndexMap<_, _>>();
-    // TODO: do we even need this?
-    let local_to_group = local_groups
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
-        .collect::<FxHashMap<_, _>>();
+                .chain(
+                    upvalue_passed_groups
+                        .into_iter()
+                        .map(|m| (ast::RcLocal::default(), m)),
+                )
+                .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
+                .collect::<IndexMap<_, _>>();
+            // TODO: do we even need this?
+            let local_to_group = local_groups
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
+                .collect::<FxHashMap<_, _>>();
+            (local_count, upvalue_to_group, local_to_group)
+        })?;
+
     // TODO: REFACTOR: some way to write a macro that states
     // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
     // structure_for_loops and remove_unnecessary_params must run again.
@@ -270,61 +275,81 @@ fn decompile_function(
     // must be recalculated.
     // etc.
     // the macro could also maybe generate an optimal ordering?
-    let mut changed = true;
-    while changed {
-        changed = false;
+    catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
+        let mut changed = true;
+        while changed {
+            changed = false;
 
-        let dominators = simple_fast(function.graph(), function.entry().unwrap());
-        changed |= structure_jumps(&mut function, &dominators);
+            let dominators = simple_fast(function.graph(), function.entry().unwrap());
+            changed |= structure_jumps(&mut function, &dominators);
 
-        ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
+            ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-        if structure_conditionals(&mut function)
-        // || {
-        //     let post_dominators = post_dominators(function.graph_mut());
-        //     structure_for_loops(&mut function, &dominators, &post_dominators)
-        // }
-        // we can't structure method calls like this because of __namecall
-        // || structure_method_calls(&mut function)
-        {
-            changed = true;
+            if structure_conditionals(&mut function)
+            // || {
+            //     let post_dominators = post_dominators(function.graph_mut());
+            //     structure_for_loops(&mut function, &dominators, &post_dominators)
+            // }
+            // we can't structure method calls like this because of __namecall
+            // || structure_method_calls(&mut function)
+            {
+                changed = true;
+            }
+            let mut local_map = FxHashMap::default();
+            // TODO: loop until returns false?
+            if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
+                changed = true;
+            }
+            ssa::construct::apply_local_map(&mut function, local_map);
         }
-        let mut local_map = FxHashMap::default();
-        // TODO: loop until returns false?
-        if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
-            changed = true;
-        }
-        ssa::construct::apply_local_map(&mut function, local_map);
-    }
-    // cfg::dot::render_to(&function, &mut std::io::stdout()).unwrap();
-    ssa::Destructor::new(
-        &mut function,
-        upvalue_to_group,
-        upvalues_in.iter().cloned().collect(),
-        local_count,
-    )
-    .destruct();
+    })?;
 
-    let params = std::mem::take(&mut function.parameters);
-    let is_variadic = function.is_variadic;
-    let mut block: ast::Block = restructure::lift(function).into();
-    ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
-    ast::recover_expressions_with_protected(&mut block, &upvalues_in);
-    ast::cleanup_control_flow(&mut block);
+    catch_phase(
+        DecompilePhase::SsaDestruction,
+        Some(function_id),
+        None,
+        || {
+            ssa::Destructor::new(
+                &mut function,
+                upvalue_to_group,
+                upvalues_in.iter().cloned().collect(),
+                local_count,
+            )
+            .destruct();
+        },
+    )?;
+
+    let (params, is_variadic, mut block) =
+        catch_phase(DecompilePhase::Restructure, Some(function_id), None, || {
+            let params = std::mem::take(&mut function.parameters);
+            let is_variadic = function.is_variadic;
+            let block: ast::Block = restructure::lift(function).into();
+            (params, is_variadic, block)
+        })?;
+
+    catch_phase(DecompilePhase::AstRecovery, Some(function_id), None, || {
+        ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
+        ast::recover_expressions_with_protected(&mut block, &upvalues_in);
+        ast::cleanup_control_flow(&mut block);
+    })?;
+
     let block = Arc::new(Mutex::new(block));
-    LocalDeclarer::default().declare_locals(
-        // TODO: why does block.clone() not work?
-        Arc::clone(&block),
-        &upvalues_in.iter().chain(params.iter()).cloned().collect(),
-    );
+    catch_phase(DecompilePhase::Declaration, Some(function_id), None, || {
+        LocalDeclarer::default().declare_locals(
+            // TODO: why does block.clone() not work?
+            Arc::clone(&block),
+            &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+        );
+    })?;
 
-    {
+    catch_phase(DecompilePhase::AstRecovery, Some(function_id), None, || {
         let mut ast_function = ast_function.lock();
         ast_function.body = Arc::try_unwrap(block).unwrap().into_inner();
         ast_function.parameters = params;
         ast_function.is_variadic = is_variadic;
-    }
-    (ByAddress(ast_function), upvalues_in)
+    })?;
+
+    Ok((ByAddress(ast_function), upvalues_in))
 }
 
 fn link_upvalues(

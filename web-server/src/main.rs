@@ -20,12 +20,15 @@ enum Error {
     Io(#[from] io::Error),
     #[error("invalid base64 data recieved: {0}")]
     Base64(#[from] base64::DecodeError),
+    #[error("decompilation failed: {0}")]
+    Decompile(String),
 }
 impl Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Base64(_) => StatusCode::BAD_REQUEST,
+            Error::Decompile(_) => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 }
@@ -63,7 +66,8 @@ async fn main() -> Result<(), io::Error> {
 async fn decompile(body: Bytes) -> Result<String, Error> {
     let mut bytecode = Vec::new();
     BASE64_STANDARD.decode_vec(body, &mut bytecode)?;
-    let decompiled = luau_lifter::decompile_bytecode(&bytecode, 203);
+    let decompiled = luau_lifter::decompile_bytecode(&bytecode, 203)
+        .map_err(|error| Error::Decompile(error.to_string()))?;
     info!("Successfully decompiled bytecode.");
     Ok(decompiled)
 }
