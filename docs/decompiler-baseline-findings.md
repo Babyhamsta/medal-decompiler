@@ -310,3 +310,80 @@ v19 += 1
 The local before/after reports are generated, ignored artifacts at
 `tests/luau_corpus/results/expression-before/` and
 `tests/luau_corpus/results/expression-after/`.
+
+## Function and Table Recovery Verification (2026-07-27)
+
+The corpus now includes two advanced truth sources: a product-style controller
+and an adversarial dataflow module. Together they cover static constructors,
+receiver methods, callback fields, recursive and forward closures, dynamic
+keys, snapshots, incremental tables, and open multi-return boundaries. This
+expands the comparable matrix from 240 to 260 static rows.
+
+Recovery uses AST shape, closure debug metadata, receiver-use evidence,
+read/capture identity, SSA capture groups, effect analysis, and multi-return
+selection. It does not inspect fixture names, source constants, URLs, register
+numbers, or script-specific instruction sequences.
+
+The pass now:
+
+- emits scoped `local function` declarations for recursive locals, including
+  unnamed self-capturing closures;
+- emits dotted named functions when debug metadata supports them;
+- emits colon methods only for a matching dotted closure with strong first-
+  parameter receiver evidence, while retaining static constructors as dotted
+  functions;
+- keeps anonymous callback fields as `field = function(...)` assignments;
+- folds adjacent incremental table fields when the target cannot be observed
+  through an SSA capture group;
+- preserves separate writes for target-capturing closures, effectful writes to
+  capture-observable tables, open call/vararg tails, mixed positional key
+  collisions, and fractional numeric keys.
+
+### Static verification
+
+- `cargo +nightly test --workspace --offline`: 95 passed, 0 failed.
+- `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
+- All profiles and compatibility versions: 260/260; 0 source compile failures,
+  0 decompile failures, 0 recompile failures, and 0 generated gotos.
+- Three independent reviews passed after every Critical and Important finding
+  was repaired.
+- The corpus tools compiled, decompiled, and recompiled files only. They did
+  not execute authored or generated Luau.
+
+### Comparable corpus metrics
+
+Both snapshots contain the same 26 sources and 10 profiles.
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Generated nonblank lines | 6,871 | 6,851 | -20 |
+| Generated locals | 1,179 | 1,189 | +10 |
+| Trivial aliases | 72 | 72 | unchanged |
+| Named function declarations | 262 | 206 | -56 |
+| Receiver method declarations | 0 | 48 | +48 |
+| Anonymous function assignments | 98 | 154 | +56 |
+| Aggregate tab indentation | 11,480 | 11,360 | -120 |
+| Generated gotos | 0 | 0 | unchanged |
+
+The local increase is intentional: one preserved table local per profile keeps
+an open call tail from changing result width, while one preserved registry
+local per profile keeps a callback bound to the correct lexical table. The 56
+anonymous assignments replace false named-function declarations rather than
+adding new closures.
+
+The adversarial source exposed two transformations that ordinary
+compile/recompile acceptance missed. These now remain separate:
+
+```luau
+local values = { source.seed() }
+values.status = "ready"
+
+local registry = {}
+registry.current = function()
+	return registry
+end
+```
+
+The local before/after reports are generated, ignored artifacts at
+`tests/luau_corpus/results/function-table-before/` and
+`tests/luau_corpus/results/function-table-after/`.

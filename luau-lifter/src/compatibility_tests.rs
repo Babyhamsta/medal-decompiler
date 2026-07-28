@@ -138,6 +138,142 @@ fn wonky_v12_output_has_no_trivial_local_aliases() {
 }
 
 #[test]
+fn product_controller_recovers_methods_and_keeps_callback_assignment() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let profile = &PROFILES[3];
+    let compiled = compile("binary", profile, &source("25_product_controller"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.starts_with("function ") && line.contains(":dispatch(")),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.starts_with("function ") && line.contains(":use(")),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.starts_with("function ") && line.contains(".new(")),
+        "{decompiled}"
+    );
+    assert!(!decompiled.contains(":new("), "{decompiled}");
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.trim().contains(".handlers.health = function(")),
+        "{decompiled}"
+    );
+    assert!(!decompiled.contains("handlers:health("), "{decompiled}");
+
+    let output = workspace().join("target/compatibility-tests/product-controller.luau");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, decompiled).unwrap();
+    let recompiled = compile("null", profile, &output);
+    assert!(
+        recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recompiled.stderr)
+    );
+}
+
+#[test]
+fn adversarial_dataflow_preserves_capture_and_multireturn_boundaries() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let profile = &PROFILES[3];
+    let compiled = compile("binary", profile, &source("26_adversarial_dataflow"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+    let lines = decompiled.lines().map(str::trim).collect::<Vec<_>>();
+
+    let seeded = lines
+        .windows(2)
+        .find(|window| {
+            window[0].starts_with("local ")
+                && window[0].contains(" = { ")
+                && window[0].contains(".seed()")
+                && window[0].ends_with(" }")
+                && window[1].contains(".status = ")
+        })
+        .expect("open call-tail table must stay separate from its later field");
+    let seeded_name = seeded[0]
+        .strip_prefix("local ")
+        .unwrap()
+        .split_once(" = ")
+        .unwrap()
+        .0;
+    assert!(seeded[1].starts_with(&format!("{seeded_name}.status = ")));
+
+    let registry = lines
+        .windows(2)
+        .find(|window| {
+            let Some(declaration) = window[0].strip_prefix("local ") else {
+                return false;
+            };
+            let Some((name, value)) = declaration.split_once(" = ") else {
+                return false;
+            };
+            value == "{}" && window[1] == format!("{name}.current = function()")
+        })
+        .expect("self-capturing callback must stay outside its table initializer");
+    let registry_name = registry[0]
+        .strip_prefix("local ")
+        .unwrap()
+        .split_once(" = ")
+        .unwrap()
+        .0;
+    assert!(
+        decompiled.contains(&format!("return {registry_name}")),
+        "{decompiled}"
+    );
+
+    let forward_name = lines
+        .iter()
+        .find_map(|line| {
+            let declaration = line.strip_prefix("local ")?;
+            let (name, value) = declaration.split_once(" = ")?;
+            (value == "nil").then_some(name)
+        })
+        .expect("recursive forward declaration must remain");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("{forward_name} = function("))),
+        "{decompiled}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(".callbacks[") && line.contains("] = function(")),
+        "{decompiled}"
+    );
+
+    let output = workspace().join("target/compatibility-tests/adversarial-dataflow.luau");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, decompiled).unwrap();
+    let recompiled = compile("null", profile, &output);
+    assert!(
+        recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recompiled.stderr)
+    );
+}
+
+#[test]
 fn bundled_compiler_versions_decompile_and_recompile() {
     if !compiler().is_file() {
         eprintln!("skipping: bundled Luau compiler is absent");

@@ -178,6 +178,7 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, String> 
         return Err("control-flow structuring left unsupported goto or label nodes".to_owned());
     }
     name_locals(&mut body, true);
+    ast::recover_function_syntax(&mut body);
     Ok(body.to_string())
 }
 
