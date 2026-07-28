@@ -354,7 +354,7 @@ fn decompile_function(
         catch_phase(DecompilePhase::Restructure, Some(function_id), None, || {
             let params = std::mem::take(&mut function.parameters);
             let is_variadic = function.is_variadic;
-            let block: ast::Block = restructure::lift(function).into();
+            let block: ast::Block = restructure::lift(function, &recovery_facts).into();
             (params, is_variadic, block)
         })?;
 

@@ -112,6 +112,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 ssa::construct::apply_local_map(&mut function, local_map);
             }
+            let recovery_facts = cfg::recovery::RecoveryFacts::derive(&function)
+                .expect("derive recovery facts before CFG destruction");
             ssa::Destructor::new(
                 &mut function,
                 upvalue_to_group,
@@ -122,7 +124,7 @@ fn main() -> anyhow::Result<()> {
 
             let params = std::mem::take(&mut function.parameters);
             let is_variadic = function.is_variadic;
-            let block = Arc::new(restructure::lift(function).into());
+            let block = Arc::new(restructure::lift(function, &recovery_facts).into());
             LocalDeclarer::default().declare_locals(
                 // TODO: why does block.clone() not work?
                 Arc::clone(&block),

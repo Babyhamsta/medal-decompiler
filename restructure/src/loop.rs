@@ -1,5 +1,5 @@
 use array_tool::vec::Intersect;
-use ast::{Reduce, SideEffects};
+use ast::{LocalRw, Reduce, SideEffects};
 use cfg::block::{BlockEdge, BranchType};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
@@ -151,6 +151,10 @@ impl GraphStructurer {
                 return true;
             }
             return false;
+        }
+
+        if self.try_collapse_repeat_latch(header) {
+            return true;
         }
 
         let successors = self.function.successor_blocks(header).collect::<Vec<_>>();
@@ -538,5 +542,108 @@ impl GraphStructurer {
         } else {
             false
         }
+    }
+
+    fn try_collapse_repeat_latch(&mut self, header: NodeIndex) -> bool {
+        if !self.recovery_region_headers.contains(&header) {
+            return false;
+        }
+        let Some((then_edge, else_edge)) = self.function.conditional_edges(header) else {
+            return false;
+        };
+        let (latch, exit, mut condition) = if self
+            .function
+            .successor_blocks(then_edge.target())
+            .exactly_one()
+            .is_ok_and(|successor| successor == header)
+        {
+            let condition = self
+                .function
+                .block(header)
+                .and_then(|block| block.last())
+                .and_then(ast::Statement::as_if)
+                .map(|value| {
+                    ast::Unary::new(value.condition.clone(), ast::UnaryOperation::Not)
+                        .reduce_condition()
+                });
+            (then_edge.target(), else_edge.target(), condition)
+        } else if self
+            .function
+            .successor_blocks(else_edge.target())
+            .exactly_one()
+            .is_ok_and(|successor| successor == header)
+        {
+            let condition = self
+                .function
+                .block(header)
+                .and_then(|block| block.last())
+                .and_then(ast::Statement::as_if)
+                .map(|value| value.condition.clone());
+            (else_edge.target(), then_edge.target(), condition)
+        } else {
+            return false;
+        };
+        let Some(mut condition) = condition.take() else {
+            return false;
+        };
+        if self.function.predecessor_blocks(latch).count() != 1
+            || self.function.predecessor_blocks(exit).count() != 1
+        {
+            return false;
+        }
+
+        let Some(latch_assign) = self
+            .function
+            .block(latch)
+            .filter(|block| block.len() == 1)
+            .and_then(|block| block.first())
+            .and_then(ast::Statement::as_assign)
+            .filter(|assign| {
+                !assign.prefix
+                    && !assign.parallel
+                    && assign.left.len() == 1
+                    && assign.right.len() == 1
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        let (Some(carried), Some(next_value)) = (
+            latch_assign.left[0].as_local().cloned(),
+            latch_assign.right[0].as_local().cloned(),
+        ) else {
+            return false;
+        };
+        let condition_reads = condition.values_read();
+        if !condition_reads.contains(&&carried) || !condition_reads.contains(&&next_value) {
+            return false;
+        }
+
+        let snapshot = self.function.new_synthetic_local(&carried);
+        condition.replace_values_read(&carried, &snapshot);
+        let mut body = std::mem::take(self.function.block_mut(header).unwrap());
+        body.pop();
+        body.insert(
+            0,
+            ast::Assign::new(
+                vec![ast::LValue::Local(snapshot)],
+                vec![ast::RValue::Local(carried.clone())],
+            )
+            .into(),
+        );
+        body.push(latch_assign.into());
+
+        self.function.remove_block(latch);
+        for statement in self.function.block_mut(exit).unwrap().iter_mut() {
+            statement.replace_values_read(&next_value, &carried);
+        }
+        *self.function.block_mut(header).unwrap() =
+            vec![ast::Repeat::new(condition, body).into()].into();
+        self.function.set_edges(
+            header,
+            vec![(exit, BlockEdge::new(BranchType::Unconditional))],
+        );
+        self.match_jump(header, Some(exit));
+        true
     }
 }
