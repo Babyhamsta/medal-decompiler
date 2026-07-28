@@ -138,6 +138,49 @@ fn wonky_v12_output_has_no_trivial_local_aliases() {
 }
 
 #[test]
+fn product_controller_recovers_methods_and_keeps_callback_assignment() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let profile = &PROFILES[3];
+    let compiled = compile("binary", profile, &source("25_product_controller"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.starts_with("function ") && line.contains(":dispatch(")),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.starts_with("function ") && line.contains(":use(")),
+        "{decompiled}"
+    );
+    assert!(
+        decompiled
+            .lines()
+            .any(|line| line.trim().contains(".handlers.health = function(")),
+        "{decompiled}"
+    );
+    assert!(!decompiled.contains("handlers:health("), "{decompiled}");
+
+    let output = workspace().join("target/compatibility-tests/product-controller.luau");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, decompiled).unwrap();
+    let recompiled = compile("null", profile, &output);
+    assert!(
+        recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recompiled.stderr)
+    );
+}
+
+#[test]
 fn bundled_compiler_versions_decompile_and_recompile() {
     if !compiler().is_file() {
         eprintln!("skipping: bundled Luau compiler is absent");

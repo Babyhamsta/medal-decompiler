@@ -21,6 +21,7 @@ pub struct Function {
     pub name: Option<String>,
     pub parameters: Vec<RcLocal>,
     pub is_variadic: bool,
+    pub is_method: bool,
     pub body: Block,
 }
 

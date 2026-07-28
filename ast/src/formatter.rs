@@ -260,7 +260,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 self.indent()?;
             }
             let is_last = index + 1 == table.0.len();
-            if is_last && key.is_none() {
+            if is_last && (key.is_none() || sequential_keys) {
                 let wrap = matches!(value, RValue::Select(_));
                 if wrap {
                     write!(self.output, "(")?;
@@ -330,7 +330,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         parentheses(self, binary.right_group(), &binary.right)
     }
 
-    fn format_closure_parameters(&mut self, closure: &Closure) -> fmt::Result {
+    fn format_closure_parameters_from(
+        &mut self,
+        closure: &Closure,
+        skip_parameters: usize,
+    ) -> fmt::Result {
         let function = closure.function.lock();
         write!(
             self.output,
@@ -339,13 +343,18 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 function
                     .parameters
                     .iter()
+                    .skip(skip_parameters)
                     .map(|x| x.to_string())
                     .chain(std::iter::once("...".into()))
                     .join(", ")
             } else {
-                function.parameters.iter().join(", ")
+                function.parameters.iter().skip(skip_parameters).join(", ")
             }
         )
+    }
+
+    fn format_closure_parameters(&mut self, closure: &Closure) -> fmt::Result {
+        self.format_closure_parameters_from(closure, 0)
     }
 
     fn format_closure_body(&mut self, closure: &Closure) -> fmt::Result {
@@ -399,6 +408,25 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn format_named_function(&mut self, name: &LValue, closure: &Closure) -> fmt::Result {
+        let is_method = closure.function.lock().is_method;
+        if is_method
+            && let LValue::Index(index) = name
+            && let RValue::Literal(Literal::String(method)) = index.right.as_ref()
+            && Self::is_valid_name(method)
+        {
+            write!(self.output, "function ")?;
+            self.format_rvalue(&index.left)?;
+            write!(
+                self.output,
+                ":{}(",
+                std::str::from_utf8(method).expect("valid method names are UTF-8")
+            )?;
+            self.format_closure_parameters_from(closure, 1)?;
+            write!(self.output, ")")?;
+            self.format_closure_body(closure)?;
+            return write!(self.output, "end");
+        }
+
         write!(self.output, "function {}(", name)?;
         self.format_closure_parameters(closure)?;
         write!(self.output, ")")?;
@@ -673,6 +701,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if assign.left.len() == 1
             && assign.right.len() == 1
             && let RValue::Closure(closure) = &assign.right[0]
+            && closure.function.lock().name.is_some()
         {
             let left = &assign.left[0];
             if assign.prefix || left.as_global().is_some() || {
@@ -1039,5 +1068,13 @@ mod tests {
             block.to_string(),
             "result = if condition then selected else fallback;\n({})()"
         );
+    }
+
+    #[test]
+    fn sequential_table_field_keeps_selected_final_call_closed() {
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let table = Table(vec![(Some(Literal::Number(1.0).into()), selected.into())]);
+
+        assert_eq!(table.to_string(), "{ (produce()) }");
     }
 }
