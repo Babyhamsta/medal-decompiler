@@ -34,15 +34,17 @@ fn has_open_table_tail(table: &ast::Table) -> bool {
     })
 }
 
-fn fold_table_fields(block: &mut ast::Block) -> usize {
+fn fold_table_fields(
+    block: &mut ast::Block,
+    effect_observable_locals: &FxHashSet<ast::RcLocal>,
+) -> usize {
     let mut folded = 0;
     let mut index = 0;
     while index < block.len() {
         let Some((table_index, object_local)) = block[index]
             .as_assign()
             .filter(|assign| {
-                !assign.prefix
-                    && !assign.parallel
+                !assign.parallel
                     && assign.left.len() == 1
                     && assign.right.len() == 1
                     && assign
@@ -84,8 +86,8 @@ fn fold_table_fields(block: &mut ast::Block) -> usize {
                 break;
             };
 
-            if key.has_side_effects()
-                || value.has_side_effects()
+            if (effect_observable_locals.contains(&object_local)
+                && (key.has_side_effects() || value.has_side_effects()))
                 || key.values_read().contains(&&object_local)
                 || value.values_read().contains(&&object_local)
             {
@@ -550,6 +552,24 @@ pub fn inline(
     local_to_group: &FxHashMap<ast::RcLocal, usize>,
     upvalue_to_group: &IndexMap<ast::RcLocal, ast::RcLocal>,
 ) {
+    let mut observable_groups = FxHashSet::default();
+    for local in upvalue_to_group.keys().chain(upvalue_to_group.values()) {
+        if let Some(group) = local_to_group.get(local) {
+            observable_groups.insert(*group);
+        }
+    }
+    let mut effect_observable_locals = upvalue_to_group
+        .keys()
+        .chain(upvalue_to_group.values())
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    effect_observable_locals.extend(
+        local_to_group
+            .iter()
+            .filter(|(_, group)| observable_groups.contains(group))
+            .map(|(local, _)| local.clone()),
+    );
+
     let mut local_usages = FxHashMap::default();
     for node in function.graph().node_indices() {
         for read in function.values_read(node) {
@@ -614,7 +634,7 @@ pub fn inline(
             block.retain(|s| s.as_empty().is_none());
 
             // `t = {} t.a = 1` -> `t = { a = 1 }`
-            changed |= fold_table_fields(block) != 0;
+            changed |= fold_table_fields(block, &effect_observable_locals) != 0;
 
             // if the first statement is a set_list, we cant inline it anyway
             for i in 1..block.len() {
@@ -671,6 +691,8 @@ mod tests {
         Table, Upvalue,
     };
 
+    use rustc_hash::FxHashSet;
+
     use super::fold_table_fields;
 
     fn local(name: &str) -> RcLocal {
@@ -705,7 +727,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(fold_table_fields(&mut block), 1);
+        assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 1);
         assert_eq!(block.len(), 1);
         assert_eq!(
             block[0].as_assign().unwrap().right[0]
@@ -729,7 +751,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(fold_table_fields(&mut block), 0);
+        assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 0);
         assert_eq!(block.len(), 2);
     }
 
@@ -750,7 +772,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(fold_table_fields(&mut block), 0);
+        assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 0);
         assert_eq!(block.len(), 2);
     }
 
@@ -758,6 +780,7 @@ mod tests {
     fn keeps_effectful_field_value_after_table_assignment() {
         let object = local("state");
         let observe = Call::new(RValue::from(Global::from("observe")), Vec::new());
+        let observable = FxHashSet::from_iter([object.clone()]);
         let mut block = Block(vec![
             Assign::new(vec![object.clone().into()], vec![Table::default().into()]).into(),
             field_assignment(
@@ -767,7 +790,27 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(fold_table_fields(&mut block), 0);
+        assert_eq!(fold_table_fields(&mut block, &observable), 0);
         assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn folds_effectful_field_value_into_fresh_local_table() {
+        let object = local("state");
+        let observe = Call::new(RValue::from(Global::from("observe")), Vec::new());
+        let mut declaration =
+            Assign::new(vec![object.clone().into()], vec![Table::default().into()]);
+        declaration.prefix = true;
+        let mut block = Block(vec![
+            declaration.into(),
+            field_assignment(
+                &object,
+                Literal::String(b"value".to_vec()).into(),
+                observe.into(),
+            ),
+        ]);
+
+        assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 1);
+        assert_eq!(block.len(), 1);
     }
 }
