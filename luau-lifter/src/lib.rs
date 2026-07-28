@@ -310,6 +310,7 @@ fn decompile_function(
     let mut block: ast::Block = restructure::lift(function).into();
     ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
     ast::recover_expressions_with_protected(&mut block, &upvalues_in);
+    ast::cleanup_control_flow(&mut block);
     let block = Arc::new(Mutex::new(block));
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?

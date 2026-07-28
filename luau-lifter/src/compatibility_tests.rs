@@ -274,6 +274,44 @@ fn adversarial_dataflow_preserves_capture_and_multireturn_boundaries() {
 }
 
 #[test]
+fn nested_early_exits_recovers_loop_guard_and_terminal_return() {
+    if !compiler().is_file() {
+        eprintln!("skipping: bundled Luau compiler is absent");
+        return;
+    }
+
+    let profile = &PROFILES[3];
+    let compiled = compile("binary", profile, &source("22_nested_early_exits"));
+    assert!(compiled.status.success());
+    let decompiled = crate::try_decompile_bytecode(&compiled.stdout, 1).unwrap();
+    let lines = decompiled.lines().map(str::trim).collect::<Vec<_>>();
+
+    assert!(
+        lines.windows(3).any(|window| {
+            window[0].starts_with("if ")
+                && window[0].contains(".disabled then")
+                && window[1] == "continue"
+                && window[2] == "end"
+        }),
+        "{decompiled}"
+    );
+    assert!(
+        !lines.iter().any(|line| *line == "else"),
+        "terminal else branch remained\n{decompiled}"
+    );
+
+    let output = workspace().join("target/compatibility-tests/nested-early-exits.luau");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, decompiled).unwrap();
+    let recompiled = compile("null", profile, &output);
+    assert!(
+        recompiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recompiled.stderr)
+    );
+}
+
+#[test]
 fn bundled_compiler_versions_decompile_and_recompile() {
     if !compiler().is_file() {
         eprintln!("skipping: bundled Luau compiler is absent");
