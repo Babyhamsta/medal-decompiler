@@ -230,3 +230,83 @@ tests/luau_corpus/results/final-fix/V12/24_wonky_integration.luau
 tests/luau_corpus/results/final-fix/V12/23_register_pressure_aliases.luau
 tests/luau_corpus/results/final-fix/O0_g1/24_wonky_integration.luau
 ```
+
+## Expression Recovery Verification (2026-07-27)
+
+Expression recovery runs after alias elimination and before local declaration
+placement. It uses AST identity, read/write sets, effect boundaries, and
+single-result `Select` nodes; it does not inspect script names, constants,
+URLs, or generated register numbers.
+
+The pass now:
+
+- emits first-class Luau conditional expressions, including `elseif` chains,
+  instead of encoding falsy branches with unsafe `and`/`or` expressions;
+- rebuilds exact adjacent `and`/`or` assignment chains;
+- inlines a single-use expression only before the first observable consumer
+  operation and without crossing calls, indexing, metamethod-capable
+  expressions, source writes, structured control flow, or reference captures;
+- retains parentheses around a final selected call result, such as
+  `return (produce())`, so one result cannot become an open multi-return;
+- formats exact local and stable indexed updates with Luau compound operators.
+
+A static compiler probe showed that stable local-backed
+`target[key] = target[key] + value` and `target[key] += value` both lower to
+`GETTABLE`, the arithmetic operation, and `SETTABLE`; only temporary register
+allocation differs.
+
+### Static verification
+
+- `cargo +nightly test --workspace --offline`: 78 passed, 0 failed.
+- `python -m unittest discover -s tests/python -v`: 10 passed, 0 failed.
+- V9-V12/current-profile compiler round trips: 240/240; 0 source compile
+  failures, 0 decompile failures, 0 recompile failures, and 0 generated gotos.
+- The corpus tools compiled, decompiled, and recompiled files only. They did
+  not execute authored or generated Luau.
+
+### Comparable corpus metrics
+
+Both snapshots contain the same 24 sources and 10 profiles. The corpus runner
+counts nonblank generated `.luau` lines. Conditional and compound counts use
+the canonical single-line syntax emitted by the formatter. Split short-circuit
+pairs are adjacent assignments followed by a matching `if local` or
+`if not local` block that reassigns the same local.
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Generated nonblank lines | 4,996 | 4,707 | -289 (-5.8%) |
+| Generated locals | 922 | 879 | -43 (-4.7%) |
+| Trivial aliases | 48 | 32 | -16 (-33.3%) |
+| Conditional expressions | 0 | 148 | +148 |
+| Compound assignments | 0 | 138 | +138 |
+| Split short-circuit assignment/`if` pairs | 8 | 0 | -8 (-100.0%) |
+| Generated gotos | 0 | 0 | unchanged |
+
+Representative changes include:
+
+```luau
+-- before
+local v10
+if p4 < 0 then
+	v10 = -p4
+else
+	v10 = p4
+end
+
+-- after
+local v10 = if p4 < 0 then -p4 else p4
+```
+
+```luau
+-- before
+p6.total = p6.total + (v8 or 0)
+v19 = v19 + 1
+
+-- after
+p6.total += v8 or 0
+v19 += 1
+```
+
+The local before/after reports are generated, ignored artifacts at
+`tests/luau_corpus/results/expression-before/` and
+`tests/luau_corpus/results/expression-after/`.

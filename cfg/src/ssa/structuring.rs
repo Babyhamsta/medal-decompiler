@@ -344,27 +344,27 @@ pub fn structure_conditionals(function: &mut Function) -> bool {
     did_structure
 }
 
-// TODO: REFACTOR: move to ast
-// None = unknown
-fn is_truthy(rvalue: ast::RValue) -> Option<bool> {
-    match rvalue.reduce_condition() {
-        // __len has to return number, but __unm can return any value
-        ast::RValue::Unary(ast::Unary {
-            operation: ast::UnaryOperation::Length,
-            ..
-        }) => Some(true),
-        ast::RValue::Literal(
-            ast::Literal::Boolean(true)
-            | ast::Literal::Number(_)
-            | ast::Literal::Integer(_)
-            | ast::Literal::String(_)
-            | ast::Literal::Vector(..)
-            | ast::Literal::VectorD(..),
-        )
-        | ast::RValue::Table(_)
-        | ast::RValue::Closure(_) => Some(true),
-        ast::RValue::Literal(ast::Literal::Nil | ast::Literal::Boolean(_)) => Some(false),
-        _ => None,
+fn make_conditional_value(
+    condition: ast::RValue,
+    then_value: ast::RValue,
+    else_value: ast::RValue,
+) -> ast::RValue {
+    if let ast::RValue::Literal(ast::Literal::Boolean(then_boolean)) = then_value
+        && let ast::RValue::Literal(ast::Literal::Boolean(else_boolean)) = else_value
+        && then_boolean != else_boolean
+    {
+        let negated = ast::Unary::new(condition, ast::UnaryOperation::Not);
+        if then_boolean {
+            ast::Unary::new(negated.into(), ast::UnaryOperation::Not).into()
+        } else {
+            negated.into()
+        }
+    } else if else_value == condition && !condition.has_side_effects() {
+        ast::Binary::new(condition, then_value, ast::BinaryOperation::And).reduce()
+    } else if then_value == condition && !condition.has_side_effects() {
+        ast::Binary::new(condition, else_value, ast::BinaryOperation::Or).reduce()
+    } else {
+        ast::Conditional::new(condition, then_value, else_value).into()
     }
 }
 
@@ -372,79 +372,13 @@ fn is_truthy(rvalue: ast::RValue) -> Option<bool> {
 fn make_bool_conditional(
     function: &mut Function,
     node: NodeIndex,
-    mut then_value: ast::RValue,
-    mut else_value: ast::RValue,
+    then_value: ast::RValue,
+    else_value: ast::RValue,
 ) -> Option<ast::RValue> {
     let block = function.block_mut(node).unwrap();
     let r#if = block.last_mut().unwrap().as_if_mut().unwrap();
-    if let ast::RValue::Literal(ast::Literal::Boolean(then_value)) = then_value
-        && let ast::RValue::Literal(ast::Literal::Boolean(else_value)) = else_value
-        && then_value != else_value
-    {
-        let cond = ast::Unary::new(
-            std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into()),
-            ast::UnaryOperation::Not,
-        );
-        let cond = if then_value {
-            ast::Unary::new(cond.into(), ast::UnaryOperation::Not)
-        } else {
-            cond
-        };
-        Some(cond.reduce())
-    } else {
-        // TODO: `v0 and v1 and v2`, v0, v1 and v2 are truthy, but only v2 is treated as such
-        let then_truthy = match is_truthy(then_value.clone()) {
-            Some(truthy) => truthy,
-            None if !then_value.has_side_effects() => {
-                let value = match &r#if.condition {
-                    ast::RValue::Binary(ast::Binary {
-                        right: box value,
-                        operation: ast::BinaryOperation::And,
-                        ..
-                    }) => value,
-                    value => value,
-                };
-                !value.has_side_effects() && *value == then_value
-            }
-            None => false,
-        };
-        // TODO: if condition is `and not else_value` or `not else_value` then truthy?
-        let else_truthy = is_truthy(else_value.clone()).is_some_and(|v| v);
-        let cond = if !then_truthy && !else_truthy {
-            return None;
-        } else if !then_truthy {
-            std::mem::swap(&mut then_value, &mut else_value);
-            ast::Unary::new(
-                std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into()),
-                ast::UnaryOperation::Not,
-            )
-            .reduce_condition()
-        } else if !else_truthy {
-            std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into()).reduce_condition()
-        } else {
-            let cond =
-                std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into()).reduce_condition();
-            if let ast::RValue::Unary(ast::Unary {
-                box value,
-                operation: ast::UnaryOperation::Not,
-            }) = cond
-            {
-                std::mem::swap(&mut then_value, &mut else_value);
-                value
-            } else {
-                cond
-            }
-        };
-
-        Some(
-            ast::Binary::new(
-                ast::Binary::new(cond, then_value, ast::BinaryOperation::And).into(),
-                else_value,
-                ast::BinaryOperation::Or,
-            )
-            .reduce(),
-        )
-    }
+    let condition = std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into());
+    Some(make_conditional_value(condition, then_value, else_value))
 }
 
 // TODO: `return if g then true else false` in luau?
@@ -892,6 +826,88 @@ fn try_remove_unnecessary_condition(function: &mut Function, node: NodeIndex) ->
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ast::{
+        BinaryOperation, Call, Global, Literal, Local, RValue, RcLocal, SideEffects, Unary,
+        UnaryOperation,
+    };
+
+    use super::make_conditional_value;
+
+    fn local(name: &str) -> RcLocal {
+        RcLocal::new(Local::new(Some(name.to_owned())))
+    }
+
+    #[test]
+    fn conditional_value_preserves_falsy_branches() {
+        let value = make_conditional_value(
+            local("condition").into(),
+            Literal::Boolean(false).into(),
+            Literal::Nil.into(),
+        );
+
+        assert_eq!(value.to_string(), "if condition then false else nil");
+    }
+
+    #[test]
+    fn conditional_value_keeps_and_identity_shape() {
+        let condition = local("condition");
+        let value = make_conditional_value(
+            condition.clone().into(),
+            local("selected").into(),
+            condition.into(),
+        );
+
+        assert!(matches!(
+            value,
+            RValue::Binary(ast::Binary {
+                operation: BinaryOperation::And,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn conditional_value_keeps_or_identity_shape() {
+        let condition = local("condition");
+        let value = make_conditional_value(
+            condition.clone().into(),
+            condition.into(),
+            local("fallback").into(),
+        );
+
+        assert!(matches!(
+            value,
+            RValue::Binary(ast::Binary {
+                operation: BinaryOperation::Or,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn conditional_value_does_not_merge_equal_effectful_branches() {
+        let condition = RValue::Call(Call::new(Global::from("probe").into(), Vec::new()));
+        let value = make_conditional_value(condition.clone(), local("selected").into(), condition);
+
+        assert!(matches!(value, RValue::Conditional(_)));
+    }
+
+    #[test]
+    fn boolean_conditional_keeps_observable_length_evaluation() {
+        let condition = Unary::new(local("object").into(), UnaryOperation::Length);
+        let value = make_conditional_value(
+            condition.into(),
+            Literal::Boolean(false).into(),
+            Literal::Boolean(true).into(),
+        );
+
+        assert_eq!(value.to_string(), "not #object");
+        assert!(value.has_side_effects());
     }
 }
 
