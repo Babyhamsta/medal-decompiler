@@ -1044,6 +1044,6 @@ mod tests {
         let mut lifted = Vec::new();
         let (mut function, upvalues) = Lifter::lift(&bytecode, &mut lifted);
 
-        cfg::ssa::construct(&mut function, &upvalues);
+        cfg::ssa::construct(&mut function, &upvalues).expect("SSA construction");
     }
 }

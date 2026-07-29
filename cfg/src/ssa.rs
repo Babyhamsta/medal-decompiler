@@ -8,3 +8,9 @@ pub mod upvalues;
 
 pub use construct::construct;
 pub use destruct::Destructor;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SsaError {
+    #[error(transparent)]
+    Upvalues(#[from] upvalues::UpvalueAnalysisError),
+}

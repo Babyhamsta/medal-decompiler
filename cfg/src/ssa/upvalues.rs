@@ -91,10 +91,6 @@ pub(crate) struct UpvaluesOpen {
 }
 
 impl UpvaluesOpen {
-    pub fn new(function: &Function, old_locals: FxHashMap<ast::RcLocal, ast::RcLocal>) -> Self {
-        Self::try_new(function, old_locals).expect("bounded upvalue analysis")
-    }
-
     pub fn try_new(
         function: &Function,
         old_locals: FxHashMap<ast::RcLocal, ast::RcLocal>,
@@ -459,7 +455,7 @@ mod tests {
         let (function, captured) = diamond_chain(8);
         let old_locals = FxHashMap::from_iter([(captured.clone(), captured)]);
 
-        let analysis = UpvaluesOpen::new(&function, old_locals);
+        let analysis = UpvaluesOpen::try_new(&function, old_locals).unwrap();
         let maximum_locations = analysis
             .open
             .values()

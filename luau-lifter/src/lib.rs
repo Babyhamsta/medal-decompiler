@@ -197,7 +197,7 @@ mod output_tests {
 
 #[cfg(test)]
 mod structured_error_tests {
-    use super::{DecompileError, DecompilePhase, catch_phase, decompile_bytecode};
+    use super::{DecompileError, DecompilePhase, catch_phase, decompile_bytecode, ssa_error};
 
     #[test]
     fn structured_error_display_includes_available_context() {
@@ -238,6 +238,25 @@ mod structured_error_tests {
         assert_eq!(error.invariant, "valid Luau bytecode");
         assert!(!error.to_string().starts_with("--"));
     }
+
+    #[test]
+    fn bounded_ssa_resource_error_retains_function_context() {
+        let error = ssa_error(
+            31,
+            cfg::ssa::SsaError::Upvalues(cfg::ssa::upvalues::UpvalueAnalysisError::Resource(
+                "capacity".to_owned(),
+            )),
+        );
+
+        assert_eq!(error.phase, DecompilePhase::Ssa);
+        assert_eq!(error.function_id, Some(31));
+        assert_eq!(error.instruction, None);
+        assert_eq!(error.invariant, "bounded SSA analysis");
+        assert_eq!(
+            error.detail,
+            "unable to reserve bounded upvalue state: capacity"
+        );
+    }
 }
 
 fn decompile_function(
@@ -246,10 +265,13 @@ fn decompile_function(
     upvalues_in: Vec<ast::RcLocal>,
 ) -> Result<(ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>), DecompileError> {
     let function_id = function.id;
-    let (local_count, upvalue_to_group, local_to_group) =
-        catch_phase(DecompilePhase::Ssa, Some(function_id), None, || {
+    let ssa_result = catch_phase(
+        DecompilePhase::Ssa,
+        Some(function_id),
+        None,
+        || -> Result<_, cfg::ssa::SsaError> {
             let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
-                cfg::ssa::construct(&mut function, &upvalues_in);
+                cfg::ssa::construct(&mut function, &upvalues_in)?;
             function
                 .validate_reference_bindings()
                 .expect("SSA must preserve reference binding classes");
@@ -275,8 +297,11 @@ fn decompile_function(
                 .enumerate()
                 .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
                 .collect::<FxHashMap<_, _>>();
-            (local_count, upvalue_to_group, local_to_group)
-        })?;
+            Ok((local_count, upvalue_to_group, local_to_group))
+        },
+    )?;
+    let (local_count, upvalue_to_group, local_to_group) =
+        ssa_result.map_err(|error| ssa_error(function_id, error))?;
 
     let recovery_report = catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
         let mut scheduler = cfg::recovery::PassScheduler::new(32);
@@ -392,6 +417,16 @@ fn decompile_function(
     })?;
 
     Ok((ByAddress(ast_function), upvalues_in))
+}
+
+fn ssa_error(function_id: usize, error: cfg::ssa::SsaError) -> DecompileError {
+    DecompileError::new(
+        DecompilePhase::Ssa,
+        Some(function_id),
+        None,
+        "bounded SSA analysis",
+        error.to_string(),
+    )
 }
 
 fn link_upvalues(

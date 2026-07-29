@@ -12,7 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{function::Function, ssa::param_dependency_graph::ParamDependencyGraph};
 
-use super::upvalues::UpvaluesOpen;
+use super::{SsaError, upvalues::UpvaluesOpen};
 
 struct SsaConstructor<'a> {
     function: &'a mut Function,
@@ -451,8 +451,8 @@ impl<'a> SsaConstructor<'a> {
         }
     }
 
-    fn mark_upvalues(&mut self) {
-        let upvalues_open = UpvaluesOpen::new(self.function, self.old_locals.clone());
+    fn mark_upvalues(&mut self) -> Result<(), SsaError> {
+        let upvalues_open = UpvaluesOpen::try_new(self.function, self.old_locals.clone())?;
         for &node in &self.dfs {
             for stat_index in 0..self.function.block(node).unwrap().len() {
                 let statement = self.function.block(node).unwrap().get(stat_index).unwrap();
@@ -480,6 +480,7 @@ impl<'a> SsaConstructor<'a> {
                 .unwrap()
                 .retain(|statement| !matches!(statement, ast::Statement::Close(_)))
         }
+        Ok(())
     }
 
     fn read(&mut self, node: NodeIndex, stat_index: usize) {
@@ -516,12 +517,15 @@ impl<'a> SsaConstructor<'a> {
 
     fn construct(
         mut self,
-    ) -> (
-        usize,
-        Vec<FxHashSet<RcLocal>>,
-        Vec<(RcLocal, FxHashSet<RcLocal>)>,
-        Vec<FxHashSet<RcLocal>>,
-    ) {
+    ) -> Result<
+        (
+            usize,
+            Vec<FxHashSet<RcLocal>>,
+            Vec<(RcLocal, FxHashSet<RcLocal>)>,
+            Vec<FxHashSet<RcLocal>>,
+        ),
+        SsaError,
+    > {
         let entry = self.function.entry().unwrap();
         let mut visited_nodes = Vec::with_capacity(self.function.graph().node_count());
         for i in 0..self.dfs.len() {
@@ -632,7 +636,7 @@ impl<'a> SsaConstructor<'a> {
         // TODO: apply_local_map unnecessary number of calls
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
-        self.mark_upvalues();
+        self.mark_upvalues()?;
         self.propagate_copies();
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
@@ -687,7 +691,7 @@ impl<'a> SsaConstructor<'a> {
 
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
-        (
+        Ok((
             self.local_count,
             self.all_definitions.into_values().collect(),
             self.new_upvalues_in.into_iter().collect(),
@@ -695,19 +699,22 @@ impl<'a> SsaConstructor<'a> {
                 .into_values()
                 .flat_map(|m| m.into_values())
                 .collect(),
-        )
+        ))
     }
 }
 
 pub fn construct(
     function: &mut Function,
     upvalues_in: &Vec<RcLocal>,
-) -> (
-    usize,
-    Vec<FxHashSet<RcLocal>>,
-    Vec<(RcLocal, FxHashSet<RcLocal>)>,
-    Vec<FxHashSet<RcLocal>>,
-) {
+) -> Result<
+    (
+        usize,
+        Vec<FxHashSet<RcLocal>>,
+        Vec<(RcLocal, FxHashSet<RcLocal>)>,
+        Vec<FxHashSet<RcLocal>>,
+    ),
+    SsaError,
+> {
     // if entry has predecessors, this might risk it never being incomplete
     // resulting in broken params
     // TODO: verify ^ and insert temporary entry that's removed if there is no block params (if its an issue)

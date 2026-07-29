@@ -62,84 +62,86 @@ fn main() -> anyhow::Result<()> {
     let (main, ..) = lifted.first().unwrap().clone();
     let mut upvalues = lifted
         .into_iter()
-        .map(|(ast_function, mut function, upvalues_in)| {
-            let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
-                cfg::ssa::construct(&mut function, &upvalues_in);
-            let upvalue_to_group = upvalue_in_groups
-                .into_iter()
-                .chain(
-                    upvalue_passed_groups
-                        .into_iter()
-                        .map(|m| (ast::RcLocal::default(), m)),
-                )
-                .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
-                .collect::<IndexMap<_, _>>();
-            // TODO: do we even need this?
-            let local_to_group = local_groups
-                .into_iter()
-                .enumerate()
-                .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
-                .collect::<FxHashMap<_, _>>();
-            // TODO: REFACTOR: some way to write a macro that states
-            // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
-            // structure_for_loops and remove_unnecessary_params must run again.
-            // if structure_compound_conditionals results in change then dominators and post dominators
-            // must be recalculated.
-            // etc.
-            // the macro could also maybe generate an optimal ordering?
-            let mut changed = true;
-            while changed {
-                changed = false;
+        .map(
+            |(ast_function, mut function, upvalues_in)| -> anyhow::Result<_> {
+                let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
+                    cfg::ssa::construct(&mut function, &upvalues_in)?;
+                let upvalue_to_group = upvalue_in_groups
+                    .into_iter()
+                    .chain(
+                        upvalue_passed_groups
+                            .into_iter()
+                            .map(|m| (ast::RcLocal::default(), m)),
+                    )
+                    .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
+                    .collect::<IndexMap<_, _>>();
+                // TODO: do we even need this?
+                let local_to_group = local_groups
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
+                    .collect::<FxHashMap<_, _>>();
+                // TODO: REFACTOR: some way to write a macro that states
+                // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
+                // structure_for_loops and remove_unnecessary_params must run again.
+                // if structure_compound_conditionals results in change then dominators and post dominators
+                // must be recalculated.
+                // etc.
+                // the macro could also maybe generate an optimal ordering?
+                let mut changed = true;
+                while changed {
+                    changed = false;
 
-                let dominators = simple_fast(function.graph(), function.entry().unwrap());
-                changed |= structure_jumps(&mut function, &dominators);
+                    let dominators = simple_fast(function.graph(), function.entry().unwrap());
+                    changed |= structure_jumps(&mut function, &dominators);
 
-                ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
+                    ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-                if structure_conditionals(&mut function)
+                    if structure_conditionals(&mut function)
                 // || {
                 //     let post_dominators = post_dominators(function.graph_mut());
                 //     structure_for_loops(&mut function, &dominators, &post_dominators)
                 // }
                     || structure_method_calls(&mut function)
+                    {
+                        changed = true;
+                    }
+                    let mut local_map = FxHashMap::default();
+                    // TODO: loop until returns false?
+                    if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
+                        changed = true;
+                    }
+                    ssa::construct::apply_local_map(&mut function, local_map);
+                }
+                let recovery_facts = cfg::recovery::RecoveryFacts::derive(&function)
+                    .expect("derive recovery facts before CFG destruction");
+                ssa::Destructor::new(
+                    &mut function,
+                    upvalue_to_group,
+                    upvalues_in.iter().cloned().collect(),
+                    local_count,
+                )
+                .destruct();
+
+                let params = std::mem::take(&mut function.parameters);
+                let is_variadic = function.is_variadic;
+                let block = Arc::new(restructure::lift(function, &recovery_facts).into());
+                LocalDeclarer::default().declare_locals(
+                    // TODO: why does block.clone() not work?
+                    Arc::clone(&block),
+                    &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+                );
+
                 {
-                    changed = true;
+                    let mut ast_function = ast_function.lock();
+                    ast_function.body = Arc::try_unwrap(block).unwrap().into_inner();
+                    ast_function.parameters = params;
+                    ast_function.is_variadic = is_variadic;
                 }
-                let mut local_map = FxHashMap::default();
-                // TODO: loop until returns false?
-                if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
-                    changed = true;
-                }
-                ssa::construct::apply_local_map(&mut function, local_map);
-            }
-            let recovery_facts = cfg::recovery::RecoveryFacts::derive(&function)
-                .expect("derive recovery facts before CFG destruction");
-            ssa::Destructor::new(
-                &mut function,
-                upvalue_to_group,
-                upvalues_in.iter().cloned().collect(),
-                local_count,
-            )
-            .destruct();
-
-            let params = std::mem::take(&mut function.parameters);
-            let is_variadic = function.is_variadic;
-            let block = Arc::new(restructure::lift(function, &recovery_facts).into());
-            LocalDeclarer::default().declare_locals(
-                // TODO: why does block.clone() not work?
-                Arc::clone(&block),
-                &upvalues_in.iter().chain(params.iter()).cloned().collect(),
-            );
-
-            {
-                let mut ast_function = ast_function.lock();
-                ast_function.body = Arc::try_unwrap(block).unwrap().into_inner();
-                ast_function.parameters = params;
-                ast_function.is_variadic = is_variadic;
-            }
-            (ByAddress(ast_function), upvalues_in)
-        })
-        .collect::<FxHashMap<_, _>>();
+                Ok((ByAddress(ast_function), upvalues_in))
+            },
+        )
+        .collect::<anyhow::Result<FxHashMap<_, _>>>()?;
 
     let main = ByAddress(main);
     upvalues.remove(&main);
