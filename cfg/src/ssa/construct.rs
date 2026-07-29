@@ -459,11 +459,8 @@ impl<'a> SsaConstructor<'a> {
                 let values = statement.values().into_iter().cloned().collect::<Vec<_>>();
                 for value in values {
                     let old_local = &self.old_locals[&value];
-                    if let Some(open_locations) = upvalues_open
-                        .open
-                        .get(&node)
-                        .and_then(|m| m.get(old_local))
-                        .and_then(|m| m.get(&stat_index))
+                    if let Some(opening_location) =
+                        upvalues_open.opening_location(node, old_local, stat_index)
                     {
                         if let Some(new_upvalues_in) = self.new_upvalues_in.get_mut(old_local) {
                             assert!(new_upvalues_in.contains(&value));
@@ -471,7 +468,7 @@ impl<'a> SsaConstructor<'a> {
                             self.upvalues_passed
                                 .entry(old_local.clone())
                                 .or_default()
-                                .entry(*open_locations.first().unwrap())
+                                .entry(opening_location)
                                 .or_default()
                                 .insert(value);
                         }
