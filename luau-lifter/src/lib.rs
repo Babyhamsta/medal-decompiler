@@ -94,30 +94,24 @@ fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<Strin
 }
 
 fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, DecompileError> {
-    let mut lifted = Vec::new();
-    let mut stack = vec![(Arc::<Mutex<ast::Function>>::default(), chunk.main)];
+    let main = Arc::<Mutex<ast::Function>>::default();
+    let mut stack = vec![(main.clone(), chunk.main)];
+    let mut decompiled_upvalues = FxHashMap::default();
     while let Some((ast_func, func_id)) = stack.pop() {
-        let (function, upvalues, child_functions) =
+        let (function, upvalues_in, child_functions) =
             catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
                 Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
             })?;
-        lifted.push((ast_func, function, upvalues));
         stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+        let (function, function_upvalues) = decompile_function(ast_func, function, upvalues_in)?;
+        decompiled_upvalues.insert(function, function_upvalues);
     }
 
-    let (main, ..) = lifted.first().unwrap().clone();
-    let mut upvalues = lifted
-        .into_iter()
-        .map(|(ast_function, function, upvalues_in)| {
-            decompile_function(ast_function, function, upvalues_in)
-        })
-        .collect::<Result<FxHashMap<_, _>, DecompileError>>()?;
-
     let main = ByAddress(main);
-    upvalues.remove(&main);
+    decompiled_upvalues.remove(&main);
     let mut body = catch_phase(DecompilePhase::Link, None, None, || {
         let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
-        link_upvalues(&mut body, &mut upvalues);
+        link_upvalues(&mut body, &mut decompiled_upvalues);
         body
     })?;
     if block_contains_unsupported_nodes(&mut body) {

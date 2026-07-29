@@ -395,10 +395,44 @@ impl GraphStructurer {
                     .unwrap(),
             )
         };
+        recover_terminal_backedge_loop(&mut result);
         flatten_single_iteration_loops(&mut result);
         relocate_unreachable_terminal_returns(&mut result, &self.reachable_terminal_returns);
         result
     }
+}
+
+fn recover_terminal_backedge_loop(block: &mut ast::Block) -> bool {
+    let Some(label) = block.first().and_then(ast::Statement::as_label).cloned() else {
+        return false;
+    };
+    let Some(goto) = block.last().and_then(ast::Statement::as_goto) else {
+        return false;
+    };
+    if goto.0 != label || contains_unstructured_jump(&block[1..block.len() - 1]) {
+        return false;
+    }
+
+    let mut statements = std::mem::take(&mut block.0);
+    statements.pop();
+    statements.remove(0);
+    block.push(ast::While::new(ast::Literal::Boolean(true).into(), ast::Block(statements)).into());
+    true
+}
+
+fn contains_unstructured_jump(statements: &[ast::Statement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        ast::Statement::Goto(_) | ast::Statement::Label(_) => true,
+        ast::Statement::If(if_) => {
+            contains_unstructured_jump(&if_.then_block.lock())
+                || contains_unstructured_jump(&if_.else_block.lock())
+        }
+        ast::Statement::While(while_) => contains_unstructured_jump(&while_.block.lock()),
+        ast::Statement::Repeat(repeat) => contains_unstructured_jump(&repeat.block.lock()),
+        ast::Statement::NumericFor(for_) => contains_unstructured_jump(&for_.block.lock()),
+        ast::Statement::GenericFor(for_) => contains_unstructured_jump(&for_.block.lock()),
+        _ => false,
+    })
 }
 
 fn flatten_single_iteration_loops(block: &mut ast::Block) -> usize {
@@ -795,7 +829,7 @@ pub fn lift(
 mod tests {
     use crate::{
         contains_reachable_return, flatten_single_iteration_loops, lift,
-        relocate_unreachable_terminal_returns,
+        recover_terminal_backedge_loop, relocate_unreachable_terminal_returns,
     };
     use ast::{
         Assign, Binary, BinaryOperation, Call, Global, If, LValue, Literal, Local, RValue, RcLocal,
@@ -814,6 +848,38 @@ mod tests {
 
     fn assign(target: &RcLocal, value: RValue) -> Statement {
         Assign::new(vec![LValue::Local(target.clone())], vec![value]).into()
+    }
+
+    #[test]
+    fn terminal_backedge_becomes_infinite_loop() {
+        let label = ast::Label("loop".to_owned());
+        let mut block = ast::Block(vec![
+            label.clone().into(),
+            ast::Comment::new("body".to_owned()).into(),
+            ast::Goto::new(label).into(),
+        ]);
+
+        assert!(recover_terminal_backedge_loop(&mut block));
+        assert_eq!(block.len(), 1);
+        let loop_ = block[0].as_while().unwrap();
+        assert_eq!(
+            loop_.condition,
+            ast::RValue::Literal(ast::Literal::Boolean(true))
+        );
+        assert_eq!(loop_.block.lock().len(), 1);
+    }
+
+    #[test]
+    fn terminal_backedge_with_internal_jump_stays_explicit() {
+        let label = ast::Label("loop".to_owned());
+        let mut block = ast::Block(vec![
+            label.clone().into(),
+            ast::Goto::new(label.clone()).into(),
+            ast::Goto::new(label).into(),
+        ]);
+
+        assert!(!recover_terminal_backedge_loop(&mut block));
+        assert_eq!(block.len(), 3);
     }
 
     #[test]
