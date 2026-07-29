@@ -509,7 +509,6 @@ impl<'a> Destructor<'a> {
 
             let con_class_z = self.get_congruence_class(local_c.clone()).clone();
             if con_class_x == con_class_z && con_class_x != con_class_y {
-                println!("WOAH COPY SHARING");
                 return true;
             }
             if con_class_y != con_class_x
@@ -517,7 +516,6 @@ impl<'a> Destructor<'a> {
                 && con_class_x != con_class_z
                 && self.try_coalesce_copy_by_value(local_a.clone(), local_c)
             {
-                println!("WOAH COPY SHARING");
                 return true;
             }
         }

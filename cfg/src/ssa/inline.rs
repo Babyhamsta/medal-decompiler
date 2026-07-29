@@ -106,6 +106,138 @@ fn fold_table_fields(
     folded
 }
 
+fn fold_set_lists(
+    block: &mut ast::Block,
+    local_usages: &mut FxHashMap<ast::RcLocal, usize>,
+) -> usize {
+    let mut folded = 0;
+    for set_index in 0..block.len() {
+        let ast::Statement::SetList(set_list) = block[set_index].clone() else {
+            continue;
+        };
+        let Some(expected_values) = set_list.index.checked_sub(1) else {
+            continue;
+        };
+
+        let mut search_before = set_index;
+        let mut defined_local = set_list.object_local.clone();
+        let mut aliases = Vec::new();
+        let table_index = loop {
+            let Some(definition_index) = (0..search_before)
+                .rev()
+                .find(|&index| block[index].values_written().contains(&&defined_local))
+            else {
+                break None;
+            };
+            let Some(assign) = block[definition_index].as_assign() else {
+                break None;
+            };
+            if assign.parallel || assign.left.len() != 1 || assign.right.len() != 1 {
+                break None;
+            }
+            let Some(target) = assign.left[0].as_local() else {
+                break None;
+            };
+            if target != &defined_local {
+                break None;
+            }
+            if assign.right[0].as_table().is_some() {
+                break Some(definition_index);
+            }
+            let Some(source) = assign.right[0].as_local() else {
+                break None;
+            };
+            if local_usages.get(&defined_local) != Some(&1) {
+                break None;
+            }
+            aliases.push((definition_index, defined_local, source.clone()));
+            defined_local = source.clone();
+            search_before = definition_index;
+        };
+        let Some(table_index) = table_index else {
+            continue;
+        };
+
+        let table = block[table_index].as_assign().unwrap().right[0]
+            .as_table()
+            .unwrap();
+        if has_open_table_tail(table)
+            || table.0.iter().filter(|(key, _)| key.is_none()).count() != expected_values
+        {
+            continue;
+        }
+        let mut protected_locals = aliases
+            .iter()
+            .map(|(_, target, _)| target.clone())
+            .collect::<Vec<_>>();
+        protected_locals.push(defined_local.clone());
+        let expressions_read_crossed_local = set_list
+            .values
+            .iter()
+            .chain(set_list.tail.as_ref())
+            .flat_map(ast::LocalRw::values_read)
+            .any(|read| protected_locals.contains(read));
+        if expressions_read_crossed_local
+            || !local_usages
+                .get(&set_list.object_local)
+                .is_some_and(|usage| *usage > 0)
+        {
+            continue;
+        }
+
+        let alias_indices = aliases
+            .iter()
+            .map(|(index, _, _)| *index)
+            .collect::<FxHashSet<_>>();
+        let can_keep_constructor_in_place = (table_index + 1..set_index)
+            .all(|index| alias_indices.contains(&index) || block[index].as_empty().is_some());
+        if !can_keep_constructor_in_place {
+            let table_values_are_movable = table.0.iter().all(|(key, value)| {
+                key.as_ref().is_none_or(|key| !key.has_side_effects()) && !value.has_side_effects()
+            });
+            let table_is_unobserved = (table_index + 1..set_index)
+                .filter(|index| !alias_indices.contains(index))
+                .all(|index| {
+                    !block[index]
+                        .values_read()
+                        .iter()
+                        .any(|read| protected_locals.contains(read))
+                        && !block[index]
+                            .values_written()
+                            .iter()
+                            .any(|written| protected_locals.contains(written))
+                });
+            if !table_values_are_movable || !table_is_unobserved {
+                continue;
+            }
+        }
+
+        let mut table_assign = block[table_index].as_assign().unwrap().clone();
+        let table = table_assign.right[0].as_table_mut().unwrap();
+        table
+            .0
+            .extend(set_list.values.into_iter().map(|value| (None, value)));
+        if let Some(tail) = set_list.tail {
+            table.0.push((None, tail));
+        }
+        *local_usages.get_mut(&set_list.object_local).unwrap() -= 1;
+
+        if can_keep_constructor_in_place {
+            block[table_index] = table_assign.into();
+            block[set_index] = ast::Empty {}.into();
+        } else {
+            block[table_index] = ast::Empty {}.into();
+            for (alias_index, _, source) in aliases {
+                block[alias_index] = ast::Empty {}.into();
+                *local_usages.get_mut(&source).unwrap() -= 1;
+            }
+            block[set_index] = table_assign.into();
+        }
+        folded += 1;
+    }
+    folded
+}
+
 impl<'a> Inliner<'a> {
     fn new(
         function: &'a mut Function,
@@ -635,46 +767,7 @@ pub fn inline(
 
             // `t = {} t.a = 1` -> `t = { a = 1 }`
             changed |= fold_table_fields(block, &effect_observable_locals) != 0;
-
-            // if the first statement is a set_list, we cant inline it anyway
-            for i in 1..block.len() {
-                if let ast::Statement::SetList(set_list) = &block[i] {
-                    let object_local = set_list.object_local.clone();
-                    if let Some(assign) = block[i - 1].as_assign_mut()
-                        && assign.left == [object_local.into()]
-                    {
-                        let set_list = std::mem::replace(&mut block[i], ast::Empty {}.into())
-                            .into_set_list()
-                            .unwrap();
-                        *local_usages.get_mut(&set_list.object_local).unwrap() -= 1;
-                        let assign = block.get_mut(i - 1).unwrap().as_assign_mut().unwrap();
-                        let table = assign.right[0].as_table_mut().unwrap();
-                        assert!(
-                            table.0.iter().filter(|(k, _)| k.is_none()).count()
-                                == set_list.index - 1
-                        );
-                        for value in set_list.values {
-                            table.0.push((None, value));
-                        }
-                        // table already has tail?
-                        // TODO: REFACTOR: is_some_and
-                        assert!(!table.0.last().map_or(false, |(k, v)| k.is_none()
-                            && matches!(
-                                v,
-                                ast::RValue::VarArg(_)
-                                    | ast::RValue::Call(_)
-                                    | ast::RValue::MethodCall(_)
-                            )));
-                        if let Some(tail) = set_list.tail {
-                            table.0.push((None, tail));
-                        }
-                        changed = true;
-                    }
-                    // todo: only inline in changed blocks
-                    //cfg::dot::render_to(function, &mut std::io::stdout());
-                    //break 'outer;
-                }
-            }
+            changed |= fold_set_lists(block, &mut local_usages) != 0;
         }
     }
     // we check block.ast.len() elsewhere and do `i - ` here and elsewhere so we need to get rid of empty statements
@@ -688,12 +781,12 @@ pub fn inline(
 mod tests {
     use ast::{
         Assign, Block, Call, Closure, Global, Index, LValue, Literal, Local, RValue, RcLocal,
-        Table, Upvalue,
+        SetList, Table, Upvalue,
     };
 
-    use rustc_hash::FxHashSet;
+    use rustc_hash::{FxHashMap, FxHashSet};
 
-    use super::fold_table_fields;
+    use super::{fold_set_lists, fold_table_fields};
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
@@ -812,5 +905,53 @@ mod tests {
 
         assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 1);
         assert_eq!(block.len(), 1);
+    }
+
+    #[test]
+    fn folds_set_list_through_adjacent_table_alias() {
+        let table = local("table");
+        let alias = local("alias");
+        let mut block = Block(vec![
+            Assign::new(vec![table.clone().into()], vec![Table::default().into()]).into(),
+            Assign::new(vec![alias.clone().into()], vec![table.into()]).into(),
+            SetList::new(
+                alias.clone(),
+                1,
+                vec![Literal::String(b"value".to_vec()).into()],
+                None,
+            )
+            .into(),
+        ]);
+        let mut local_usages = FxHashMap::from_iter([(alias.clone(), 1)]);
+
+        assert_eq!(fold_set_lists(&mut block, &mut local_usages), 1);
+        assert_eq!(
+            block[0].as_assign().unwrap().right[0].as_table().unwrap().0,
+            vec![(None, Literal::String(b"value".to_vec()).into())]
+        );
+        assert!(block[2].as_empty().is_some());
+        assert_eq!(local_usages[&alias], 0);
+    }
+
+    #[test]
+    fn moves_unobserved_table_construction_past_value_preparation() {
+        let table = local("table");
+        let value = local("value");
+        let mut block = Block(vec![
+            Assign::new(vec![table.clone().into()], vec![Table::default().into()]).into(),
+            Assign::new(
+                vec![value.clone().into()],
+                vec![Literal::String(b"value".to_vec()).into()],
+            )
+            .into(),
+            SetList::new(table.clone(), 1, vec![value.clone().into()], None).into(),
+        ]);
+        let mut local_usages = FxHashMap::from_iter([(table.clone(), 1), (value, 1)]);
+
+        assert_eq!(fold_set_lists(&mut block, &mut local_usages), 1);
+        assert!(block[0].as_empty().is_some());
+        let moved = block[2].as_assign().unwrap();
+        assert_eq!(moved.left, vec![table.into()]);
+        assert_eq!(moved.right[0].as_table().unwrap().0.len(), 1);
     }
 }

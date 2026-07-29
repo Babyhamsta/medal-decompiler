@@ -120,13 +120,13 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, Decompil
         link_upvalues(&mut body, &mut upvalues);
         body
     })?;
-    if block_contains_unsupported_jump(&mut body) {
+    if block_contains_unsupported_nodes(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
             None,
             None,
-            "structured control flow",
-            "control-flow structuring left unsupported goto or label nodes",
+            "source-level AST",
+            "reconstruction left internal goto, label, or set-list nodes",
         ));
     }
     catch_phase(DecompilePhase::Format, None, None, || {
@@ -136,45 +136,46 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, Decompil
     })
 }
 
-fn block_contains_unsupported_jump(block: &mut ast::Block) -> bool {
+fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
     for statement in &mut block.0 {
         if matches!(
             statement,
-            ast::Statement::Goto(_) | ast::Statement::Label(_)
+            ast::Statement::Goto(_) | ast::Statement::Label(_) | ast::Statement::SetList(_)
         ) {
             return true;
         }
 
-        let nested_jump = match statement {
+        let nested_internal_node = match statement {
             ast::Statement::If(r#if) => {
-                block_contains_unsupported_jump(&mut r#if.then_block.lock())
-                    || block_contains_unsupported_jump(&mut r#if.else_block.lock())
+                block_contains_unsupported_nodes(&mut r#if.then_block.lock())
+                    || block_contains_unsupported_nodes(&mut r#if.else_block.lock())
             }
             ast::Statement::While(r#while) => {
-                block_contains_unsupported_jump(&mut r#while.block.lock())
+                block_contains_unsupported_nodes(&mut r#while.block.lock())
             }
             ast::Statement::Repeat(repeat) => {
-                block_contains_unsupported_jump(&mut repeat.block.lock())
+                block_contains_unsupported_nodes(&mut repeat.block.lock())
             }
             ast::Statement::NumericFor(numeric_for) => {
-                block_contains_unsupported_jump(&mut numeric_for.block.lock())
+                block_contains_unsupported_nodes(&mut numeric_for.block.lock())
             }
             ast::Statement::GenericFor(generic_for) => {
-                block_contains_unsupported_jump(&mut generic_for.block.lock())
+                block_contains_unsupported_nodes(&mut generic_for.block.lock())
             }
             _ => false,
         };
-        if nested_jump {
+        if nested_internal_node {
             return true;
         }
 
-        let mut closure_jump = false;
+        let mut closure_internal_node = false;
         statement.traverse_rvalues(&mut |rvalue| {
-            if !closure_jump && let ast::RValue::Closure(closure) = rvalue {
-                closure_jump = block_contains_unsupported_jump(&mut closure.function.lock().body);
+            if !closure_internal_node && let ast::RValue::Closure(closure) = rvalue {
+                closure_internal_node =
+                    block_contains_unsupported_nodes(&mut closure.function.lock().body);
             }
         });
-        if closure_jump {
+        if closure_internal_node {
             return true;
         }
     }
@@ -184,14 +185,24 @@ fn block_contains_unsupported_jump(block: &mut ast::Block) -> bool {
 
 #[cfg(test)]
 mod output_tests {
-    use super::block_contains_unsupported_jump;
+    use super::block_contains_unsupported_nodes;
 
     #[test]
     fn rejects_unsupported_jump_nodes() {
         let label = ast::Label("exit".to_owned());
         let mut body = ast::Block(vec![ast::Goto::new(label).into()]);
 
-        assert!(block_contains_unsupported_jump(&mut body));
+        assert!(block_contains_unsupported_nodes(&mut body));
+    }
+
+    #[test]
+    fn rejects_internal_set_list_nodes() {
+        let table = ast::RcLocal::default();
+        let mut body = ast::Block(vec![
+            ast::SetList::new(table, 1, vec![ast::Literal::Number(1.0).into()], None).into(),
+        ]);
+
+        assert!(block_contains_unsupported_nodes(&mut body));
     }
 }
 

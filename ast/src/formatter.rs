@@ -95,6 +95,16 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         )
     }
 
+    fn starts_with_parenthesis(value: &RValue) -> bool {
+        if Self::should_wrap_left_rvalue(value) {
+            return true;
+        }
+        match value {
+            RValue::Index(index) => Self::starts_with_parenthesis(&index.left),
+            _ => false,
+        }
+    }
+
     fn format_block(&mut self, block: &Block) -> fmt::Result {
         self.indentation_level += 1;
         self.format_block_no_indent(block)?;
@@ -147,14 +157,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                             ..
                         }) => {
                             if let Some(index) = left[0].as_index() {
-                                Self::should_wrap_left_rvalue(&index.left)
+                                Self::starts_with_parenthesis(&index.left)
                             } else {
                                 false
                             }
                         }
                         Statement::Call(Call { value, .. })
                         | Statement::MethodCall(MethodCall { value, .. }) => {
-                            Self::should_wrap_left_rvalue(value)
+                            Self::starts_with_parenthesis(value)
                         }
                         Statement::Comment(_) => unimplemented!(),
                         _ => false,
@@ -881,6 +891,17 @@ mod tests {
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
+    }
+
+    #[test]
+    fn separates_call_from_following_parenthesized_table_call() {
+        let first = Call::new(Global::from("first").into(), Vec::new());
+        let callable = Table(vec![(None, Global::from("callback").into())]);
+        let indexed = Index::new(callable.into(), Literal::Number(1.0).into());
+        let second = Call::new(indexed.into(), Vec::new());
+        let block = Block(vec![first.into(), second.into()]);
+
+        assert_eq!(block.to_string(), "first();\n({ callback })[1]()");
     }
 
     #[test]
