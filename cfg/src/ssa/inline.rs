@@ -194,7 +194,7 @@ fn fold_set_lists(
         if !can_keep_constructor_in_place {
             let table_values_are_movable = table.0.iter().all(|(key, value)| {
                 key.as_ref().is_none_or(|key| !key.has_side_effects()) && !value.has_side_effects()
-            });
+            }) && table.values_read().is_empty();
             let table_is_unobserved = (table_index + 1..set_index)
                 .filter(|index| !alias_indices.contains(index))
                 .all(|index| {
@@ -953,5 +953,36 @@ mod tests {
         let moved = block[2].as_assign().unwrap();
         assert_eq!(moved.left, vec![table.into()]);
         assert_eq!(moved.right[0].as_table().unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn keeps_constructor_local_read_before_intervening_call() {
+        let table = local("table");
+        let source = local("source");
+        let mut block = Block(vec![
+            Assign::new(
+                vec![table.clone().into()],
+                vec![
+                    Table(vec![(
+                        Some(Literal::String(b"tag".to_vec()).into()),
+                        source.clone().into(),
+                    )])
+                    .into(),
+                ],
+            )
+            .into(),
+            Call::new(Global::from("mutate").into(), Vec::new()).into(),
+            SetList::new(
+                table.clone(),
+                1,
+                vec![Literal::String(b"value".to_vec()).into()],
+                None,
+            )
+            .into(),
+        ]);
+        let mut local_usages = FxHashMap::from_iter([(table, 1), (source, 1)]);
+
+        assert_eq!(fold_set_lists(&mut block, &mut local_usages), 0);
+        assert!(block[2].as_set_list().is_some());
     }
 }

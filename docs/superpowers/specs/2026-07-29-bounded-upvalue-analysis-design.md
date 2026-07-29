@@ -83,3 +83,10 @@ Use a focused red-green cycle:
 9. Run the existing Luau corpus and semantic regression gates, including the
    previously identified multi-return, vararg, repeat, generic-for, protected
    call, and state-machine cases.
+
+The pinned stock compiler is an additional round-trip gate only when the input
+prototype's declared stack fits that compiler's source register ceiling. If an
+input already exceeds that ceiling, record the input maximum and compiler
+limit, then use the pinned parser plus static prototype and closure traversal as
+the completeness gate. Do not reshape otherwise valid output merely to satisfy
+a lower external compiler limit.

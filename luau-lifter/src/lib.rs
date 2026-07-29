@@ -90,7 +90,108 @@ fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<Strin
         ));
     };
 
+    validate_prototype_graph(&chunk.functions)?;
     decompile_chunk(chunk)
+}
+
+#[derive(Clone, Copy)]
+struct PrototypeFrame {
+    function: usize,
+    nested_cursor: usize,
+    constant_cursor: usize,
+}
+
+impl PrototypeFrame {
+    fn new(function: usize) -> Self {
+        Self {
+            function,
+            nested_cursor: 0,
+            constant_cursor: 0,
+        }
+    }
+
+    fn next_child(&mut self, function: &deserializer::function::Function) -> Option<usize> {
+        if let Some(&child) = function.functions.get(self.nested_cursor) {
+            self.nested_cursor += 1;
+            return Some(child);
+        }
+        while let Some(constant) = function.constants.get(self.constant_cursor) {
+            self.constant_cursor += 1;
+            if let deserializer::constant::Constant::Closure(child) = constant {
+                return Some(*child);
+            }
+        }
+        None
+    }
+}
+
+fn validate_prototype_graph(
+    functions: &[deserializer::function::Function],
+) -> Result<(), DecompileError> {
+    let mut states = Vec::new();
+    states.try_reserve_exact(functions.len()).map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Validate,
+            None,
+            None,
+            "bounded prototype graph",
+            error.to_string(),
+        )
+    })?;
+    states.resize(functions.len(), 0u8);
+
+    let mut stack = Vec::new();
+    stack.try_reserve(functions.len()).map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Validate,
+            None,
+            None,
+            "bounded prototype graph",
+            error.to_string(),
+        )
+    })?;
+
+    for root in 0..functions.len() {
+        if states[root] != 0 {
+            continue;
+        }
+        states[root] = 1;
+        stack.push(PrototypeFrame::new(root));
+        while let Some(frame) = stack.last_mut() {
+            let function_id = frame.function;
+            let Some(child) = frame.next_child(&functions[function_id]) else {
+                states[function_id] = 2;
+                stack.pop();
+                continue;
+            };
+            if child >= functions.len() {
+                return Err(DecompileError::new(
+                    DecompilePhase::Validate,
+                    Some(function_id),
+                    None,
+                    "valid prototype graph",
+                    format!("prototype references missing child {child}"),
+                ));
+            }
+            match states[child] {
+                0 => {
+                    states[child] = 1;
+                    stack.push(PrototypeFrame::new(child));
+                }
+                1 => {
+                    return Err(DecompileError::new(
+                        DecompilePhase::Validate,
+                        Some(function_id),
+                        None,
+                        "acyclic prototype graph",
+                        format!("prototype cycle reaches child {child}"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, DecompileError> {
@@ -106,6 +207,7 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, Decompil
         let (function, function_upvalues) = decompile_function(ast_func, function, upvalues_in)?;
         decompiled_upvalues.insert(function, function_upvalues);
     }
+    drop(chunk);
 
     let main = ByAddress(main);
     decompiled_upvalues.remove(&main);
@@ -114,6 +216,7 @@ fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, Decompil
         link_upvalues(&mut body, &mut decompiled_upvalues);
         body
     })?;
+    drop(decompiled_upvalues);
     if block_contains_unsupported_nodes(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
@@ -179,7 +282,29 @@ fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
 
 #[cfg(test)]
 mod output_tests {
-    use super::block_contains_unsupported_nodes;
+    use super::{block_contains_unsupported_nodes, validate_prototype_graph};
+
+    fn prototype(functions: Vec<usize>) -> super::deserializer::function::Function {
+        super::deserializer::function::Function {
+            max_stack_size: 1,
+            num_parameters: 0,
+            num_upvalues: 0,
+            is_vararg: false,
+            flags: 0,
+            instructions: Vec::new(),
+            constants: Vec::new(),
+            functions,
+            line_defined: 0,
+            function_name: 0,
+            line_gap_log2: None,
+            line_info_delta: None,
+            abs_line_info_delta: None,
+            debug_locals: Vec::new(),
+            debug_upvalues: Vec::new(),
+            feedback: Vec::new(),
+            cost: None,
+        }
+    }
 
     #[test]
     fn rejects_unsupported_jump_nodes() {
@@ -197,6 +322,27 @@ mod output_tests {
         ]);
 
         assert!(block_contains_unsupported_nodes(&mut body));
+    }
+
+    #[test]
+    fn rejects_cyclic_prototype_graph() {
+        let functions = vec![prototype(vec![1]), prototype(vec![0])];
+
+        let error = validate_prototype_graph(&functions).unwrap_err();
+
+        assert_eq!(error.phase, super::DecompilePhase::Validate);
+        assert_eq!(error.invariant, "acyclic prototype graph");
+    }
+
+    #[test]
+    fn accepts_shared_acyclic_prototype_graph() {
+        let functions = vec![
+            prototype(vec![1, 2]),
+            prototype(vec![2]),
+            prototype(Vec::new()),
+        ];
+
+        validate_prototype_graph(&functions).unwrap();
     }
 }
 

@@ -396,10 +396,16 @@ Run:
 .tools/luau-windows/luau-compile.exe --binary -O1 -g1 tests/luau_corpus/results/connected-root-v1/connected-root.luau > tests/luau_corpus/results/connected-root-v1/recompiled.luac
 ```
 
-Use the existing static v6 reader in `C:/Users/Admin/Desktop/Script/stage4` to
-confirm both the input and recompiled chunks contain 380 prototypes and that
-the decompiled source contains no diagnostic stubs, cut-edge markers, or
-unsupported-operation placeholders.
+The parser is mandatory. Before treating recompilation as an acceptance gate,
+use the existing static v6 reader in `C:/Users/Admin/Desktop/Script/stage4` to
+compare the input's maximum declared stack with the pinned compiler's 200-local
+source ceiling. If the input fits, require the recompiled chunk to retain the
+input prototype and closure counts. If the input exceeds the ceiling, record
+the expected compiler rejection and instead require static traversal to confirm
+all 380 reachable prototypes and 379 closure edges. In both cases, require the
+decompiled source to contain no diagnostic stubs, cut-edge markers, internal
+gotos or set-list nodes, or unsupported-operation placeholders. Do not rewrite
+valid output solely to fit the lower compiler ceiling.
 
 - [ ] **Step 6: Commit only source changes if measurement required corrections**
 

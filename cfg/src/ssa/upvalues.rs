@@ -1,7 +1,10 @@
-use std::collections::{TryReserveError, VecDeque};
+use std::{
+    collections::{TryReserveError, VecDeque},
+    ops::RangeInclusive,
+};
 
 use petgraph::stable_graph::NodeIndex;
-use rangemap::RangeInclusiveMap;
+use petgraph::visit::{Dfs, Walker};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::function::Function;
@@ -82,12 +85,45 @@ impl EpochForest {
     }
 }
 
+#[derive(Debug, Default)]
+struct OpenRanges(Vec<(RangeInclusive<usize>, OpenSite)>);
+
+impl OpenRanges {
+    fn with_capacity(capacity: usize) -> Result<Self, UpvalueAnalysisError> {
+        let mut ranges = Vec::new();
+        reserve(ranges.try_reserve(capacity))?;
+        Ok(Self(ranges))
+    }
+
+    fn push(&mut self, range: RangeInclusive<usize>, site: OpenSite) {
+        self.0.push((range, site));
+    }
+
+    fn close_from(&mut self, statement: usize) {
+        let Some((range, _)) = self.0.last_mut() else {
+            return;
+        };
+        if !range.contains(&statement) {
+            return;
+        }
+        let start = *range.start();
+        if start < statement {
+            *range = start..=statement - 1;
+        } else {
+            self.0.pop();
+        }
+    }
+
+    fn get(&self, statement: usize) -> Option<OpenSite> {
+        self.0
+            .iter()
+            .find_map(|(range, site)| range.contains(&statement).then_some(*site))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct UpvaluesOpen {
-    pub open: FxHashMap<
-        NodeIndex,
-        FxHashMap<ast::RcLocal, RangeInclusiveMap<usize, Vec<(NodeIndex, usize)>>>,
-    >,
+    open: FxHashMap<NodeIndex, FxHashMap<ast::RcLocal, OpenRanges>>,
 }
 
 impl UpvaluesOpen {
@@ -95,16 +131,16 @@ impl UpvaluesOpen {
         function: &Function,
         old_locals: FxHashMap<ast::RcLocal, ast::RcLocal>,
     ) -> Result<Self, UpvalueAnalysisError> {
-        let mut nodes = function.blocks().map(|(node, _)| node).collect::<Vec<_>>();
+        let entry = (*function.entry()).ok_or_else(|| {
+            UpvalueAnalysisError::Resource("function has no control-flow entry".into())
+        })?;
+        let mut nodes = Vec::new();
+        reserve(nodes.try_reserve(function.graph().node_count()))?;
+        nodes.extend(Dfs::new(function.graph(), entry).iter(function.graph()));
         nodes.sort_unstable_by_key(|node| node.index());
 
         let capture_count = nodes.iter().try_fold(0usize, |count, &node| {
-            let references = function
-                .block(node)
-                .unwrap()
-                .iter()
-                .map(reference_capture_count)
-                .sum::<usize>();
+            let references = block_capture_count(function.block(node).unwrap())?;
             count
                 .checked_add(references)
                 .ok_or_else(|| UpvalueAnalysisError::Resource("capture count overflow".into()))
@@ -172,7 +208,10 @@ impl UpvaluesOpen {
             }
             if output_changed {
                 exit_states.insert(node, outgoing);
-                let mut successors = function.successor_blocks(node).collect::<Vec<_>>();
+                let successor_count = function.successor_blocks(node).count();
+                let mut successors = Vec::new();
+                reserve(successors.try_reserve(successor_count))?;
+                successors.extend(function.successor_blocks(node));
                 successors.sort_unstable_by_key(|successor| successor.index());
                 for successor in successors {
                     if queued.insert(successor) {
@@ -199,12 +238,7 @@ impl UpvaluesOpen {
         local: &ast::RcLocal,
         statement: usize,
     ) -> Option<OpenSite> {
-        self.open
-            .get(&node)?
-            .get(local)?
-            .get(&statement)?
-            .first()
-            .copied()
+        self.open.get(&node)?.get(local)?.get(statement)
     }
 }
 
@@ -221,6 +255,14 @@ fn reference_capture_count(statement: &ast::Statement) -> usize {
         .flat_map(|closure| &closure.upvalues)
         .filter(|upvalue| matches!(upvalue, ast::Upvalue::Ref(_)))
         .count()
+}
+
+fn block_capture_count(block: &ast::Block) -> Result<usize, UpvalueAnalysisError> {
+    block.iter().try_fold(0usize, |count, statement| {
+        count
+            .checked_add(reference_capture_count(statement))
+            .ok_or_else(|| UpvalueAnalysisError::Resource("block capture count overflow".into()))
+    })
 }
 
 fn for_each_reference_capture(
@@ -272,7 +314,10 @@ fn merge_predecessors(
     epochs: &mut EpochForest,
     captured_local_count: usize,
 ) -> Result<OpenState, UpvalueAnalysisError> {
-    let mut predecessors = function.predecessor_blocks(node).collect::<Vec<_>>();
+    let predecessor_count = function.predecessor_blocks(node).count();
+    let mut predecessors = Vec::new();
+    reserve(predecessors.try_reserve(predecessor_count))?;
+    predecessors.extend(function.predecessor_blocks(node));
     predecessors.sort_unstable_by_key(|predecessor| predecessor.index());
     let reserve_count = predecessors
         .iter()
@@ -305,7 +350,7 @@ fn transfer_block(
     state: &mut OpenState,
 ) -> Result<(), UpvalueAnalysisError> {
     let block = function.block(node).unwrap();
-    let additional = block.iter().map(reference_capture_count).sum();
+    let additional = block_capture_count(block)?;
     reserve(state.try_reserve(additional))?;
     for (statement, value) in block.iter().enumerate() {
         for_each_reference_capture(value, old_locals, |local| {
@@ -332,13 +377,7 @@ fn materialize_ranges(
     old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
     site_epochs: &SiteEpochs,
     epochs: &mut EpochForest,
-) -> Result<
-    FxHashMap<
-        NodeIndex,
-        FxHashMap<ast::RcLocal, RangeInclusiveMap<usize, Vec<(NodeIndex, usize)>>>,
-    >,
-    UpvalueAnalysisError,
-> {
+) -> Result<FxHashMap<NodeIndex, FxHashMap<ast::RcLocal, OpenRanges>>, UpvalueAnalysisError> {
     let mut open = FxHashMap::default();
     reserve(open.try_reserve(nodes.len()))?;
     for &node in nodes {
@@ -349,18 +388,38 @@ fn materialize_ranges(
         } else {
             empty_state(0)?
         };
-        let capture_count = block.iter().map(reference_capture_count).sum::<usize>();
+        let capture_count = block_capture_count(block)?;
         reserve(state.try_reserve(capture_count))?;
+        let mut capture_counts = FxHashMap::default();
+        reserve(capture_counts.try_reserve(capture_count))?;
+        for value in block.iter() {
+            for_each_reference_capture(value, old_locals, |local| {
+                let count = capture_counts.entry(local).or_insert(0usize);
+                *count = count.checked_add(1).expect("bounded by capture_count");
+            });
+        }
         let range_capacity = state
             .len()
-            .checked_add(capture_count)
+            .checked_add(capture_counts.len())
             .ok_or_else(|| UpvalueAnalysisError::Resource("range state count overflow".into()))?;
         let mut block_opened = FxHashMap::default();
         reserve(block_opened.try_reserve(range_capacity))?;
+        for (local, count) in capture_counts {
+            let capacity = count
+                .checked_add(usize::from(state.contains_key(&local)))
+                .ok_or_else(|| {
+                    UpvalueAnalysisError::Resource("local range count overflow".into())
+                })?;
+            block_opened.insert(local, OpenRanges::with_capacity(capacity)?);
+        }
         for (local, epoch) in &state {
-            let mut ranges = RangeInclusiveMap::new();
-            ranges.insert(0..=end, vec![epochs.site(*epoch)]);
-            block_opened.insert(local.clone(), ranges);
+            if let Some(ranges) = block_opened.get_mut(local) {
+                ranges.push(0..=end, epochs.site(*epoch));
+            } else {
+                let mut ranges = OpenRanges::with_capacity(1)?;
+                ranges.push(0..=end, epochs.site(*epoch));
+                block_opened.insert(local.clone(), ranges);
+            }
         }
 
         for (statement, value) in block.iter().enumerate() {
@@ -371,16 +430,16 @@ fn materialize_ranges(
                 } else {
                     state.insert(local.clone(), site_epoch);
                     block_opened
-                        .entry(local)
-                        .or_insert_with(RangeInclusiveMap::new)
-                        .insert(statement..=end, vec![epochs.site(site_epoch)]);
+                        .get_mut(&local)
+                        .expect("capture range capacity was reserved")
+                        .push(statement..=end, epochs.site(site_epoch));
                 }
             });
             if let ast::Statement::Close(close) = value {
                 for local in &close.locals {
                     state.remove(local);
                     if let Some(ranges) = block_opened.get_mut(local) {
-                        ranges.remove(statement..=end);
+                        ranges.close_from(statement);
                     }
                 }
             }
@@ -460,7 +519,7 @@ mod tests {
             .open
             .values()
             .flat_map(|locals| locals.values())
-            .flat_map(|ranges| ranges.iter().map(|(_, locations)| locations.len()))
+            .flat_map(|ranges| ranges.0.iter().map(|_| 1))
             .max()
             .unwrap_or_default();
 
@@ -560,5 +619,70 @@ mod tests {
         let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
 
         assert_eq!(analysis.opening_location(after_close, &captured, 0), None);
+    }
+
+    #[test]
+    fn unreachable_predecessor_does_not_open_capture_at_reachable_merge() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let merge = function.new_block();
+        let unreachable = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .block_mut(unreachable)
+            .unwrap()
+            .push(capture(&captured));
+        function
+            .graph_mut()
+            .add_edge(entry, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(unreachable, merge, BlockEdge::default());
+
+        let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+
+        assert_eq!(analysis.opening_location(merge, &captured, 0), None);
+    }
+
+    #[test]
+    fn close_and_reopen_create_disjoint_ranges_in_one_block() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().extend([
+            capture(&captured),
+            marker(),
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+            marker(),
+            capture(&captured),
+            marker(),
+        ]);
+
+        let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+
+        assert_eq!(
+            analysis.opening_location(entry, &captured, 0),
+            Some((entry, 0))
+        );
+        assert_eq!(
+            analysis.opening_location(entry, &captured, 1),
+            Some((entry, 0))
+        );
+        assert_eq!(analysis.opening_location(entry, &captured, 2), None);
+        assert_eq!(analysis.opening_location(entry, &captured, 3), None);
+        assert_eq!(
+            analysis.opening_location(entry, &captured, 4),
+            Some((entry, 4))
+        );
+        assert_eq!(
+            analysis.opening_location(entry, &captured, 5),
+            Some((entry, 4))
+        );
     }
 }
