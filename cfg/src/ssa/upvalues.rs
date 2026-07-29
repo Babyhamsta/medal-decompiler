@@ -106,3 +106,74 @@ impl UpvaluesOpen {
         this
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ast::{Assign, Closure, RcLocal, Upvalue};
+    use rustc_hash::FxHashMap;
+
+    use crate::{
+        block::{BlockEdge, BranchType},
+        function::Function,
+    };
+
+    use super::UpvaluesOpen;
+
+    fn capture(local: &RcLocal) -> ast::Statement {
+        Assign::new(
+            vec![RcLocal::default().into()],
+            vec![Closure {
+                function: Default::default(),
+                upvalues: vec![Upvalue::Ref(local.clone())],
+            }
+            .into()],
+        )
+        .into()
+    }
+
+    fn diamond_chain(depth: usize) -> (Function, RcLocal) {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        function.set_entry(entry);
+        function
+            .block_mut(entry)
+            .unwrap()
+            .push(capture(&captured));
+        let mut tail = entry;
+
+        for _ in 0..depth {
+            let detour = function.new_block();
+            let merge = function.new_block();
+            function
+                .graph_mut()
+                .add_edge(tail, detour, BlockEdge::new(BranchType::Else));
+            function
+                .graph_mut()
+                .add_edge(tail, merge, BlockEdge::new(BranchType::Then));
+            function
+                .graph_mut()
+                .add_edge(detour, merge, BlockEdge::default());
+            tail = merge;
+        }
+
+        (function, captured)
+    }
+
+    #[test]
+    fn diamond_paths_keep_one_canonical_opening() {
+        let (function, captured) = diamond_chain(8);
+        let old_locals = FxHashMap::from_iter([(captured.clone(), captured)]);
+
+        let analysis = UpvaluesOpen::new(&function, old_locals);
+        let maximum_locations = analysis
+            .open
+            .values()
+            .flat_map(|locals| locals.values())
+            .flat_map(|ranges| ranges.iter().map(|(_, locations)| locations.len()))
+            .max()
+            .unwrap_or_default();
+
+        assert_eq!(maximum_locations, 1);
+    }
+}
