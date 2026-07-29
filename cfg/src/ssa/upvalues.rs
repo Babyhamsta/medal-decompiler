@@ -20,6 +20,8 @@ struct EpochId(usize);
 pub enum UpvalueAnalysisError {
     #[error("unable to reserve bounded upvalue state: {0}")]
     Resource(String),
+    #[error("path-dependent upvalue openness at control-flow merge block {block}")]
+    PathDependentMerge { block: usize },
 }
 
 #[derive(Debug, Default)]
@@ -221,6 +223,13 @@ impl UpvaluesOpen {
             }
         }
 
+        validate_merge_openness(
+            function,
+            &nodes,
+            &exit_states,
+            &old_locals,
+            captured_local_count,
+        )?;
         let open = materialize_ranges(
             function,
             &nodes,
@@ -339,6 +348,190 @@ fn merge_predecessors(
         }
     }
     Ok(incoming)
+}
+
+fn validate_merge_openness(
+    function: &Function,
+    nodes: &[NodeIndex],
+    exit_states: &FxHashMap<NodeIndex, OpenState>,
+    old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    captured_local_count: usize,
+) -> Result<(), UpvalueAnalysisError> {
+    let mut presence = FxHashMap::default();
+    reserve(presence.try_reserve(captured_local_count))?;
+    let mut validated = FxHashSet::default();
+    reserve(validated.try_reserve(captured_local_count))?;
+    for &node in nodes {
+        presence.clear();
+        let mut predecessor_count = 0usize;
+        for predecessor in function.predecessor_blocks(node) {
+            let Some(state) = exit_states.get(&predecessor) else {
+                continue;
+            };
+            predecessor_count = predecessor_count.checked_add(1).ok_or_else(|| {
+                UpvalueAnalysisError::Resource("predecessor count overflow".into())
+            })?;
+            for (local, epoch) in state {
+                let entry = presence
+                    .entry(local.clone())
+                    .or_insert((0usize, *epoch, false));
+                entry.0 = entry.0.checked_add(1).ok_or_else(|| {
+                    UpvalueAnalysisError::Resource("merge presence count overflow".into())
+                })?;
+                entry.2 |= entry.1 != *epoch;
+            }
+        }
+        if predecessor_count <= 1 {
+            continue;
+        }
+        for (local, &(open_count, _, distinct_epoch)) in &presence {
+            if open_count == predecessor_count && !distinct_epoch {
+                continue;
+            }
+            if validated.insert(local.clone()) {
+                validate_local_merge_openness(function, nodes, exit_states, old_locals, local)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_merge_openness(
+    function: &Function,
+    nodes: &[NodeIndex],
+    exit_states: &FxHashMap<NodeIndex, OpenState>,
+    old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    local: &ast::RcLocal,
+) -> Result<(), UpvalueAnalysisError> {
+    let history = capture_history_flags(function, nodes, old_locals, local)?;
+    for &node in nodes {
+        let mut predecessor_count = 0usize;
+        let mut open_count = 0usize;
+        let mut first_epoch = None;
+        let mut distinct_epoch = false;
+        for predecessor in function.predecessor_blocks(node) {
+            let Some(state) = exit_states.get(&predecessor) else {
+                continue;
+            };
+            predecessor_count = predecessor_count.checked_add(1).ok_or_else(|| {
+                UpvalueAnalysisError::Resource("predecessor count overflow".into())
+            })?;
+            if let Some(epoch) = state.get(local) {
+                open_count = open_count.checked_add(1).ok_or_else(|| {
+                    UpvalueAnalysisError::Resource("merge presence count overflow".into())
+                })?;
+                if let Some(first_epoch) = first_epoch {
+                    distinct_epoch |= first_epoch != *epoch;
+                } else {
+                    first_epoch = Some(*epoch);
+                }
+            }
+        }
+        if predecessor_count <= 1
+            || open_count == 0
+            || (open_count == predecessor_count && !distinct_epoch)
+        {
+            continue;
+        }
+
+        let mut reopened = false;
+        for predecessor in function.predecessor_blocks(node) {
+            let Some(state) = exit_states.get(&predecessor) else {
+                continue;
+            };
+            let flags = history[predecessor.index()];
+            if state.contains_key(local) {
+                reopened |= flags & CAPTURE_REOPENED != 0;
+            } else if flags & CAPTURE_CLOSED != 0 {
+                return Err(UpvalueAnalysisError::PathDependentMerge {
+                    block: node.index(),
+                });
+            }
+        }
+        if distinct_epoch && reopened {
+            return Err(UpvalueAnalysisError::PathDependentMerge {
+                block: node.index(),
+            });
+        }
+    }
+    Ok(())
+}
+
+const CAPTURE_NEVER: u8 = 1;
+const CAPTURE_OPEN: u8 = 2;
+const CAPTURE_CLOSED: u8 = 4;
+const CAPTURE_REOPENED: u8 = 8;
+
+fn capture_history_flags(
+    function: &Function,
+    nodes: &[NodeIndex],
+    old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    tracked_local: &ast::RcLocal,
+) -> Result<Vec<u8>, UpvalueAnalysisError> {
+    let state_count = if let Some(node) = nodes.last() {
+        node.index()
+            .checked_add(1)
+            .ok_or_else(|| UpvalueAnalysisError::Resource("node index overflow".into()))?
+    } else {
+        0
+    };
+    let mut exit_flags = Vec::new();
+    reserve(exit_flags.try_reserve_exact(state_count))?;
+    exit_flags.resize(state_count, 0u8);
+    let mut worklist = VecDeque::new();
+    reserve(worklist.try_reserve(nodes.len()))?;
+    let mut queued = FxHashSet::default();
+    reserve(queued.try_reserve(nodes.len()))?;
+    for &node in nodes {
+        worklist.push_back(node);
+        queued.insert(node);
+    }
+    let entry = function.entry().unwrap();
+
+    while let Some(node) = worklist.pop_front() {
+        queued.remove(&node);
+        let mut flags = if node == entry { CAPTURE_NEVER } else { 0 };
+        for predecessor in function.predecessor_blocks(node) {
+            flags |= exit_flags[predecessor.index()];
+        }
+        for statement in function.block(node).unwrap().iter() {
+            let mut captures = false;
+            for_each_reference_capture(statement, old_locals, |local| {
+                captures |= &local == tracked_local;
+            });
+            if captures && flags != 0 {
+                flags = if flags & (CAPTURE_NEVER | CAPTURE_OPEN) != 0 {
+                    CAPTURE_OPEN
+                } else {
+                    0
+                } | if flags & (CAPTURE_CLOSED | CAPTURE_REOPENED) != 0 {
+                    CAPTURE_REOPENED
+                } else {
+                    0
+                };
+            }
+            if let ast::Statement::Close(close) = statement
+                && close.locals.contains(tracked_local)
+            {
+                flags = (flags & CAPTURE_NEVER)
+                    | if flags & (CAPTURE_OPEN | CAPTURE_CLOSED | CAPTURE_REOPENED) != 0 {
+                        CAPTURE_CLOSED
+                    } else {
+                        0
+                    };
+            }
+        }
+        if exit_flags[node.index()] != flags {
+            exit_flags[node.index()] = flags;
+            for successor in function.successor_blocks(node) {
+                if queued.insert(successor) {
+                    worklist.push_back(successor);
+                }
+            }
+        }
+    }
+
+    Ok(exit_flags)
 }
 
 fn transfer_block(
@@ -560,6 +753,42 @@ mod tests {
     }
 
     #[test]
+    fn never_captured_path_does_not_conflict_with_open_path() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let captures = function.new_block();
+        let bypasses = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function
+            .block_mut(captures)
+            .unwrap()
+            .push(capture(&captured));
+        function.block_mut(bypasses).unwrap().push(marker());
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, captures, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, bypasses, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(captures, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(bypasses, merge, BlockEdge::default());
+
+        let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+
+        assert_eq!(
+            analysis.opening_location(merge, &captured, 0),
+            Some((captures, 0))
+        );
+    }
+
+    #[test]
     fn loop_carries_the_open_capture_over_its_back_edge() {
         let captured = RcLocal::default();
         let mut function = Function::new(0);
@@ -644,6 +873,87 @@ mod tests {
         let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
 
         assert_eq!(analysis.opening_location(merge, &captured, 0), None);
+    }
+
+    #[test]
+    fn conditional_close_is_rejected_at_reachable_merge() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let closes = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(capture(&captured));
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function.block_mut(keeps_open).unwrap().push(marker());
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, closes, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, keeps_open, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(closes, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+
+        let error = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::UpvalueAnalysisError::PathDependentMerge { block }
+                if block == merge.index()
+        ));
+    }
+
+    #[test]
+    fn conditional_close_and_reopen_is_rejected_at_reachable_merge() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let reopens = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(capture(&captured));
+        function.block_mut(reopens).unwrap().extend([
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+            capture(&captured),
+        ]);
+        function.block_mut(keeps_open).unwrap().push(marker());
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, reopens, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, keeps_open, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(reopens, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+
+        let error = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::UpvalueAnalysisError::PathDependentMerge { block }
+                if block == merge.index()
+        ));
     }
 
     #[test]

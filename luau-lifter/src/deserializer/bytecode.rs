@@ -19,10 +19,14 @@ impl Bytecode {
         match status_code {
             0 => {
                 let (input, error_msg) = take(input.len())(input)?;
-                Ok((
-                    input,
-                    Bytecode::Error(String::from_utf8_lossy(error_msg).to_string()),
-                ))
+                let error_msg = std::str::from_utf8(error_msg)
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::Verify)))?;
+                let mut message = String::new();
+                message
+                    .try_reserve_exact(error_msg.len())
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))?;
+                message.push_str(error_msg);
+                Ok((input, Bytecode::Error(message)))
             }
             4..=12 => {
                 let version = BytecodeVersion::new(status_code)

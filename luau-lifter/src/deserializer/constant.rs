@@ -74,12 +74,12 @@ impl Constant {
             }
             CONSTANT_TABLE => {
                 let (input, keys) = parse_list(input, leb128_usize)?;
-                Ok((
-                    input,
-                    Constant::Table {
-                        entries: keys.into_iter().map(|key| (key, None)).collect(),
-                    },
-                ))
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(keys.len())
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))?;
+                entries.extend(keys.into_iter().map(|key| (key, None)));
+                Ok((input, Constant::Table { entries }))
             }
             CONSTANT_CLOSURE => {
                 let (input, f_id) = leb128_usize(input)?;
@@ -94,7 +94,13 @@ impl Constant {
             }
             CONSTANT_TABLE_WITH_CONSTANTS => {
                 let (mut input, entry_count) = leb128_usize(input)?;
-                let mut entries = Vec::with_capacity(entry_count);
+                if entry_count > input.len() {
+                    return Err(Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+                }
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(entry_count)
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))?;
                 for _ in 0..entry_count {
                     let (next, key) = leb128_usize(input)?;
                     let (next, value) = le_i32(next)?;

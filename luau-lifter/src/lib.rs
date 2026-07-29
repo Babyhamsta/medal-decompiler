@@ -90,8 +90,23 @@ fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<Strin
         ));
     };
 
-    validate_prototype_graph(&chunk.functions)?;
-    decompile_chunk(chunk)
+    let prototype_order = validate_prototype_graph(&chunk.functions)?;
+    let expansion = validate_expansion_budget(
+        &chunk.functions,
+        chunk.main,
+        &prototype_order,
+        bytecode.len(),
+    )?;
+    decompile_chunk(chunk, expansion)
+}
+
+const MAX_SAFE_PROTOTYPE_DEPTH: usize = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpansionPlan {
+    instances: usize,
+    instructions: usize,
+    occurrences: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -127,7 +142,7 @@ impl PrototypeFrame {
 
 fn validate_prototype_graph(
     functions: &[deserializer::function::Function],
-) -> Result<(), DecompileError> {
+) -> Result<Vec<usize>, DecompileError> {
     let mut states = Vec::new();
     states.try_reserve_exact(functions.len()).map_err(|error| {
         DecompileError::new(
@@ -139,6 +154,19 @@ fn validate_prototype_graph(
         )
     })?;
     states.resize(functions.len(), 0u8);
+
+    let mut postorder = Vec::new();
+    postorder
+        .try_reserve_exact(functions.len())
+        .map_err(|error| {
+            DecompileError::new(
+                DecompilePhase::Validate,
+                None,
+                None,
+                "bounded prototype graph",
+                error.to_string(),
+            )
+        })?;
 
     let mut stack = Vec::new();
     stack.try_reserve(functions.len()).map_err(|error| {
@@ -161,6 +189,7 @@ fn validate_prototype_graph(
             let function_id = frame.function;
             let Some(child) = frame.next_child(&functions[function_id]) else {
                 states[function_id] = 2;
+                postorder.push(function_id);
                 stack.pop();
                 continue;
             };
@@ -191,21 +220,357 @@ fn validate_prototype_graph(
             }
         }
     }
-    Ok(())
+    postorder.reverse();
+    Ok(postorder)
 }
 
-fn decompile_chunk(chunk: deserializer::chunk::Chunk) -> Result<String, DecompileError> {
+fn closure_child(
+    functions: &[deserializer::function::Function],
+    function_id: usize,
+    instruction: &instruction::Instruction,
+) -> Result<Option<usize>, DecompileError> {
+    let function = &functions[function_id];
+    let instruction::Instruction::AD { op_code, d, .. } = instruction else {
+        return Ok(None);
+    };
+    if !matches!(
+        op_code,
+        op_code::OpCode::LOP_NEWCLOSURE | op_code::OpCode::LOP_DUPCLOSURE
+    ) {
+        return Ok(None);
+    }
+    let index = usize::try_from(*d).map_err(|_| {
+        DecompileError::new(
+            DecompilePhase::Validate,
+            Some(function_id),
+            None,
+            "valid closure reference",
+            format!("negative closure operand {d}"),
+        )
+    })?;
+    let child = match op_code {
+        op_code::OpCode::LOP_NEWCLOSURE => function.functions.get(index).copied(),
+        op_code::OpCode::LOP_DUPCLOSURE => function.constants.get(index).and_then(|constant| {
+            if let deserializer::constant::Constant::Closure(child) = constant {
+                Some(*child)
+            } else {
+                None
+            }
+        }),
+        _ => unreachable!(),
+    }
+    .ok_or_else(|| {
+        DecompileError::new(
+            DecompilePhase::Validate,
+            Some(function_id),
+            None,
+            "valid closure reference",
+            format!("{op_code:?} operand {index} does not reference a prototype"),
+        )
+    })?;
+    if child >= functions.len() {
+        return Err(DecompileError::new(
+            DecompilePhase::Validate,
+            Some(function_id),
+            None,
+            "valid closure reference",
+            format!("{op_code:?} references missing prototype {child}"),
+        ));
+    }
+    Ok(Some(child))
+}
+
+fn validate_expansion_budget(
+    functions: &[deserializer::function::Function],
+    main: usize,
+    prototype_order: &[usize],
+    input_bytes: usize,
+) -> Result<ExpansionPlan, DecompileError> {
+    let mut occurrences = Vec::new();
+    occurrences
+        .try_reserve_exact(functions.len())
+        .map_err(|error| {
+            DecompileError::new(
+                DecompilePhase::Validate,
+                None,
+                None,
+                "bounded prototype expansion",
+                error.to_string(),
+            )
+        })?;
+    occurrences.resize(functions.len(), 0usize);
+    occurrences[main] = 1;
+
+    let mut depths = Vec::new();
+    depths.try_reserve_exact(functions.len()).map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Validate,
+            None,
+            None,
+            "bounded prototype expansion",
+            error.to_string(),
+        )
+    })?;
+    depths.resize(functions.len(), 0usize);
+    depths[main] = 1;
+
+    let mut instances = 0usize;
+    let mut instructions = 0usize;
+    for &function_id in prototype_order {
+        let occurrence_count = occurrences[function_id];
+        if occurrence_count == 0 {
+            continue;
+        }
+        instances = instances.checked_add(occurrence_count).ok_or_else(|| {
+            DecompileError::new(
+                DecompilePhase::Validate,
+                Some(function_id),
+                None,
+                "bounded prototype expansion",
+                "expanded prototype count overflow",
+            )
+        })?;
+        let expanded_instructions = functions[function_id]
+            .instructions
+            .len()
+            .checked_mul(occurrence_count)
+            .ok_or_else(|| {
+                DecompileError::new(
+                    DecompilePhase::Validate,
+                    Some(function_id),
+                    None,
+                    "bounded prototype expansion",
+                    "expanded instruction count overflow",
+                )
+            })?;
+        instructions = instructions
+            .checked_add(expanded_instructions)
+            .ok_or_else(|| {
+                DecompileError::new(
+                    DecompilePhase::Validate,
+                    Some(function_id),
+                    None,
+                    "bounded prototype expansion",
+                    "expanded instruction count overflow",
+                )
+            })?;
+        if instances > input_bytes || instructions > input_bytes {
+            return Err(DecompileError::new(
+                DecompilePhase::Validate,
+                Some(function_id),
+                None,
+                "bounded prototype expansion",
+                format!("expanded work exceeds the input-sized budget of {input_bytes} units"),
+            ));
+        }
+
+        let child_depth = depths[function_id].checked_add(1).ok_or_else(|| {
+            DecompileError::new(
+                DecompilePhase::Validate,
+                Some(function_id),
+                None,
+                "bounded prototype depth",
+                "prototype depth overflow",
+            )
+        })?;
+        for instruction in &functions[function_id].instructions {
+            let Some(child) = closure_child(functions, function_id, instruction)? else {
+                continue;
+            };
+            occurrences[child] = occurrences[child]
+                .checked_add(occurrence_count)
+                .ok_or_else(|| {
+                    DecompileError::new(
+                        DecompilePhase::Validate,
+                        Some(function_id),
+                        None,
+                        "bounded prototype expansion",
+                        "expanded prototype count overflow",
+                    )
+                })?;
+            depths[child] = depths[child].max(child_depth);
+            if depths[child] > MAX_SAFE_PROTOTYPE_DEPTH {
+                return Err(DecompileError::new(
+                    DecompilePhase::Validate,
+                    Some(child),
+                    None,
+                    "bounded prototype depth",
+                    format!(
+                        "expanded closure depth {} exceeds the safe limit {MAX_SAFE_PROTOTYPE_DEPTH}",
+                        depths[child]
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(ExpansionPlan {
+        instances,
+        instructions,
+        occurrences,
+    })
+}
+
+fn release_lifted_prototype(function: &mut deserializer::function::Function) {
+    function.instructions = Vec::new();
+    function.constants = Vec::new();
+    function.functions = Vec::new();
+    function.line_info_delta = None;
+    function.abs_line_info_delta = None;
+    function.debug_locals = Vec::new();
+    function.debug_upvalues = Vec::new();
+    function.feedback = Vec::new();
+}
+
+fn decompile_chunk(
+    mut chunk: deserializer::chunk::Chunk,
+    expansion: ExpansionPlan,
+) -> Result<String, DecompileError> {
+    let ExpansionPlan {
+        instances: planned_instances,
+        instructions: planned_instructions,
+        occurrences: mut remaining_instances,
+    } = expansion;
+    let function_count = chunk.functions.len();
     let main = Arc::<Mutex<ast::Function>>::default();
-    let mut stack = vec![(main.clone(), chunk.main)];
+    let mut stack = Vec::new();
+    stack.try_reserve_exact(function_count).map_err(|error| {
+        DecompileError::new(
+            DecompilePhase::Lift,
+            None,
+            None,
+            "bounded prototype expansion",
+            error.to_string(),
+        )
+    })?;
+    stack.push((main.clone(), chunk.main));
+    let mut scheduled_instances = 1usize;
+    let mut processed_instructions = 0usize;
+
     let mut decompiled_upvalues = FxHashMap::default();
+    decompiled_upvalues
+        .try_reserve(function_count.min(planned_instances))
+        .map_err(|error| {
+            DecompileError::new(
+                DecompilePhase::Lift,
+                None,
+                None,
+                "bounded prototype expansion",
+                error.to_string(),
+            )
+        })?;
     while let Some((ast_func, func_id)) = stack.pop() {
+        let remaining = remaining_instances.get_mut(func_id).ok_or_else(|| {
+            DecompileError::new(
+                DecompilePhase::Validate,
+                Some(func_id),
+                None,
+                "bounded prototype expansion",
+                "scheduled prototype is outside the validated expansion plan",
+            )
+        })?;
+        if *remaining == 0 {
+            return Err(DecompileError::new(
+                DecompilePhase::Validate,
+                Some(func_id),
+                None,
+                "bounded prototype expansion",
+                "scheduled prototype exceeds its validated occurrence count",
+            ));
+        }
+        processed_instructions = processed_instructions
+            .checked_add(chunk.functions[func_id].instructions.len())
+            .ok_or_else(|| {
+                DecompileError::new(
+                    DecompilePhase::Lift,
+                    Some(func_id),
+                    None,
+                    "bounded prototype expansion",
+                    "processed instruction count overflow",
+                )
+            })?;
         let (function, upvalues_in, child_functions) =
             catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
                 Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
             })?;
-        stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+        *remaining -= 1;
+        if *remaining == 0 {
+            release_lifted_prototype(&mut chunk.functions[func_id]);
+        }
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(child_functions.len())
+            .map_err(|error| {
+                DecompileError::new(
+                    DecompilePhase::Lift,
+                    Some(func_id),
+                    None,
+                    "bounded prototype expansion",
+                    error.to_string(),
+                )
+            })?;
+        children.extend(
+            child_functions
+                .into_iter()
+                .map(|(function, id)| (function.0, id)),
+        );
+        children.sort_unstable_by_key(|(_, id)| *id);
+        stack.try_reserve(children.len()).map_err(|error| {
+            DecompileError::new(
+                DecompilePhase::Lift,
+                Some(func_id),
+                None,
+                "bounded prototype expansion",
+                error.to_string(),
+            )
+        })?;
+        for (function, child_id) in children {
+            scheduled_instances = scheduled_instances.checked_add(1).ok_or_else(|| {
+                DecompileError::new(
+                    DecompilePhase::Lift,
+                    Some(func_id),
+                    None,
+                    "bounded prototype expansion",
+                    "scheduled prototype count overflow",
+                )
+            })?;
+            if scheduled_instances > planned_instances {
+                return Err(DecompileError::new(
+                    DecompilePhase::Validate,
+                    Some(func_id),
+                    None,
+                    "bounded prototype expansion",
+                    "scheduled prototype count exceeds the validated expansion plan",
+                ));
+            }
+            stack.push((function, child_id));
+        }
         let (function, function_upvalues) = decompile_function(ast_func, function, upvalues_in)?;
+        decompiled_upvalues.try_reserve(1).map_err(|error| {
+            DecompileError::new(
+                DecompilePhase::Lift,
+                Some(func_id),
+                None,
+                "bounded prototype expansion",
+                error.to_string(),
+            )
+        })?;
         decompiled_upvalues.insert(function, function_upvalues);
+    }
+    if scheduled_instances != planned_instances
+        || processed_instructions != planned_instructions
+        || remaining_instances.iter().any(|remaining| *remaining != 0)
+    {
+        return Err(DecompileError::new(
+            DecompilePhase::Validate,
+            None,
+            None,
+            "bounded prototype expansion",
+            format!(
+                "validated {} instances/{} instructions but processed \
+                 {scheduled_instances}/{processed_instructions}",
+                planned_instances, planned_instructions
+            ),
+        ));
     }
     drop(chunk);
 
@@ -282,7 +647,10 @@ fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
 
 #[cfg(test)]
 mod output_tests {
-    use super::{block_contains_unsupported_nodes, validate_prototype_graph};
+    use super::{
+        ExpansionPlan, MAX_SAFE_PROTOTYPE_DEPTH, block_contains_unsupported_nodes,
+        validate_expansion_budget, validate_prototype_graph,
+    };
 
     fn prototype(functions: Vec<usize>) -> super::deserializer::function::Function {
         super::deserializer::function::Function {
@@ -304,6 +672,35 @@ mod output_tests {
             feedback: Vec::new(),
             cost: None,
         }
+    }
+
+    fn closure_prototype(
+        functions: Vec<usize>,
+        child_slots: &[usize],
+    ) -> super::deserializer::function::Function {
+        let mut prototype = prototype(functions);
+        prototype.instructions = child_slots
+            .iter()
+            .map(|&slot| super::instruction::Instruction::AD {
+                op_code: super::op_code::OpCode::LOP_NEWCLOSURE,
+                a: 0,
+                d: i16::try_from(slot).unwrap(),
+                aux: 0,
+            })
+            .collect();
+        prototype
+    }
+
+    fn duplicate_closure_prototype(child: usize) -> super::deserializer::function::Function {
+        let mut prototype = prototype(Vec::new());
+        prototype.constants = vec![super::deserializer::constant::Constant::Closure(child)];
+        prototype.instructions = vec![super::instruction::Instruction::AD {
+            op_code: super::op_code::OpCode::LOP_DUPCLOSURE,
+            a: 0,
+            d: 0,
+            aux: 0,
+        }];
+        prototype
     }
 
     #[test]
@@ -343,6 +740,88 @@ mod output_tests {
         ];
 
         validate_prototype_graph(&functions).unwrap();
+    }
+
+    #[test]
+    fn budgets_repeated_shared_prototype_instantiation() {
+        let functions = vec![
+            closure_prototype(vec![1, 2], &[0, 1]),
+            closure_prototype(vec![2], &[0]),
+            prototype(Vec::new()),
+        ];
+        let order = validate_prototype_graph(&functions).unwrap();
+
+        let plan = validate_expansion_budget(&functions, 0, &order, 100).unwrap();
+
+        assert_eq!(
+            plan,
+            ExpansionPlan {
+                instances: 4,
+                instructions: 3,
+                occurrences: vec![1, 1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn budgets_duplicate_closure_constant_instantiation() {
+        let functions = vec![duplicate_closure_prototype(1), prototype(Vec::new())];
+        let order = validate_prototype_graph(&functions).unwrap();
+
+        let plan = validate_expansion_budget(&functions, 0, &order, 100).unwrap();
+
+        assert_eq!(
+            plan,
+            ExpansionPlan {
+                instances: 2,
+                instructions: 1,
+                occurrences: vec![1, 1],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_closure_constant_cycle() {
+        let functions = vec![
+            duplicate_closure_prototype(1),
+            duplicate_closure_prototype(0),
+        ];
+
+        assert!(validate_prototype_graph(&functions).is_err());
+    }
+
+    #[test]
+    fn rejects_exponential_prototype_work_past_input_sized_budget() {
+        let mut functions = Vec::new();
+        for function_id in 0..8 {
+            functions.push(if function_id == 7 {
+                prototype(Vec::new())
+            } else {
+                closure_prototype(vec![function_id + 1], &[0, 0])
+            });
+        }
+        let order = validate_prototype_graph(&functions).unwrap();
+
+        let error = validate_expansion_budget(&functions, 0, &order, 32).unwrap_err();
+
+        assert_eq!(error.invariant, "bounded prototype expansion");
+    }
+
+    #[test]
+    fn rejects_prototype_depth_past_safe_recursive_phase_limit() {
+        let mut functions = Vec::new();
+        for function_id in 0..=MAX_SAFE_PROTOTYPE_DEPTH {
+            functions.push(if function_id == MAX_SAFE_PROTOTYPE_DEPTH {
+                prototype(Vec::new())
+            } else {
+                closure_prototype(vec![function_id + 1], &[0])
+            });
+        }
+        let order = validate_prototype_graph(&functions).unwrap();
+
+        let error = validate_expansion_budget(&functions, 0, &order, usize::MAX).unwrap_err();
+
+        assert_eq!(error.invariant, "bounded prototype depth");
     }
 }
 

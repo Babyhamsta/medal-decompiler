@@ -40,7 +40,13 @@ impl Chunk {
 
         let (next, function_count) = leb128_usize(input)?;
         input = next;
-        let mut functions = Vec::with_capacity(function_count);
+        if function_count > input.len() {
+            return Err(Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+        }
+        let mut functions = Vec::new();
+        functions
+            .try_reserve_exact(function_count)
+            .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))?;
         for _ in 0..function_count {
             if version.has_sized_prototypes() {
                 let (next, prototype_size) = leb128_usize(input)?;
