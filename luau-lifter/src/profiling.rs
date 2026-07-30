@@ -35,7 +35,7 @@ pub use inactive::report_to_stderr;
 mod active {
     use super::DecompilePhase;
     use std::{
-        alloc::{GlobalAlloc, Layout, System},
+        alloc::{GlobalAlloc, Layout},
         cell::RefCell,
         collections::HashMap,
         sync::{
@@ -88,11 +88,19 @@ mod active {
         CHECKPOINTS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
+    /// The allocator being measured. Tracking wraps whichever allocator the
+    /// build selects, so profiling reflects the production configuration
+    /// rather than always measuring the system heap.
+    #[cfg(feature = "mimalloc")]
+    const BASE: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #[cfg(not(feature = "mimalloc"))]
+    const BASE: std::alloc::System = std::alloc::System;
+
     pub struct TrackingAllocator;
 
     unsafe impl GlobalAlloc for TrackingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let pointer = unsafe { System.alloc(layout) };
+            let pointer = unsafe { BASE.alloc(layout) };
             if !pointer.is_null() {
                 record_allocation(layout.size());
             }
@@ -100,7 +108,7 @@ mod active {
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            let pointer = unsafe { System.alloc_zeroed(layout) };
+            let pointer = unsafe { BASE.alloc_zeroed(layout) };
             if !pointer.is_null() {
                 record_allocation(layout.size());
             }
@@ -109,11 +117,11 @@ mod active {
 
         unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-            unsafe { System.dealloc(pointer, layout) }
+            unsafe { BASE.dealloc(pointer, layout) }
         }
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+            let new_pointer = unsafe { BASE.realloc(pointer, layout, new_size) };
             if !new_pointer.is_null() {
                 if new_size >= layout.size() {
                     record_allocation(new_size - layout.size());
@@ -125,7 +133,22 @@ mod active {
         }
     }
 
+    /// Allocation-size buckets, upper bound in bytes; the last bucket is
+    /// everything larger. Small buckets separate per-node traversal
+    /// temporaries from genuine data structures.
+    const SIZE_BUCKETS: [usize; 9] = [8, 16, 32, 64, 128, 256, 1024, 4096, usize::MAX];
+    static SIZE_HISTOGRAM: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+    fn record_size(size: usize) {
+        let bucket = SIZE_BUCKETS
+            .iter()
+            .position(|&bound| size <= bound)
+            .unwrap_or(SIZE_BUCKETS.len() - 1);
+        SIZE_HISTOGRAM[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_allocation(size: usize) {
+        record_size(size);
         TOTAL_ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
         TOTAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
@@ -286,6 +309,23 @@ mod active {
             TOTAL_ALLOCATIONS.load(Ordering::Relaxed),
             LIVE.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
         ));
+
+        out.push_str("  \"size_histogram\": [\n");
+        for (index, bound) in SIZE_BUCKETS.iter().enumerate() {
+            if index > 0 {
+                out.push_str(",\n");
+            }
+            let label = if *bound == usize::MAX {
+                "over-4096".to_owned()
+            } else {
+                format!("upto-{bound}")
+            };
+            out.push_str(&format!(
+                "    {{\"bytes\": \"{label}\", \"count\": {}}}",
+                SIZE_HISTOGRAM[index].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str("\n  ],\n");
 
         out.push_str("  \"checkpoints\": [\n");
         let recorded = checkpoints().lock().unwrap().clone();

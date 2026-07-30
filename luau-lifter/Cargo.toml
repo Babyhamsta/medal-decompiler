@@ -26,11 +26,16 @@ rayon = "1.5.3"
 triomphe = "0.1.8"
 parking_lot = "0.12.1"
 walkdir = "2.3.2"
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
+# mimalloc is on by default for native builds. luau-worker targets wasm,
+# where it cannot build, and opts out with default-features = false.
+default = ["mimalloc"]
 dhat-heap = []
 panic-handled = []
 profiling = []
+mimalloc = ["dep:mimalloc"]
 # Cross-checks the inline pass's change flag against a full structural
 # fingerprint on every round. Validation only; never enable in a release build.
 verify-inline-change = []

@@ -45,6 +45,14 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[global_allocator]
 static ALLOC: profiling::TrackingAllocator = profiling::TrackingAllocator;
 
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "profiling"),
+    not(feature = "dhat-heap")
+))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub use profiling::report_to_stderr as report_profile;
 
 #[derive(Parser, Debug)]
