@@ -206,9 +206,9 @@ end
                 ";d2;s1:x;d3;s1:y;d4;s1:z;d5;s8:fallback;}]"
             ),
             "11_conditional_expression": (
-                "p5[t2{s3:tag;s3:low;s5:value;d1;}t2{s3:tag;s6:inside;s5:value;d7;}t2{s3"
+                "p6[t2{s3:tag;s3:low;s5:value;d1;}t2{s3:tag;s6:inside;s5:value;d7;}t2{s3"
                 ":tag;s4:high;s5:value;d12;}t2{s3:tag;s3:low;s5:value;d-4;}t2{s3:tag;s4:"
-                "high;s5:value;d18;}]"
+                "high;s5:value;d18;}t2{s3:tag;s6:inside;s5:value;d4;}]"
             ),
             "12_while_break_continue": "p4[d20;d7;d4;d6;]",
             "13_repeat_until": "p2[d10;d6;]",
@@ -255,6 +255,14 @@ end
                 "b0;s7:missing;s6:absent;"
                 "d20;d2;t2{d1;d5;d2;d8;}]"
             ),
+            "27_register_array_vm": "p6[d4;d13;d-2;d-6;d0;d0;]",
+            "28_escaping_slot_table": "p4[d110;d111;d96;d97;]",
+            "29_slot_metatable": (
+                "p8[d1006;d3014;d6;d2014;d1022;d3046;d22;d2046;]"
+            ),
+            "30_aliased_slot_write": "p6[d56;d112;d112;d49;d98;d98;]",
+            "31_nonconstant_slot_key": "p9[d11;d12;n;d4;d5;n;d4;d5;d11;]",
+            "32_slot_across_control_flow": "p6[d8;d24;d32;d8;d5;d13;]",
         }
 
         for case_name, normalized in expected.items():

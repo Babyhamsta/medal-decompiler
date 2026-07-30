@@ -49,6 +49,12 @@ _PROBE_NAMES = (
     "24_wonky_integration",
     "25_product_controller",
     "26_adversarial_dataflow",
+    "27_register_array_vm",
+    "28_escaping_slot_table",
+    "29_slot_metatable",
+    "30_aliased_slot_write",
+    "31_nonconstant_slot_key",
+    "32_slot_across_control_flow",
 )
 
 TRUSTED_SEMANTIC_PROBES: Mapping[str, SemanticProbe] = MappingProxyType(
