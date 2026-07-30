@@ -1,3 +1,4 @@
+use crate::{LValueRefsMut,LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{RcLocal, SideEffects, Traverse, formatter::Formatter};
@@ -24,15 +25,15 @@ impl Assign {
 }
 
 impl Traverse for Assign {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
         self.left.iter_mut().collect()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.right.iter_mut().collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.right.iter().collect()
     }
 }
@@ -45,7 +46,7 @@ impl SideEffects for Assign {
 }
 
 impl LocalRw for Assign {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.left
             .iter()
             .flat_map(|l| l.values_read())
@@ -53,7 +54,7 @@ impl LocalRw for Assign {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.left
             .iter_mut()
             .flat_map(|l| l.values_read_mut())
@@ -61,11 +62,11 @@ impl LocalRw for Assign {
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.left.iter().flat_map(|l| l.values_written()).collect()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.left
             .iter_mut()
             .flat_map(|l| l.values_written_mut())

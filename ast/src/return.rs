@@ -1,3 +1,4 @@
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{LocalRw, RcLocal, Traverse, formatter::Formatter, has_side_effects};
@@ -18,21 +19,21 @@ impl Return {
 }
 
 impl Traverse for Return {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.values.iter_mut().collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.values.iter().collect()
     }
 }
 
 impl LocalRw for Return {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.values.iter().flat_map(|r| r.values_read()).collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.values
             .iter_mut()
             .flat_map(|r| r.values_read_mut())

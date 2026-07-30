@@ -3,6 +3,7 @@ mod error;
 mod instruction;
 mod lifter;
 mod op_code;
+mod profiling;
 
 #[cfg(test)]
 mod compatibility_tests;
@@ -40,6 +41,20 @@ use deserializer::bytecode::Bytecode;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(all(feature = "profiling", not(feature = "dhat-heap")))]
+#[global_allocator]
+static ALLOC: profiling::TrackingAllocator = profiling::TrackingAllocator;
+
+#[cfg(all(
+    feature = "mimalloc",
+    not(feature = "profiling"),
+    not(feature = "dhat-heap")
+))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+pub use profiling::report_to_stderr as report_profile;
+
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
@@ -68,7 +83,10 @@ pub fn try_decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String,
 }
 
 fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<String, DecompileError> {
-    let parsed = deserializer::deserialize(bytecode, encode_key).map_err(|detail| {
+    let parsed = catch_phase(DecompilePhase::Deserialize, None, None, || {
+        deserializer::deserialize(bytecode, encode_key)
+    })?
+    .map_err(|detail| {
         DecompileError::new(
             DecompilePhase::Deserialize,
             None,
@@ -77,6 +95,7 @@ fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<Strin
             detail,
         )
     })?;
+    profiling::checkpoint("deserialized");
     let Bytecode::Chunk(chunk) = parsed else {
         let Bytecode::Error(message) = parsed else {
             unreachable!()
@@ -572,7 +591,9 @@ fn decompile_chunk(
             ),
         ));
     }
+    profiling::checkpoint("functions-decompiled");
     drop(chunk);
+    profiling::checkpoint("chunk-dropped");
 
     let main = ByAddress(main);
     decompiled_upvalues.remove(&main);
@@ -581,68 +602,79 @@ fn decompile_chunk(
         link_upvalues(&mut body, &mut decompiled_upvalues);
         body
     })?;
+    profiling::checkpoint("linked");
     drop(decompiled_upvalues);
-    if block_contains_unsupported_nodes(&mut body) {
+    profiling::checkpoint("upvalues-dropped");
+    if let Some(kind) = unsupported_node_kind(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
             None,
             None,
             "source-level AST",
-            "reconstruction left internal goto, label, or set-list nodes",
+            format!("reconstruction left an internal {kind} node"),
         ));
     }
+    profiling::checkpoint("validated");
     catch_phase(DecompilePhase::Format, None, None, || {
         ast::recover_function_syntax(&mut body);
+        profiling::checkpoint("function-syntax-recovered");
         name_locals(&mut body, false);
-        body.to_string()
+        profiling::checkpoint("locals-named");
+        let source = body.to_string();
+        profiling::checkpoint("formatted");
+        source
     })
 }
 
 fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
+    unsupported_node_kind(block).is_some()
+}
+
+/// Names the first internal node left in a block, for the failure message.
+///
+/// Reporting which node kind survived distinguishes an unstructured jump from
+/// an unlowered table constructor, which are unrelated defects in different
+/// passes.
+fn unsupported_node_kind(block: &mut ast::Block) -> Option<&'static str> {
     for statement in &mut block.0 {
-        if matches!(
-            statement,
-            ast::Statement::Goto(_) | ast::Statement::Label(_) | ast::Statement::SetList(_)
-        ) {
-            return true;
+        match statement {
+            ast::Statement::Goto(_) => return Some("goto"),
+            ast::Statement::Label(_) => return Some("label"),
+            ast::Statement::SetList(_) => return Some("set-list"),
+            _ => {}
         }
 
         let nested_internal_node = match statement {
-            ast::Statement::If(r#if) => {
-                block_contains_unsupported_nodes(&mut r#if.then_block.lock())
-                    || block_contains_unsupported_nodes(&mut r#if.else_block.lock())
-            }
-            ast::Statement::While(r#while) => {
-                block_contains_unsupported_nodes(&mut r#while.block.lock())
-            }
-            ast::Statement::Repeat(repeat) => {
-                block_contains_unsupported_nodes(&mut repeat.block.lock())
-            }
+            ast::Statement::If(r#if) => unsupported_node_kind(&mut r#if.then_block.lock())
+                .or_else(|| unsupported_node_kind(&mut r#if.else_block.lock())),
+            ast::Statement::While(r#while) => unsupported_node_kind(&mut r#while.block.lock()),
+            ast::Statement::Repeat(repeat) => unsupported_node_kind(&mut repeat.block.lock()),
             ast::Statement::NumericFor(numeric_for) => {
-                block_contains_unsupported_nodes(&mut numeric_for.block.lock())
+                unsupported_node_kind(&mut numeric_for.block.lock())
             }
             ast::Statement::GenericFor(generic_for) => {
-                block_contains_unsupported_nodes(&mut generic_for.block.lock())
+                unsupported_node_kind(&mut generic_for.block.lock())
             }
-            _ => false,
+            _ => None,
         };
-        if nested_internal_node {
-            return true;
+        if nested_internal_node.is_some() {
+            return nested_internal_node;
         }
 
-        let mut closure_internal_node = false;
+        let mut closure_internal_node = None;
         statement.traverse_rvalues(&mut |rvalue| {
-            if !closure_internal_node && let ast::RValue::Closure(closure) = rvalue {
-                closure_internal_node =
-                    block_contains_unsupported_nodes(&mut closure.function.lock().body);
+            if closure_internal_node.is_none()
+                && let ast::RValue::Closure(closure) = rvalue
+            {
+                closure_internal_node = unsupported_node_kind(&mut closure.function.lock().body);
             }
         });
-        if closure_internal_node {
-            return true;
+        if closure_internal_node.is_some() {
+            return closure_internal_node;
         }
     }
 
-    false
+    None
 }
 
 #[cfg(test)]
@@ -936,41 +968,69 @@ fn decompile_function(
     let recovery_report = catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
         let mut scheduler = cfg::recovery::PassScheduler::new(32);
         scheduler.add_pass("structure-jumps", |function| {
-            let dominators = simple_fast(function.graph(), function.entry().unwrap());
-            if structure_jumps(function, &dominators) {
-                cfg::recovery::PassChange::cfg().union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            let dominators = cfg::metrics::time(cfg::metrics::Metric::Dominators, || {
+                simple_fast(function.graph(), function.entry().unwrap())
+            });
+            cfg::metrics::time(cfg::metrics::Metric::StructureJumps, || {
+                if structure_jumps(function, &dominators) {
+                    cfg::recovery::PassChange::cfg().union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         scheduler.add_pass("inline", |function| {
+            #[cfg(feature = "verify-inline-change")]
             let before = cfg::recovery::structural_fingerprint(function);
-            ssa::inline::inline(function, &local_to_group, &upvalue_to_group);
-            if cfg::recovery::structural_fingerprint(function) != before {
+
+            let changed = cfg::metrics::time(cfg::metrics::Metric::Inline, || {
+                ssa::inline::inline(function, &local_to_group, &upvalue_to_group)
+            });
+
+            // The reported flag must agree with the fingerprint in both
+            // directions. A false negative ends a round early; a false
+            // positive drives a round that changes nothing, which the
+            // scheduler reports as a repeated state and fails the decompile.
+            #[cfg(feature = "verify-inline-change")]
+            {
+                let after = cfg::recovery::structural_fingerprint(function);
+                assert_eq!(
+                    changed,
+                    before != after,
+                    "inline reported changed={changed} but the structural \
+                     fingerprint disagrees"
+                );
+            }
+
+            if changed {
                 cfg::recovery::PassChange::dataflow().union(cfg::recovery::PassChange::ast())
             } else {
                 cfg::recovery::PassChange::none()
             }
         });
         scheduler.add_pass("structure-conditionals", |function| {
-            if structure_conditionals(function) {
-                cfg::recovery::PassChange::cfg()
-                    .union(cfg::recovery::PassChange::dataflow())
-                    .union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            cfg::metrics::time(cfg::metrics::Metric::StructureConditionals, || {
+                if structure_conditionals(function) {
+                    cfg::recovery::PassChange::cfg()
+                        .union(cfg::recovery::PassChange::dataflow())
+                        .union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         scheduler.add_pass("remove-unnecessary-params", |function| {
-            let mut local_map = FxHashMap::default();
-            if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
-                ssa::construct::apply_local_map(function, local_map);
-                cfg::recovery::PassChange::cfg()
-                    .union(cfg::recovery::PassChange::dataflow())
-                    .union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            cfg::metrics::time(cfg::metrics::Metric::RemoveParams, || {
+                let mut local_map = FxHashMap::default();
+                if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
+                    ssa::construct::apply_local_map(function, local_map);
+                    cfg::recovery::PassChange::cfg()
+                        .union(cfg::recovery::PassChange::dataflow())
+                        .union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         let report = scheduler.run(&mut function)?;
         function

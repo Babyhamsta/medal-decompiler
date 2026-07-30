@@ -3,7 +3,9 @@
 use ast::{LocalRw, Reduce, Traverse};
 use cfg::{block::BranchType, function::Function};
 use itertools::Itertools;
+use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
+use triomphe::Arc;
 
 use petgraph::{
     algo::dominators::{Dominators, simple_fast},
@@ -60,7 +62,7 @@ impl GraphStructurer {
             function,
             loop_headers: FxHashSet::default(),
             recovery_region_headers: recovery
-                .candidate_regions
+                .candidate_regions()
                 .iter()
                 .map(|region| region.header)
                 .collect(),
@@ -395,11 +397,146 @@ impl GraphStructurer {
                     .unwrap(),
             )
         };
+        // Loop exits first: an unrecovered `goto` in the interior disqualifies
+        // the whole block from terminal back-edge recovery below.
+        if recover_loop_exit_breaks(&mut result) {
+            let mut referenced = FxHashSet::default();
+            collect_referenced_labels(&result, &mut referenced);
+            remove_unreferenced_labels(&mut result, &referenced);
+        }
         recover_terminal_backedge_loop(&mut result);
         flatten_single_iteration_loops(&mut result);
         relocate_unreachable_terminal_returns(&mut result, &self.reachable_terminal_returns);
         result
     }
+}
+
+/// The body of a loop statement, if this statement is a loop.
+fn loop_body(statement: &ast::Statement) -> Option<&Arc<Mutex<ast::Block>>> {
+    match statement {
+        ast::Statement::While(r#while) => Some(&r#while.block),
+        ast::Statement::Repeat(repeat) => Some(&repeat.block),
+        ast::Statement::NumericFor(numeric_for) => Some(&numeric_for.block),
+        ast::Statement::GenericFor(generic_for) => Some(&generic_for.block),
+        _ => None,
+    }
+}
+
+/// Rewrites `goto L` as `break` inside one loop level.
+///
+/// Nested loops are not descended into: `break` binds to the innermost
+/// enclosing loop, so a jump from inside a nested loop to the outer loop's
+/// exit is not expressible as a plain `break` and is left alone. Closures are
+/// not descended into either, since they are separate functions.
+fn replace_exit_gotos_with_break(block: &mut ast::Block, label: &ast::Label) -> bool {
+    let mut changed = false;
+    for statement in &mut block.0 {
+        match statement {
+            ast::Statement::Goto(goto) if &goto.0 == label => {
+                *statement = ast::Break {}.into();
+                changed = true;
+            }
+            ast::Statement::If(r#if) => {
+                changed |= replace_exit_gotos_with_break(&mut r#if.then_block.lock(), label);
+                changed |= replace_exit_gotos_with_break(&mut r#if.else_block.lock(), label);
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+/// Rewrites jumps to the statement immediately after a loop as `break`.
+///
+/// Restructuring emits `goto L`, with `::L::` placed directly after the
+/// enclosing loop, when it cannot express that exit structurally. Jumping to
+/// the point just past a loop is exactly what `break` means. Recovering it
+/// matters beyond readability: an interior jump disqualifies the surrounding
+/// block from [`recover_terminal_backedge_loop`], so one unrecovered exit can
+/// leave an entire function unstructured.
+fn recover_loop_exit_breaks(block: &mut ast::Block) -> bool {
+    let mut changed = false;
+
+    for statement in &mut block.0 {
+        match statement {
+            ast::Statement::If(r#if) => {
+                changed |= recover_loop_exit_breaks(&mut r#if.then_block.lock());
+                changed |= recover_loop_exit_breaks(&mut r#if.else_block.lock());
+            }
+            ast::Statement::While(r#while) => {
+                changed |= recover_loop_exit_breaks(&mut r#while.block.lock());
+            }
+            ast::Statement::Repeat(repeat) => {
+                changed |= recover_loop_exit_breaks(&mut repeat.block.lock());
+            }
+            ast::Statement::NumericFor(numeric_for) => {
+                changed |= recover_loop_exit_breaks(&mut numeric_for.block.lock());
+            }
+            ast::Statement::GenericFor(generic_for) => {
+                changed |= recover_loop_exit_breaks(&mut generic_for.block.lock());
+            }
+            _ => {}
+        }
+    }
+
+    for index in 0..block.len() {
+        let Some(label) = block.0.get(index + 1).and_then(ast::Statement::as_label).cloned() else {
+            continue;
+        };
+        let Some(body) = loop_body(&block.0[index]).cloned() else {
+            continue;
+        };
+        changed |= replace_exit_gotos_with_break(&mut body.lock(), &label);
+    }
+
+    changed
+}
+
+/// Collects every label still referenced by a `goto`.
+fn collect_referenced_labels(block: &ast::Block, referenced: &mut FxHashSet<ast::Label>) {
+    for statement in &block.0 {
+        match statement {
+            ast::Statement::Goto(goto) => {
+                referenced.insert(goto.0.clone());
+            }
+            ast::Statement::If(r#if) => {
+                collect_referenced_labels(&r#if.then_block.lock(), referenced);
+                collect_referenced_labels(&r#if.else_block.lock(), referenced);
+            }
+            _ => {
+                if let Some(body) = loop_body(statement) {
+                    collect_referenced_labels(&body.lock(), referenced);
+                }
+            }
+        }
+    }
+}
+
+/// Drops label definitions that no `goto` targets any more.
+fn remove_unreferenced_labels(block: &mut ast::Block, referenced: &FxHashSet<ast::Label>) -> bool {
+    let mut changed = false;
+    for statement in &mut block.0 {
+        match statement {
+            ast::Statement::If(r#if) => {
+                changed |= remove_unreferenced_labels(&mut r#if.then_block.lock(), referenced);
+                changed |= remove_unreferenced_labels(&mut r#if.else_block.lock(), referenced);
+            }
+            _ => {
+                if let Some(body) = loop_body(statement) {
+                    let body = body.clone();
+                    let mut body = body.lock();
+                    changed |= remove_unreferenced_labels(&mut body, referenced);
+                }
+            }
+        }
+    }
+
+    let before = block.len();
+    block.0.retain(|statement| match statement {
+        ast::Statement::Label(label) => referenced.contains(label),
+        _ => true,
+    });
+    changed || block.len() != before
 }
 
 fn recover_terminal_backedge_loop(block: &mut ast::Block) -> bool {
@@ -677,9 +814,11 @@ fn collect_region_terminal_returns(
     recovery: &cfg::recovery::RecoveryFacts,
 ) -> Vec<ast::Return> {
     let mut returns = Vec::new();
-    for region in &recovery.candidate_regions {
-        for mut target in recovery
-            .edges
+    let edges = recovery
+        .edges()
+        .expect("reconstruction facts must carry edge facts");
+    for region in recovery.candidate_regions() {
+        for mut target in edges
             .iter()
             .filter(|edge| {
                 region.members.contains(&edge.source) && !region.members.contains(&edge.target)
@@ -828,8 +967,9 @@ pub fn lift(
 #[cfg(test)]
 mod tests {
     use crate::{
-        contains_reachable_return, flatten_single_iteration_loops, lift,
-        recover_terminal_backedge_loop, relocate_unreachable_terminal_returns,
+        collect_referenced_labels, contains_reachable_return, flatten_single_iteration_loops, lift,
+        recover_loop_exit_breaks, recover_terminal_backedge_loop, remove_unreferenced_labels,
+        relocate_unreachable_terminal_returns,
     };
     use ast::{
         Assign, Binary, BinaryOperation, Call, Global, If, LValue, Literal, Local, RValue, RcLocal,
@@ -974,7 +1114,7 @@ mod tests {
         );
         let returned = block.last().unwrap().as_return().unwrap();
         assert_eq!(returned.values[0], previous.clone().into());
-        assert!(facts.candidate_regions[0].members.contains(&header));
+        assert!(facts.candidate_regions()[0].members.contains(&header));
     }
 
     #[test]
@@ -1113,6 +1253,82 @@ mod tests {
         ]);
 
         assert_eq!(flatten_single_iteration_loops(&mut block), 0);
+        assert!(block[0].as_while().is_some());
+    }
+
+    fn drop_unreferenced_labels(block: &mut ast::Block) {
+        let mut referenced = rustc_hash::FxHashSet::default();
+        collect_referenced_labels(block, &mut referenced);
+        remove_unreferenced_labels(block, &referenced);
+    }
+
+    #[test]
+    fn jump_to_statement_after_loop_becomes_break() {
+        let exit = ast::Label("exit".to_owned());
+        let mut block = ast::Block(vec![
+            ast::While::new(
+                Literal::Boolean(true).into(),
+                ast::Block(vec![ast::Goto::new(exit.clone()).into()]),
+            )
+            .into(),
+            Statement::Label(exit),
+        ]);
+
+        assert!(recover_loop_exit_breaks(&mut block));
+        drop_unreferenced_labels(&mut block);
+
+        assert_eq!(block.len(), 1, "the label should be gone");
+        let body = block[0].as_while().unwrap().block.lock();
+        assert!(matches!(body[0], Statement::Break(_)));
+    }
+
+    #[test]
+    fn jump_from_a_nested_loop_is_left_alone() {
+        // `break` binds to the innermost loop, so this jump is not expressible
+        // as a plain break and must survive untouched.
+        let exit = ast::Label("exit".to_owned());
+        let inner = ast::While::new(
+            Literal::Boolean(true).into(),
+            ast::Block(vec![ast::Goto::new(exit.clone()).into()]),
+        );
+        let mut block = ast::Block(vec![
+            ast::While::new(Literal::Boolean(true).into(), ast::Block(vec![inner.into()])).into(),
+            Statement::Label(exit),
+        ]);
+
+        assert!(!recover_loop_exit_breaks(&mut block));
+        let outer = block[0].as_while().unwrap().block.lock();
+        let inner = outer[0].as_while().unwrap().block.lock();
+        assert!(matches!(inner[0], Statement::Goto(_)));
+    }
+
+    #[test]
+    fn recovered_break_unblocks_terminal_backedge_recovery() {
+        // The pattern that left a whole function unstructured: a back edge
+        // spanning the body, with an unrecovered loop exit inside it.
+        let top = ast::Label("l0".to_owned());
+        let exit = ast::Label("l8".to_owned());
+        let mut block = ast::Block(vec![
+            Statement::Label(top.clone()),
+            ast::While::new(
+                Literal::Boolean(true).into(),
+                ast::Block(vec![ast::Goto::new(exit.clone()).into()]),
+            )
+            .into(),
+            Statement::Label(exit),
+            ast::Goto::new(top).into(),
+        ]);
+
+        assert!(
+            !recover_terminal_backedge_loop(&mut block.clone()),
+            "the interior jump should block recovery before the break is found"
+        );
+
+        assert!(recover_loop_exit_breaks(&mut block));
+        drop_unreferenced_labels(&mut block);
+        assert!(recover_terminal_backedge_loop(&mut block));
+
+        assert_eq!(block.len(), 1);
         assert!(block[0].as_while().is_some());
     }
 }

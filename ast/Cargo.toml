@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+smallvec = "1.13"
 derive_more = "0.99.17"
 enum-as-inner = "0.5.1"
 itertools = "0.10.5"

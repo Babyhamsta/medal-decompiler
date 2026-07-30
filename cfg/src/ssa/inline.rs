@@ -8,12 +8,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 struct TraverseSelf<'a, T: Traverse>(&'a mut T);
 
 impl<'a> Traverse for TraverseSelf<'a, ast::RValue> {
-    fn rvalues_mut(&mut self) -> Vec<&mut ast::RValue> {
-        vec![self.0]
+    fn rvalues_mut(&mut self) -> ast::RValueRefsMut<'_> {
+        smallvec::smallvec![&mut *self.0]
     }
 
-    fn rvalues(&self) -> Vec<&ast::RValue> {
-        vec![self.0]
+    fn rvalues(&self) -> ast::RValueRefs<'_> {
+        smallvec::smallvec![&*self.0]
     }
 }
 
@@ -22,6 +22,9 @@ struct Inliner<'a> {
     local_to_group: &'a FxHashMap<ast::RcLocal, usize>,
     upvalue_to_group: &'a IndexMap<ast::RcLocal, ast::RcLocal>,
     local_usages: &'a mut FxHashMap<ast::RcLocal, usize>,
+    /// Set at each site that rewrites a statement or edge argument, so the
+    /// caller can report a change without fingerprinting the whole function.
+    changed: bool,
 }
 
 fn has_open_table_tail(table: &ast::Table) -> bool {
@@ -250,6 +253,7 @@ impl<'a> Inliner<'a> {
             local_to_group,
             upvalue_to_group,
             local_usages,
+            changed: false,
         }
     }
 
@@ -330,7 +334,8 @@ impl<'a> Inliner<'a> {
     // TODO: dont clone rvalues
     // TODO: REFACTOR: move to ssa module?
     // TODO: inline into block arguments
-    fn inline_rvalues(self) {
+    /// Returns whether any statement or edge argument was rewritten.
+    fn inline_rvalues(mut self) -> bool {
         let node_indices = self.function.graph().node_indices().collect::<Vec<_>>();
         for node in node_indices {
             let block = self.function.block_mut(node).unwrap();
@@ -445,6 +450,7 @@ impl<'a> Inliner<'a> {
                                     // with no declarations serves no purpose
                                     block[stat_index] = ast::Empty {}.into();
                                     *read = None;
+                                    self.changed = true;
                                     continue 'w;
                                 } else {
                                     block[stat_index]
@@ -517,6 +523,7 @@ impl<'a> Inliner<'a> {
                                             .find(|l| l.as_ref() == Some(&old_local))
                                             .unwrap() = None;
                                     }
+                                    self.changed = true;
                                     continue 'w;
                                 }
                             }
@@ -650,6 +657,7 @@ impl<'a> Inliner<'a> {
 
                                     block[stat_index] = ast::Empty {}.into();
                                     *read = None;
+                                    self.changed = true;
                                     continue 'w;
                                 } else {
                                     let block = self.function.block_mut(node).unwrap();
@@ -676,14 +684,20 @@ impl<'a> Inliner<'a> {
                 }
             }
         }
+        self.changed
     }
 }
 
+/// Returns whether inlining rewrote anything.
+///
+/// The scheduler previously answered that question by fingerprinting the whole
+/// function before and after this call. Reporting it directly removes two of
+/// the three full-AST fingerprints per reconstruction round.
 pub fn inline(
     function: &mut Function,
     local_to_group: &FxHashMap<ast::RcLocal, usize>,
     upvalue_to_group: &IndexMap<ast::RcLocal, ast::RcLocal>,
-) {
+) -> bool {
     let mut observable_groups = FxHashSet::default();
     for local in upvalue_to_group.keys().chain(upvalue_to_group.values()) {
         if let Some(group) = local_to_group.get(local) {
@@ -709,10 +723,14 @@ pub fn inline(
         }
     }
 
+    // `changed` drives loop termination and deliberately excludes
+    // `inline_rvalues`, preserving the original fixed point. `any_change` is
+    // the reported signal and does include it.
+    let mut any_change = false;
     let mut changed = true;
     while changed {
         changed = false;
-        Inliner::new(
+        any_change |= Inliner::new(
             function,
             local_to_group,
             upvalue_to_group,
@@ -769,12 +787,14 @@ pub fn inline(
             changed |= fold_table_fields(block, &effect_observable_locals) != 0;
             changed |= fold_set_lists(block, &mut local_usages) != 0;
         }
+        any_change |= changed;
     }
     // we check block.ast.len() elsewhere and do `i - ` here and elsewhere so we need to get rid of empty statements
     // TODO: fix ^
     for block in function.blocks_mut() {
         block.retain(|s| s.as_empty().is_none());
     }
+    any_change
 }
 
 #[cfg(test)]

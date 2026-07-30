@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{LocalRw, RValue, RcLocal, SideEffects, Traverse, formatter::Formatter};
@@ -22,35 +24,35 @@ impl Class {
 }
 
 impl LocalRw for Class {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.methods
             .iter()
             .flat_map(|(_, value)| value.values_read())
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.methods
             .iter_mut()
             .flat_map(|(_, value)| value.values_read_mut())
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
-        vec![&self.target]
+    fn values_written(&self) -> LocalRefs<'_> {
+        smallvec![&self.target]
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
-        vec![&mut self.target]
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
+        smallvec![&mut self.target]
     }
 }
 
 impl Traverse for Class {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.methods.iter_mut().map(|(_, value)| value).collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.methods.iter().map(|(_, value)| value).collect()
     }
 }

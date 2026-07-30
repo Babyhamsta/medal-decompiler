@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LValueRefsMut,LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use crate::{
     Assign, Block, LValue, LocalRw, RValue, RcLocal, SideEffects, Traverse, has_side_effects,
 };
@@ -30,21 +32,21 @@ impl NumForInit {
 has_side_effects!(NumForInit);
 
 impl Traverse for NumForInit {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
-        vec![&mut self.counter.0, &mut self.limit.0, &mut self.step.0]
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
+        smallvec![&mut self.counter.0, &mut self.limit.0, &mut self.step.0]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.counter.1, &self.limit.1, &self.step.1]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&self.counter.1, &self.limit.1, &self.step.1]
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.counter.1, &mut self.limit.1, &mut self.step.1]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut self.counter.1, &mut self.limit.1, &mut self.step.1]
     }
 }
 
 impl LocalRw for NumForInit {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.counter
             .1
             .values_read()
@@ -54,7 +56,7 @@ impl LocalRw for NumForInit {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.counter
             .1
             .values_read_mut()
@@ -64,7 +66,7 @@ impl LocalRw for NumForInit {
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.counter
             .0
             .values_written()
@@ -74,7 +76,7 @@ impl LocalRw for NumForInit {
             .collect()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.counter
             .0
             .values_written_mut()
@@ -119,21 +121,21 @@ impl NumForNext {
 }
 
 impl Traverse for NumForNext {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
-        vec![&mut self.counter.0]
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
+        smallvec![&mut self.counter.0]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.counter.1, &self.step, &self.limit]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&self.counter.1, &self.step, &self.limit]
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.counter.1, &mut self.step, &mut self.limit]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut self.counter.1, &mut self.step, &mut self.limit]
     }
 }
 
 impl LocalRw for NumForNext {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.counter
             .1
             .values_read()
@@ -143,7 +145,7 @@ impl LocalRw for NumForNext {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.counter
             .1
             .values_read_mut()
@@ -153,11 +155,11 @@ impl LocalRw for NumForNext {
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.counter.0.values_written()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.counter.0.values_written_mut()
     }
 }
@@ -211,7 +213,7 @@ impl NumericFor {
 }
 
 impl LocalRw for NumericFor {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.initial
             .values_read()
             .into_iter()
@@ -220,7 +222,7 @@ impl LocalRw for NumericFor {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.initial
             .values_read_mut()
             .into_iter()
@@ -229,22 +231,22 @@ impl LocalRw for NumericFor {
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
-        vec![&self.counter]
+    fn values_written(&self) -> LocalRefs<'_> {
+        smallvec![&self.counter]
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
-        vec![&mut self.counter]
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
+        smallvec![&mut self.counter]
     }
 }
 
 impl Traverse for NumericFor {
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.initial, &self.limit, &self.step]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&self.initial, &self.limit, &self.step]
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.initial, &mut self.limit, &mut self.step]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut self.initial, &mut self.limit, &mut self.step]
     }
 }
 
@@ -289,33 +291,33 @@ impl SideEffects for GenericForInit {
 }
 
 impl Traverse for GenericForInit {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
         self.0.lvalues_mut()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.0.rvalues_mut()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.0.rvalues()
     }
 }
 
 impl LocalRw for GenericForInit {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.0.values_read()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.0.values_read_mut()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.0.values_written()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.0.values_written_mut()
     }
 }
@@ -356,21 +358,21 @@ impl GenericForNext {
 has_side_effects!(GenericForNext);
 
 impl Traverse for GenericForNext {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
         self.res_locals.iter_mut().collect()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.generator, &mut self.state]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut self.generator, &mut self.state]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.generator, &self.state]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&self.generator, &self.state]
     }
 }
 
 impl LocalRw for GenericForNext {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.generator
             .values_read()
             .into_iter()
@@ -378,7 +380,7 @@ impl LocalRw for GenericForNext {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.generator
             .values_read_mut()
             .into_iter()
@@ -386,14 +388,14 @@ impl LocalRw for GenericForNext {
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.res_locals
             .iter()
             .flat_map(|l| l.values_written())
             .collect()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.res_locals
             .iter_mut()
             .flat_map(|l| l.values_written_mut())
@@ -442,32 +444,32 @@ impl GenericFor {
 has_side_effects!(GenericFor);
 
 impl LocalRw for GenericFor {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.right.iter().flat_map(|r| r.values_read()).collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.right
             .iter_mut()
             .flat_map(|r| r.values_read_mut())
             .collect()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         self.res_locals.iter().collect()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         self.res_locals.iter_mut().collect()
     }
 }
 
 impl Traverse for GenericFor {
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.right.iter().collect()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.right.iter_mut().collect()
     }
 }

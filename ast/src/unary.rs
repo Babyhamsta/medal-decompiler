@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse};
@@ -38,12 +40,12 @@ impl SideEffects for Unary {
 }
 
 impl Traverse for Unary {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.value]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut *self.value]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.value]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&*self.value]
     }
 }
 
@@ -412,11 +414,11 @@ impl Unary {
 }
 
 impl LocalRw for Unary {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.value.values_read()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.value.values_read_mut()
     }
 }

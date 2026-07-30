@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use crate::{LocalRw, RcLocal, Traverse, formatter::Formatter, has_side_effects};
 
 use super::RValue;
@@ -22,7 +24,7 @@ impl Index {
 }
 
 impl LocalRw for Index {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.left
             .values_read()
             .into_iter()
@@ -30,7 +32,7 @@ impl LocalRw for Index {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.left
             .values_read_mut()
             .into_iter()
@@ -40,12 +42,12 @@ impl LocalRw for Index {
 }
 
 impl Traverse for Index {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.left, &mut self.right]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut *self.left, &mut *self.right]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.left, &self.right]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&*self.left, &*self.right]
     }
 }
 

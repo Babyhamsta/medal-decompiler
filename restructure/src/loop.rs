@@ -614,8 +614,15 @@ impl GraphStructurer {
         ) else {
             return false;
         };
-        let condition_reads = condition.values_read();
-        if !condition_reads.contains(&&carried) || !condition_reads.contains(&&next_value) {
+        // Scoped so the borrow of `condition` ends here. SmallVec's Drop lacks
+        // the dropck eyepatch that lets Vec's borrows end early, so an
+        // unscoped binding would hold `condition` borrowed for the rest of the
+        // function.
+        let reads_both = {
+            let condition_reads = condition.values_read();
+            condition_reads.contains(&&carried) && condition_reads.contains(&&next_value)
+        };
+        if !reads_both {
             return false;
         }
 
