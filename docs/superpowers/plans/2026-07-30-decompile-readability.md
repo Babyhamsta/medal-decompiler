@@ -502,7 +502,7 @@ Six probes containing no register-array pattern cannot catch a bad slot fold. Th
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `TRUSTED_SEMANTIC_PROBES` covering all 26 corpus cases.
+- Produces: `TRUSTED_SEMANTIC_PROBES` covering 25 of the 26 corpus cases; `18_recursion` is exempt because Luau's `require` rejects its multi-value return.
 
 A probe is a module returning `function(subject) ... end`. `runner.luau` calls it, `table.pack`s the results, and encodes them. **The encoder raises on function values**, so no probe may return a function or a table containing one.
 
@@ -814,7 +814,9 @@ grep -c "| yes |" tests/luau_corpus/results/current/summary.md
 head -4 tests/luau_corpus/results/current/summary.md
 ```
 
-Expected: 0 failures, and 78 semantic matches (26 cases × 3 profiles).
+Expected: 0 failures, and 75 semantic matches (25 probed cases × 3 profiles).
+
+`18_recursion` is not probed: it returns three values, and Luau's `require` rejects a module returning more than one, so `runner.luau` cannot load it. The case still compiles, decompiles, and recompiles in all 78 structural runs.
 
 If any case reports a semantic mismatch here, **stop**. That is a pre-existing decompiler defect on unmodified `main`, not something this plan introduced. Record the case name and its diagnostic log path, remove that case from `_PROBE_NAMES` with a one-line comment naming the defect, and report it before continuing.
 
@@ -1059,7 +1061,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 sed -n '1,40p' tests/luau_corpus/results/current/O2_g1/25_product_controller.luau
 ```
 
-Expected: 0 failures, 78 semantic matches, and the `blank` column now non-zero for every case. Read the case 25 output and confirm it looks like hand-written Lua — functions separated, declaration runs kept together.
+Expected: 0 failures, 75 semantic matches, and the `blank` column now non-zero for every case. Read the case 25 output and confirm it looks like hand-written Lua — functions separated, declaration runs kept together.
 
 - [ ] **Step 8: Check the performance ceiling**
 
@@ -1307,7 +1309,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: 0 failures, 78 semantic matches, wall clock under 16.0 s.
+Expected: 0 failures, 75 semantic matches, wall clock under 16.0 s.
 
 - [ ] **Step 8: Commit**
 
@@ -1531,7 +1533,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: 0 failures, 78 semantic matches, wall clock under 16.0 s. The `vN` column in the summary should drop substantially.
+Expected: 0 failures, 75 semantic matches, wall clock under 16.0 s. The `vN` column in the summary should drop substantially.
 
 - [ ] **Step 9: Commit**
 
@@ -2056,7 +2058,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: 0 failures, 78 semantic matches, `format` phase under 1.5 s, wall clock under 16.0 s.
+Expected: 0 failures, 75 semantic matches, `format` phase under 1.5 s, wall clock under 16.0 s.
 
 - [ ] **Step 7: Commit**
 
@@ -2077,8 +2079,8 @@ Written and passing **before** folding exists, so they establish expected behavi
 - Modify: `tools/luau_corpus/semantic.py` (`_PROBE_NAMES`)
 
 **Interfaces:**
-- Consumes: the 26-entry `_PROBE_NAMES` from Task 3.
-- Produces: a 32-entry `_PROBE_NAMES`.
+- Consumes: the 25-entry `_PROBE_NAMES` from Task 3.
+- Produces: a 31-entry `_PROBE_NAMES`.
 
 - [ ] **Step 1: Write the six cases**
 
@@ -2254,7 +2256,7 @@ python tools/run_luau_corpus.py --profiles primary --semantic \
 head -4 tests/luau_corpus/results/current/summary.md
 ```
 
-Expected: `Cases: 96; compile failures: 0; decompile failures: 0; recompile failures: 0.` and 96 semantic matches.
+Expected: `Cases: 96; compile failures: 0; decompile failures: 0; recompile failures: 0.` and 93 semantic matches (31 probed cases × 3 profiles; `18_recursion` is unprobeable).
 
 If any of the six fails to decompile on unmodified code, that is a pre-existing defect the case has exposed. Report it and keep the case — it belongs in the corpus regardless.
 
@@ -2264,7 +2266,7 @@ Run the six through the runner as in Task 3 Step 2, add their encodings to the `
 
 Run: `python -m unittest tests.python.test_luau_corpus -v`
 
-Expected: PASS, 32 subtests in the literal-results test.
+Expected: PASS, 31 subtests in the literal-results test.
 
 - [ ] **Step 6: Commit**
 
@@ -2622,7 +2624,7 @@ python tools/run_luau_corpus.py --profiles primary --semantic \
 head -4 tests/luau_corpus/results/current/summary.md
 ```
 
-Expected: `Cases: 96; compile failures: 0; decompile failures: 0; recompile failures: 0.` and 96 semantic matches.
+Expected: `Cases: 96; compile failures: 0; decompile failures: 0; recompile failures: 0.` and 93 semantic matches (31 probed cases × 3 profiles; `18_recursion` is unprobeable).
 
 **A single semantic mismatch here means a precondition is wrong.** Do not adjust the expected value. Read the failing case's `.log`, find which precondition the fold violated, and fix the precondition. If case `29_slot_metatable` fails, apply the fallback from the spec: tighten precondition 2 so a table that appears as a bare argument to any call is never foldable.
 
@@ -2749,7 +2751,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: 96 cases, 0 failures, 96 semantic matches, wall clock under 16.0 s.
+Expected: 96 cases, 0 failures, 93 semantic matches, wall clock under 16.0 s.
 
 Pay attention to case `08_table_incremental` — it mixes positional, named, computed, and `#result + 1` keys, so most of its run must stay expanded. If it folds entirely, the density check is wrong.
 
@@ -2847,7 +2849,7 @@ head -4 tests/luau_corpus/results/current/summary.md
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: 96 cases, 0 failures, 96 semantic matches, `format` phase under 1.5 s.
+Expected: 96 cases, 0 failures, 93 semantic matches, `format` phase under 1.5 s.
 
 - [ ] **Step 7: Commit**
 
