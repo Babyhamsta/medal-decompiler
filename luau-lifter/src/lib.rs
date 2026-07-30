@@ -3,6 +3,7 @@ mod error;
 mod instruction;
 mod lifter;
 mod op_code;
+mod profiling;
 
 #[cfg(test)]
 mod compatibility_tests;
@@ -40,6 +41,12 @@ use deserializer::bytecode::Bytecode;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(all(feature = "profiling", not(feature = "dhat-heap")))]
+#[global_allocator]
+static ALLOC: profiling::TrackingAllocator = profiling::TrackingAllocator;
+
+pub use profiling::report_to_stderr as report_profile;
+
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
@@ -68,7 +75,10 @@ pub fn try_decompile_bytecode(bytecode: &[u8], encode_key: u8) -> Result<String,
 }
 
 fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<String, DecompileError> {
-    let parsed = deserializer::deserialize(bytecode, encode_key).map_err(|detail| {
+    let parsed = catch_phase(DecompilePhase::Deserialize, None, None, || {
+        deserializer::deserialize(bytecode, encode_key)
+    })?
+    .map_err(|detail| {
         DecompileError::new(
             DecompilePhase::Deserialize,
             None,
@@ -77,6 +87,7 @@ fn try_decompile_bytecode_inner(bytecode: &[u8], encode_key: u8) -> Result<Strin
             detail,
         )
     })?;
+    profiling::checkpoint("deserialized");
     let Bytecode::Chunk(chunk) = parsed else {
         let Bytecode::Error(message) = parsed else {
             unreachable!()
@@ -572,7 +583,9 @@ fn decompile_chunk(
             ),
         ));
     }
+    profiling::checkpoint("functions-decompiled");
     drop(chunk);
+    profiling::checkpoint("chunk-dropped");
 
     let main = ByAddress(main);
     decompiled_upvalues.remove(&main);
@@ -581,7 +594,9 @@ fn decompile_chunk(
         link_upvalues(&mut body, &mut decompiled_upvalues);
         body
     })?;
+    profiling::checkpoint("linked");
     drop(decompiled_upvalues);
+    profiling::checkpoint("upvalues-dropped");
     if block_contains_unsupported_nodes(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
@@ -591,10 +606,15 @@ fn decompile_chunk(
             "reconstruction left internal goto, label, or set-list nodes",
         ));
     }
+    profiling::checkpoint("validated");
     catch_phase(DecompilePhase::Format, None, None, || {
         ast::recover_function_syntax(&mut body);
+        profiling::checkpoint("function-syntax-recovered");
         name_locals(&mut body, false);
-        body.to_string()
+        profiling::checkpoint("locals-named");
+        let source = body.to_string();
+        profiling::checkpoint("formatted");
+        source
     })
 }
 
@@ -936,41 +956,56 @@ fn decompile_function(
     let recovery_report = catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
         let mut scheduler = cfg::recovery::PassScheduler::new(32);
         scheduler.add_pass("structure-jumps", |function| {
-            let dominators = simple_fast(function.graph(), function.entry().unwrap());
-            if structure_jumps(function, &dominators) {
-                cfg::recovery::PassChange::cfg().union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            let dominators = cfg::metrics::time(cfg::metrics::Metric::Dominators, || {
+                simple_fast(function.graph(), function.entry().unwrap())
+            });
+            cfg::metrics::time(cfg::metrics::Metric::StructureJumps, || {
+                if structure_jumps(function, &dominators) {
+                    cfg::recovery::PassChange::cfg().union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         scheduler.add_pass("inline", |function| {
-            let before = cfg::recovery::structural_fingerprint(function);
-            ssa::inline::inline(function, &local_to_group, &upvalue_to_group);
-            if cfg::recovery::structural_fingerprint(function) != before {
+            let before = cfg::metrics::time(cfg::metrics::Metric::Fingerprint, || {
+                cfg::recovery::structural_fingerprint(function)
+            });
+            cfg::metrics::time(cfg::metrics::Metric::Inline, || {
+                ssa::inline::inline(function, &local_to_group, &upvalue_to_group)
+            });
+            let after = cfg::metrics::time(cfg::metrics::Metric::Fingerprint, || {
+                cfg::recovery::structural_fingerprint(function)
+            });
+            if after != before {
                 cfg::recovery::PassChange::dataflow().union(cfg::recovery::PassChange::ast())
             } else {
                 cfg::recovery::PassChange::none()
             }
         });
         scheduler.add_pass("structure-conditionals", |function| {
-            if structure_conditionals(function) {
-                cfg::recovery::PassChange::cfg()
-                    .union(cfg::recovery::PassChange::dataflow())
-                    .union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            cfg::metrics::time(cfg::metrics::Metric::StructureConditionals, || {
+                if structure_conditionals(function) {
+                    cfg::recovery::PassChange::cfg()
+                        .union(cfg::recovery::PassChange::dataflow())
+                        .union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         scheduler.add_pass("remove-unnecessary-params", |function| {
-            let mut local_map = FxHashMap::default();
-            if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
-                ssa::construct::apply_local_map(function, local_map);
-                cfg::recovery::PassChange::cfg()
-                    .union(cfg::recovery::PassChange::dataflow())
-                    .union(cfg::recovery::PassChange::ast())
-            } else {
-                cfg::recovery::PassChange::none()
-            }
+            cfg::metrics::time(cfg::metrics::Metric::RemoveParams, || {
+                let mut local_map = FxHashMap::default();
+                if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
+                    ssa::construct::apply_local_map(function, local_map);
+                    cfg::recovery::PassChange::cfg()
+                        .union(cfg::recovery::PassChange::dataflow())
+                        .union(cfg::recovery::PassChange::ast())
+                } else {
+                    cfg::recovery::PassChange::none()
+                }
+            })
         });
         let report = scheduler.run(&mut function)?;
         function

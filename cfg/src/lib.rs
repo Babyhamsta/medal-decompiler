@@ -7,6 +7,7 @@
 pub mod block;
 pub mod dot;
 pub mod function;
+pub mod metrics;
 pub mod pattern;
 pub mod provenance;
 pub mod recovery;

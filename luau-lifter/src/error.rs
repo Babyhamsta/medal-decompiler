@@ -21,7 +21,41 @@ pub enum DecompilePhase {
 }
 
 impl DecompilePhase {
-    const fn label(self) -> &'static str {
+    pub(crate) const COUNT: usize = 12;
+
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Deserialize,
+        Self::Lift,
+        Self::Ssa,
+        Self::Structure,
+        Self::SsaDestruction,
+        Self::Restructure,
+        Self::AstRecovery,
+        Self::Declaration,
+        Self::Link,
+        Self::Validate,
+        Self::Format,
+        Self::Unknown,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Deserialize => 0,
+            Self::Lift => 1,
+            Self::Ssa => 2,
+            Self::Structure => 3,
+            Self::SsaDestruction => 4,
+            Self::Restructure => 5,
+            Self::AstRecovery => 6,
+            Self::Declaration => 7,
+            Self::Link => 8,
+            Self::Validate => 9,
+            Self::Format => 10,
+            Self::Unknown => 11,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Deserialize => "deserialize",
             Self::Lift => "lift",
@@ -87,6 +121,7 @@ pub(crate) fn catch_phase<T>(
     instruction: Option<usize>,
     operation: impl FnOnce() -> T,
 ) -> Result<T, DecompileError> {
+    let _scope = crate::profiling::scope(phase, function_id);
     catch_unwind(AssertUnwindSafe(operation)).map_err(|payload| {
         DecompileError::new(
             phase,

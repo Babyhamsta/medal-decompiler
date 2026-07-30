@@ -6,7 +6,9 @@ fn main() {
         .map(|s| if s == "-e" { 203 } else { panic!() })
         .unwrap_or(1);
     let bytecode = std::fs::read(file_name).expect("failed to read file");
-    match luau_lifter::try_decompile_bytecode(&bytecode, key) {
+    let result = luau_lifter::try_decompile_bytecode(&bytecode, key);
+    luau_lifter::report_profile();
+    match result {
         Ok(output) => println!("{output}"),
         Err(error) => {
             eprintln!("decompiler error: {error}");

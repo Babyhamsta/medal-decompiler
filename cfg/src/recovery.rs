@@ -767,12 +767,20 @@ impl<'a> PassScheduler<'a> {
     }
 
     pub fn run(&mut self, function: &mut Function) -> Result<SchedulerReport, SchedulerError> {
-        let mut facts = RecoveryFacts::derive(function)?;
+        crate::metrics::record_scheduler_run();
+        let mut facts =
+            crate::metrics::time(crate::metrics::Metric::FactsDerive, || {
+                RecoveryFacts::derive(function)
+            })?;
         let mut invalidations = InvalidationCounts::default();
-        let mut seen = HashMap::from([(structural_fingerprint(function), 0usize)]);
+        let initial_fingerprint = crate::metrics::time(crate::metrics::Metric::Fingerprint, || {
+            structural_fingerprint(function)
+        });
+        let mut seen = HashMap::from([(initial_fingerprint, 0usize)]);
         let mut applied_changes = Vec::new();
 
         for round in 1..=self.max_rounds {
+            crate::metrics::record_round();
             let mut round_change = PassChange::none();
             for pass in &mut self.passes {
                 let change = (pass.operation)(function);
@@ -792,8 +800,12 @@ impl<'a> PassScheduler<'a> {
                 });
             }
 
-            facts = RecoveryFacts::derive(function)?;
-            let fingerprint = structural_fingerprint(function);
+            facts = crate::metrics::time(crate::metrics::Metric::FactsDerive, || {
+                RecoveryFacts::derive(function)
+            })?;
+            let fingerprint = crate::metrics::time(crate::metrics::Metric::Fingerprint, || {
+                structural_fingerprint(function)
+            });
             if let Some(first_round) = seen.insert(fingerprint, round) {
                 return Err(SchedulerError::RepeatedState {
                     function_id: function.id,
