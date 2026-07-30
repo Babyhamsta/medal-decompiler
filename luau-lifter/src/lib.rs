@@ -605,13 +605,13 @@ fn decompile_chunk(
     profiling::checkpoint("linked");
     drop(decompiled_upvalues);
     profiling::checkpoint("upvalues-dropped");
-    if block_contains_unsupported_nodes(&mut body) {
+    if let Some(kind) = unsupported_node_kind(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
             None,
             None,
             "source-level AST",
-            "reconstruction left internal goto, label, or set-list nodes",
+            format!("reconstruction left an internal {kind} node"),
         ));
     }
     profiling::checkpoint("validated");
@@ -627,50 +627,54 @@ fn decompile_chunk(
 }
 
 fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
+    unsupported_node_kind(block).is_some()
+}
+
+/// Names the first internal node left in a block, for the failure message.
+///
+/// Reporting which node kind survived distinguishes an unstructured jump from
+/// an unlowered table constructor, which are unrelated defects in different
+/// passes.
+fn unsupported_node_kind(block: &mut ast::Block) -> Option<&'static str> {
     for statement in &mut block.0 {
-        if matches!(
-            statement,
-            ast::Statement::Goto(_) | ast::Statement::Label(_) | ast::Statement::SetList(_)
-        ) {
-            return true;
+        match statement {
+            ast::Statement::Goto(_) => return Some("goto"),
+            ast::Statement::Label(_) => return Some("label"),
+            ast::Statement::SetList(_) => return Some("set-list"),
+            _ => {}
         }
 
         let nested_internal_node = match statement {
-            ast::Statement::If(r#if) => {
-                block_contains_unsupported_nodes(&mut r#if.then_block.lock())
-                    || block_contains_unsupported_nodes(&mut r#if.else_block.lock())
-            }
-            ast::Statement::While(r#while) => {
-                block_contains_unsupported_nodes(&mut r#while.block.lock())
-            }
-            ast::Statement::Repeat(repeat) => {
-                block_contains_unsupported_nodes(&mut repeat.block.lock())
-            }
+            ast::Statement::If(r#if) => unsupported_node_kind(&mut r#if.then_block.lock())
+                .or_else(|| unsupported_node_kind(&mut r#if.else_block.lock())),
+            ast::Statement::While(r#while) => unsupported_node_kind(&mut r#while.block.lock()),
+            ast::Statement::Repeat(repeat) => unsupported_node_kind(&mut repeat.block.lock()),
             ast::Statement::NumericFor(numeric_for) => {
-                block_contains_unsupported_nodes(&mut numeric_for.block.lock())
+                unsupported_node_kind(&mut numeric_for.block.lock())
             }
             ast::Statement::GenericFor(generic_for) => {
-                block_contains_unsupported_nodes(&mut generic_for.block.lock())
+                unsupported_node_kind(&mut generic_for.block.lock())
             }
-            _ => false,
+            _ => None,
         };
-        if nested_internal_node {
-            return true;
+        if nested_internal_node.is_some() {
+            return nested_internal_node;
         }
 
-        let mut closure_internal_node = false;
+        let mut closure_internal_node = None;
         statement.traverse_rvalues(&mut |rvalue| {
-            if !closure_internal_node && let ast::RValue::Closure(closure) = rvalue {
-                closure_internal_node =
-                    block_contains_unsupported_nodes(&mut closure.function.lock().body);
+            if closure_internal_node.is_none()
+                && let ast::RValue::Closure(closure) = rvalue
+            {
+                closure_internal_node = unsupported_node_kind(&mut closure.function.lock().body);
             }
         });
-        if closure_internal_node {
-            return true;
+        if closure_internal_node.is_some() {
+            return closure_internal_node;
         }
     }
 
-    false
+    None
 }
 
 #[cfg(test)]
