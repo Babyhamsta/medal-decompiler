@@ -112,11 +112,76 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
 
+    fn value_renders_multiline(value: &RValue) -> bool {
+        match value {
+            RValue::Closure(closure) => !closure.function.lock().body.is_empty(),
+            RValue::Table(table) => Self::table_renders_multiline(table),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn statement_renders_multiline(statement: &Statement) -> bool {
+        match statement {
+            Statement::If(_)
+            | Statement::While(_)
+            | Statement::Repeat(_)
+            | Statement::NumericFor(_)
+            | Statement::GenericFor(_) => true,
+            Statement::Assign(assign) => {
+                assign.right.iter().any(Self::value_renders_multiline)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_declaration(statement: &Statement) -> bool {
+        matches!(statement, Statement::Assign(assign) if assign.prefix)
+    }
+
+    /// Whether a blank line belongs between two adjacent statements.
+    ///
+    /// `declaration_run` is the number of declarations immediately preceding
+    /// `next`, so a block of locals can be separated from the work that uses
+    /// them without splitting the block itself.
+    fn needs_blank_between(
+        previous: &Statement,
+        next: &Statement,
+        declaration_run: usize,
+    ) -> bool {
+        if matches!(previous, Statement::Comment(_) | Statement::Empty(_))
+            || matches!(next, Statement::Comment(_) | Statement::Empty(_))
+        {
+            return false;
+        }
+        if Self::statement_renders_multiline(previous)
+            || Self::statement_renders_multiline(next)
+        {
+            return true;
+        }
+        if matches!(next, Statement::Return(_)) {
+            return true;
+        }
+        declaration_run >= 2 && !Self::is_declaration(next)
+    }
+
     fn format_block_no_indent(&mut self, block: &Block) -> fmt::Result {
+        let mut declaration_run = 0usize;
         for (i, statement) in block.iter().enumerate() {
             if i != 0 {
                 writeln!(self.output)?;
+                if Self::needs_blank_between(
+                    &block[i - 1],
+                    statement,
+                    declaration_run,
+                ) {
+                    writeln!(self.output)?;
+                }
             }
+            declaration_run = if Self::is_declaration(statement) {
+                declaration_run + 1
+            } else {
+                0
+            };
             self.format_statement(statement)?;
             if let Some(next_statement) =
                 block.iter().skip(i + 1).find(|s| s.as_comment().is_none())
@@ -249,13 +314,24 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         same_target.then_some((target, binary.operation, binary.right.as_ref()))
     }
 
+    /// Whether `format_table` will place this table's fields on their own
+    /// lines.
+    ///
+    /// The blank-line predicate and the table writer must agree, so both read
+    /// this one definition rather than each deciding for themselves.
+    pub(crate) fn table_renders_multiline(table: &Table) -> bool {
+        let compacted = table.without_shadowed_literal_fields();
+        let sequential_keys = Self::are_table_keys_sequential(&compacted);
+        !compacted.0.is_empty() && (!sequential_keys || compacted.0.len() > 3)
+            || Self::contains_table(&compacted)
+    }
+
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
         let compacted = table.without_shadowed_literal_fields();
         let table = &compacted;
         let sequential_keys = Self::are_table_keys_sequential(table);
         let should_space = !table.0.is_empty();
-        let should_format = !table.0.is_empty() && (!sequential_keys || table.0.len() > 3)
-            || Self::contains_table(table);
+        let should_format = Self::table_renders_multiline(&compacted);
         write!(self.output, "{{")?;
         if should_format {
             writeln!(self.output)?;
@@ -885,8 +961,8 @@ mod tests {
 
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
-        Index, LValue, Literal, Local, MethodCall, RValue, RcLocal, ResultDemand, Return, Select,
-        Table, Upvalue, VarArg,
+        Index, LValue, Literal, Local, MethodCall, NumericFor, RValue, RcLocal, ResultDemand,
+        Return, Select, Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1187,5 +1263,74 @@ mod tests {
         assign.prefix = true;
 
         assert!(assign.to_string().starts_with("local function recurse()"));
+    }
+
+    #[test]
+    fn blank_line_separates_a_multiline_statement_from_its_neighbours() {
+        let counter = local("i");
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Assign::new(vec![local("c").into()], vec![Literal::Number(3.0).into()]).into(),
+        ]);
+
+        let formatted = block.to_string();
+
+        assert_eq!(
+            formatted,
+            "a = 1\n\nfor i = 1, 2 do\n\tb = 2\nend\n\nc = 3"
+        );
+    }
+
+    #[test]
+    fn consecutive_single_line_statements_stay_tight() {
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
+            Assign::new(vec![local("c").into()], vec![Literal::Number(3.0).into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\nb = 2\nc = 3");
+    }
+
+    #[test]
+    fn blank_line_precedes_a_return_that_follows_other_work() {
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\n\nreturn a");
+    }
+
+    #[test]
+    fn a_lone_return_gains_no_leading_blank_line() {
+        let block = Block(vec![Return::new(vec![local("a").into()]).into()]);
+
+        assert_eq!(block.to_string(), "return a");
+    }
+
+    #[test]
+    fn empty_closure_value_is_not_treated_as_multiline() {
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function::default()))),
+            upvalues: Vec::new(),
+        };
+        let block = Block(vec![
+            Assign::new(vec![local("f").into()], vec![closure.into()]).into(),
+            Assign::new(vec![local("g").into()], vec![Literal::Number(1.0).into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "f = function() end\ng = 1");
     }
 }

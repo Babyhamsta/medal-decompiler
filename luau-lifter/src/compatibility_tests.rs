@@ -284,7 +284,14 @@ fn adversarial_dataflow_preserves_capture_and_multireturn_boundaries() {
             .any(|line| line.trim_start().starts_with("for key, value in pairs(")),
         "{decompiled}"
     );
-    let lines = decompiled.lines().map(str::trim).collect::<Vec<_>>();
+    // Blank lines are deliberate formatting between statements now, so drop
+    // them before checking that two statements are adjacent (no other
+    // statement between them).
+    let lines = decompiled
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
 
     let seeded = lines
         .windows(2)
