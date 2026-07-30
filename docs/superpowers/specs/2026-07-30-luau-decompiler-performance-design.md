@@ -101,31 +101,44 @@ The report includes live-byte checkpoints across the pipeline. That is what
 distinguishes transient working set from retained memory, and it is the
 measurement that redirected this design away from retention-focused fixes.
 
-### Phase 1: Lazy Recovery Facts
+### Phase 1: Demand-Declared Recovery Facts (landed, `b0bf51d`)
 
-`RecoveryFacts::derive` eagerly builds seven fields. Production reads one:
+`RecoveryFacts::derive` eagerly builds seven fields. Production reads two:
 
-- `restructure/src/lib.rs:680` reads `candidate_regions`.
-- `luau-lifter/src/lib.rs:1041` reads `function_id()` in a `debug_assert`.
+- `restructure/src/lib.rs` reads `candidate_regions` and `edges`; the latter
+  pairs regions with the edges leaving them to find terminal returns.
+- `luau-lifter/src/lib.rs` reads `function_id()` in a `debug_assert`.
 
-`locals`, `statement_origins`, `edges`, `dominators`, `post_dominators`, and
-`effects` are built 1,812 times and never read outside `cfg`'s own tests.
-`derive_candidate_regions` computes from the function graph via
-`kosaraju_scc` and does not consult the other fields.
+`locals`, `statement_origins`, `dominators`, `post_dominators`, and `effects`
+are built 1,812 times and never read outside `cfg`'s own tests.
 
-`dominators` and `post_dominators` are `BTreeMap<NodeIndex, BTreeSet<NodeIndex>>`
-— materialized dominator sets per node, quadratic in block count. These are
-the leading suspect for the 3,134 MB peak.
+Facts cannot be computed on first access. They describe the function while it
+is still in SSA form, and every consumer runs after `ssa::Destructor` has
+discarded that information, so a lazily populated cache would answer from a
+destructed graph. Demand is declared up front through `FactSet`, and an
+unrequested fact reads back as `None` rather than as an empty collection
+indistinguishable from a genuinely empty result. `candidate_regions` stays
+unconditional because it costs one SCC pass.
 
-Change: convert the six unread fields from eager `pub` fields to accessors
-that compute on first call and memoize. The evidence surface stays available
-to tests and future passes; production stops paying for it.
+Measured cost of the seven fields, per 1,812 derivations:
 
-Accessors take `&self` and memoize, so `RecoveryFacts` gains interior
-mutability for the cached slots. `RecoveryFacts` derives `Clone`, `Debug`, and
-`PartialEq`; those impls must compare and clone the *logical* facts, not
-cache-population state, or two equal fact sets could compare unequal purely
-because one had been queried.
+| Sub-step | Seconds |
+| --- | ---: |
+| post-dominators | 5.44 |
+| statements and effects | 3.20 |
+| locals | 1.14 |
+| dominators | 0.085 |
+| edges | 0.025 |
+| candidate-regions | 0.010 |
+
+`derive_post_dominators` is the outlier. It seeds every non-exit node with a
+clone of the entire node set — quadratic in block count before the first
+iteration — then clones and intersects `BTreeSet`s to a fixpoint. Its
+near-linear neighbour `derive_dominators`, which delegates to petgraph's
+`simple_fast`, costs 64x less.
+
+Result: 33.9 s to 23.1 s, peak resident set 3,307 MB to 1,773 MB, allocations
+235.2 M to 136.1 M, output byte-identical.
 
 ### Phase 2: Single Derivation Per Scheduler Run
 
@@ -224,6 +237,33 @@ repository.
 **Real captures.** Located through a `MEDAL_CAPTURE_ROOT` environment
 variable, skipped when unset. Too large to commit, and the primary evidence for
 whether the work succeeded. stage-27 with its recorded hash is the gate.
+
+### Output Is Not Reproducible For Every Input
+
+Discovered while validating phase 1, and predating all work on this branch.
+
+`component-root-0031.luac` decompiles to a different byte stream on every run
+of an unmodified binary. Three consecutive runs produced three distinct
+SHA-256 values. Byte count and line count are stable; the content is not.
+
+Two distinct effects:
+
+- `RcLocal` implements `Display` for an unnamed local by hashing the local's
+  heap address, so `UNNAMED_<n>` identifiers vary per run.
+- Statement placement itself varies. A `local` table-constructor declaration
+  moved 87 lines between two runs, with local numbering shifting around it.
+  `RcLocal` orders and hashes by address, so any address-keyed collection
+  iterates in allocation order. `ast::local_declarations::declarations`
+  returns `BTreeSet<RcLocal>` and drives declaration placement, which matches
+  the observed symptom.
+
+stage-27 is unaffected: it contains no `UNNAMED_` identifiers and hashed
+identically across four runs spanning three builds. It remains a valid gate.
+
+Inputs that do contain unnamed locals cannot serve as byte-hash oracles until
+this is repaired, which limits how much of the capture corpus can gate this
+work. Repair is not scheduled here; it changes output for affected inputs and
+belongs in its own change.
 
 ## Acceptance Gates
 
