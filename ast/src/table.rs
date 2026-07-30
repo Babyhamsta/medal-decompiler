@@ -1,3 +1,4 @@
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use crate::{
     Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse, formatter::Formatter,
 };
@@ -57,7 +58,7 @@ impl Reduce for Table {
 }*/
 
 impl LocalRw for Table {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.0
             .iter()
             .flat_map(|(k, v)| k.iter().chain(iter::once(v)))
@@ -65,7 +66,7 @@ impl LocalRw for Table {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.0
             .iter_mut()
             .flat_map(|(k, v)| k.iter_mut().chain(iter::once(v)))
@@ -75,14 +76,14 @@ impl LocalRw for Table {
 }
 
 impl Traverse for Table {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.0
             .iter_mut()
             .flat_map(|(k, v)| k.iter_mut().chain(iter::once(v)))
             .collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.0
             .iter()
             .flat_map(|(k, v)| k.iter().chain(iter::once(v)))

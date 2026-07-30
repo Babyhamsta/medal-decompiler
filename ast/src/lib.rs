@@ -6,6 +6,7 @@ use enum_as_inner::EnumAsInner;
 use enum_dispatch::enum_dispatch;
 use formatter::Formatter;
 use itertools::Either;
+use smallvec::{SmallVec, smallvec};
 
 use std::{
     fmt,
@@ -82,6 +83,19 @@ use type_system::{Type, TypeSystem};
 pub use unary::*;
 pub use vararg::*;
 pub use r#while::*;
+
+/// Inline capacity for the per-node value and traversal lists below.
+///
+/// Every `LocalRw` and `Traverse` method returns one of these, once per node
+/// per visit, across dozens of passes. Returning `Vec` made each of those a
+/// heap allocation: on the stage-27 fixture 75% of all allocations were 32
+/// bytes or smaller, and 37% were a single pointer. Four inline slots absorb
+/// that without making the returned value unwieldy.
+pub type LocalRefs<'a> = SmallVec<[&'a RcLocal; 4]>;
+pub type LocalRefsMut<'a> = SmallVec<[&'a mut RcLocal; 4]>;
+pub type RValueRefs<'a> = SmallVec<[&'a RValue; 4]>;
+pub type RValueRefsMut<'a> = SmallVec<[&'a mut RValue; 4]>;
+pub type LValueRefsMut<'a> = SmallVec<[&'a mut LValue; 4]>;
 
 pub trait Reduce {
     fn reduce(self) -> RValue;
@@ -219,33 +233,33 @@ pub enum LValue {
 }
 
 impl LocalRw for LValue {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         match self {
-            LValue::Local(_) => Vec::new(),
+            LValue::Local(_) => SmallVec::new(),
             LValue::Global(global) => global.values_read(),
             LValue::Index(index) => index.values_read(),
         }
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         match self {
-            LValue::Local(_) => Vec::new(),
+            LValue::Local(_) => SmallVec::new(),
             LValue::Global(global) => global.values_read_mut(),
             LValue::Index(index) => index.values_read_mut(),
         }
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
+    fn values_written(&self) -> LocalRefs<'_> {
         match self {
-            LValue::Local(local) => vec![local],
+            LValue::Local(local) => smallvec![local],
             LValue::Global(global) => global.values_written(),
             LValue::Index(index) => index.values_written(),
         }
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
         match self {
-            LValue::Local(local) => vec![local],
+            LValue::Local(local) => smallvec![local],
             LValue::Global(global) => global.values_written_mut(),
             LValue::Index(index) => index.values_written_mut(),
         }

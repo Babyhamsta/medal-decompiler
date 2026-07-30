@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{LocalRw, RValue, RcLocal, SideEffects, Traverse, formatter::Formatter};
@@ -20,16 +22,16 @@ impl Conditional {
 }
 
 impl Traverse for Conditional {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![
-            &mut self.condition,
-            &mut self.then_value,
-            &mut self.else_value,
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![
+            &mut *self.condition,
+            &mut *self.then_value,
+            &mut *self.else_value,
         ]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.condition, &self.then_value, &self.else_value]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&*self.condition, &*self.then_value, &*self.else_value]
     }
 }
 
@@ -42,7 +44,7 @@ impl SideEffects for Conditional {
 }
 
 impl LocalRw for Conditional {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.condition
             .values_read()
             .into_iter()
@@ -51,7 +53,7 @@ impl LocalRw for Conditional {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.condition
             .values_read_mut()
             .into_iter()
@@ -125,7 +127,10 @@ mod tests {
             fallback.into(),
         );
 
-        assert_eq!(expression.values_read(), vec![&condition, &then_value]);
+        assert_eq!(
+            expression.values_read().as_slice(),
+            [&condition, &then_value]
+        );
         assert!(expression.has_side_effects());
     }
 }

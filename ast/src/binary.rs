@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse};
@@ -73,12 +75,12 @@ pub struct Binary {
 }
 
 impl Traverse for Binary {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.left, &mut self.right]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut *self.left, &mut *self.right]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.left, &self.right]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&*self.left, &*self.right]
     }
 }
 
@@ -314,7 +316,7 @@ impl Binary {
 }
 
 impl LocalRw for Binary {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.left
             .values_read()
             .into_iter()
@@ -322,7 +324,7 @@ impl LocalRw for Binary {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.left
             .values_read_mut()
             .into_iter()

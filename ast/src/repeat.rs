@@ -1,3 +1,5 @@
+use smallvec::{smallvec};
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use parking_lot::Mutex;
 use triomphe::Arc;
 
@@ -30,21 +32,21 @@ impl Repeat {
 }
 
 impl Traverse for Repeat {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        vec![&mut self.condition]
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        smallvec![&mut self.condition]
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        vec![&self.condition]
+    fn rvalues(&self) -> RValueRefs<'_> {
+        smallvec![&self.condition]
     }
 }
 
 impl LocalRw for Repeat {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.condition.values_read()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.condition.values_read_mut()
     }
 }

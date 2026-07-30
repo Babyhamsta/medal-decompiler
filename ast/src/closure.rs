@@ -1,3 +1,4 @@
+use crate::{LocalRefs,LocalRefsMut};
 use std::fmt;
 
 use by_address::ByAddress;
@@ -67,7 +68,7 @@ impl fmt::Display for Closure {
 }
 
 impl LocalRw for Closure {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.upvalues
             .iter()
             .map(|u| match u {
@@ -76,7 +77,7 @@ impl LocalRw for Closure {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.upvalues
             .iter_mut()
             .map(|u| match u {

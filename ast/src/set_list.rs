@@ -1,3 +1,4 @@
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use crate::{LocalRw, RValue, RcLocal, SideEffects, Traverse, formatter};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +26,7 @@ impl SetList {
 }
 
 impl LocalRw for SetList {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         let tail_locals = self
             .tail
             .as_ref()
@@ -37,7 +38,7 @@ impl LocalRw for SetList {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         let tail_locals = self
             .tail
             .as_mut()
@@ -64,11 +65,11 @@ impl SideEffects for SetList {
 }
 
 impl Traverse for SetList {
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         self.values.iter().chain(self.tail.as_ref()).collect()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         self.values.iter_mut().chain(self.tail.as_mut()).collect()
     }
 }

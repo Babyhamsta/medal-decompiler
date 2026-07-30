@@ -1,3 +1,5 @@
+use smallvec::{SmallVec, smallvec};
+use crate::{LocalRefs,LocalRefsMut};
 use crate::{SideEffects, Traverse, Type, TypeSystem, type_system::Infer};
 use by_address::ByAddress;
 use derive_more::From;
@@ -159,12 +161,12 @@ impl RcLocal {
 }
 
 impl LocalRw for RcLocal {
-    fn values_read(&self) -> Vec<&RcLocal> {
-        vec![self]
+    fn values_read(&self) -> LocalRefs<'_> {
+        smallvec![self]
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        vec![self]
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
+        smallvec![self]
     }
 }
 
@@ -216,23 +218,23 @@ mod identifier_tests {
 
 #[enum_dispatch]
 pub trait LocalRw {
-    fn values_read(&self) -> Vec<&RcLocal> {
-        Vec::new()
+    fn values_read(&self) -> LocalRefs<'_> {
+        SmallVec::new()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        Vec::new()
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
+        SmallVec::new()
     }
 
-    fn values_written(&self) -> Vec<&RcLocal> {
-        Vec::new()
+    fn values_written(&self) -> LocalRefs<'_> {
+        SmallVec::new()
     }
 
-    fn values_written_mut(&mut self) -> Vec<&mut RcLocal> {
-        Vec::new()
+    fn values_written_mut(&mut self) -> LocalRefsMut<'_> {
+        SmallVec::new()
     }
 
-    fn values(&self) -> Vec<&RcLocal> {
+    fn values(&self) -> LocalRefs<'_> {
         self.values_read()
             .into_iter()
             .chain(self.values_written())

@@ -1,3 +1,5 @@
+use smallvec::{SmallVec};
+use crate::{LValueRefsMut,RValueRefs,RValueRefsMut};
 use crate::{LValue, RValue};
 use enum_dispatch::enum_dispatch;
 use itertools::Either;
@@ -9,16 +11,16 @@ pub enum PreOrPost {
 
 #[enum_dispatch]
 pub trait Traverse {
-    fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
-        Vec::new()
+    fn lvalues_mut(&mut self) -> LValueRefsMut<'_> {
+        SmallVec::new()
     }
 
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
-        Vec::new()
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
+        SmallVec::new()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
-        Vec::new()
+    fn rvalues(&self) -> RValueRefs<'_> {
+        SmallVec::new()
     }
 
     // fn traverse_lvalues(

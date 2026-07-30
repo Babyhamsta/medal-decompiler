@@ -8,12 +8,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 struct TraverseSelf<'a, T: Traverse>(&'a mut T);
 
 impl<'a> Traverse for TraverseSelf<'a, ast::RValue> {
-    fn rvalues_mut(&mut self) -> Vec<&mut ast::RValue> {
-        vec![self.0]
+    fn rvalues_mut(&mut self) -> ast::RValueRefsMut<'_> {
+        smallvec::smallvec![&mut *self.0]
     }
 
-    fn rvalues(&self) -> Vec<&ast::RValue> {
-        vec![self.0]
+    fn rvalues(&self) -> ast::RValueRefs<'_> {
+        smallvec::smallvec![&*self.0]
     }
 }
 

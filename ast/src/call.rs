@@ -1,3 +1,4 @@
+use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use std::fmt;
 
 use crate::{LocalRw, RcLocal, Traverse, formatter::Formatter, has_side_effects};
@@ -30,13 +31,13 @@ has_side_effects!(Call);
 // }
 
 impl Traverse for Call {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         std::iter::once(self.value.as_mut())
             .chain(self.arguments.iter_mut())
             .collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         std::iter::once(self.value.as_ref())
             .chain(self.arguments.iter())
             .collect()
@@ -44,7 +45,7 @@ impl Traverse for Call {
 }
 
 impl LocalRw for Call {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.value
             .values_read()
             .into_iter()
@@ -52,7 +53,7 @@ impl LocalRw for Call {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.value
             .values_read_mut()
             .into_iter()
@@ -94,13 +95,13 @@ impl MethodCall {
 has_side_effects!(MethodCall);
 
 impl Traverse for MethodCall {
-    fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
+    fn rvalues_mut(&mut self) -> RValueRefsMut<'_> {
         std::iter::once(self.value.as_mut())
             .chain(self.arguments.iter_mut())
             .collect()
     }
 
-    fn rvalues(&self) -> Vec<&RValue> {
+    fn rvalues(&self) -> RValueRefs<'_> {
         std::iter::once(self.value.as_ref())
             .chain(self.arguments.iter())
             .collect()
@@ -108,7 +109,7 @@ impl Traverse for MethodCall {
 }
 
 impl LocalRw for MethodCall {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn values_read(&self) -> LocalRefs<'_> {
         self.value
             .values_read()
             .into_iter()
@@ -116,7 +117,7 @@ impl LocalRw for MethodCall {
             .collect()
     }
 
-    fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+    fn values_read_mut(&mut self) -> LocalRefsMut<'_> {
         self.value
             .values_read_mut()
             .into_iter()
