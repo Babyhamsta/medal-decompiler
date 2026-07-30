@@ -263,7 +263,39 @@ the ceiling is near 2x. A bounded pool is required because peak memory is
 per-function transient: an unbounded pool multiplies peak by the worker count,
 trading the memory goal for the speed goal.
 
-### Phase 6: Reconstruction Failure on `-g0` Round-Trip
+### Phase 6: Reconstruction Failure on `-g0` Round-Trip (landed)
+
+One function of 486 was responsible. Its body had the shape
+
+    ::l0::
+    while true do
+        if true then goto l8 end
+        ...
+    end
+    ::l8::
+    while ... do ... end
+    goto l0
+
+Both jumps are structurally expressible. `goto l8` targets the statement
+immediately after its enclosing loop, which is what `break` means. `goto l0`
+closing a block that opens with `::l0::` is an infinite loop, and
+`recover_terminal_backedge_loop` already handled that.
+
+It never ran. That pass requires the interior to be free of unstructured
+jumps, and the unrecovered `goto l8` sat inside it. A single unexpressed loop
+exit left a 33,870-line function unstructured, and with it the entire chunk.
+
+Fix: rewrite a jump to the statement following a loop as `break`, before
+terminal back-edge recovery, then drop labels no `goto` still targets. Jumps
+out of *nested* loops are deliberately left alone, since `break` binds to the
+innermost enclosing loop.
+
+The capture now decompiles to 283,242 lines and parses under Luau 0.731. It
+does not compile: one function holds roughly 1,800 simultaneous locals against
+a 255-register limit. That is local scoping, not control flow, it predates
+this change, and it is not addressed here.
+
+### Phase 6 (original plan)
 
 `medal-full-v12-recompiled-g0.luac` fails after 26.5 s and 3.2 GB with
 `reconstruction left internal goto, label, or set-list nodes`, emitting
@@ -354,13 +386,22 @@ justify its complexity is reverted.
 
 ## Success Criteria
 
-- Wall clock on stage-27 below 15 s, from 33.9 s.
-- Peak resident set on stage-27 below 1,200 MB, from 3,307 MB.
-- Output byte-identical on every currently-succeeding input.
-- `medal-full-v12-recompiled-g0.luac` produces parseable output.
+| Criterion | Target | Result |
+| --- | --- | --- |
+| Wall clock on stage-27 | under 15 s, from 33.9 s | 13.9 s, met |
+| Peak resident set on stage-27 | under 1,200 MB, from 3,307 MB | 1,826 MB, not met |
+| Output byte-identical on currently-succeeding inputs | required | met, with the reproducibility rebaseline |
+| `medal-full-v12-recompiled-g0.luac` parses | required | met; does not compile |
 
-The time target follows from phases 1-3 alone (~12 s of measured redundant
-work) plus phase 5's bounded parallelism. The memory target assumes the
-quadratic dominator sets are in fact the peak; if measurement after phase 1
-contradicts that, the target is restated against evidence rather than pursued
-by other means.
+Phase 5 was dropped, so the time target was met without parallelism.
+
+The memory target was set on the assumption that the quadratic dominator sets
+were the whole peak. They were roughly half: removing them took the peak from
+3,307 MB to 1,773 MB. mimalloc then added 97 MB back in exchange for 24% of
+runtime. Reaching 1,200 MB would need per-function transient working set
+reduced further, in `ssa` and `structure`, which no phase here attempted. The
+target is left recorded as missed rather than restated to match the outcome.
+
+The g0 capture parses but exceeds the 255-register limit in one function
+holding roughly 1,800 simultaneous locals. Control-flow reconstruction is
+repaired; local scoping is not.
