@@ -2,7 +2,12 @@ return function(subject)
     local groups = {
         { items = { "a", "b" } },
         { disabled = true, items = { "target" } },
-        { items = { "c", "target", "d" } },
+        { items = { "c", false, "target" } },
+        { items = { "target", "d" } },
     }
-    return subject(groups, "target"), subject(groups, "absent")
+
+    local outerFound, innerFound, itemFound = subject(groups, "target")
+    local missing = subject(groups, "absent")
+
+    return outerFound, innerFound, itemFound, missing
 end

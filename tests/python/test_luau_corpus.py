@@ -47,6 +47,10 @@ class ProfileTests(unittest.TestCase):
             sorted(cases - self.UNPROBEABLE_CASES),
             sorted(TRUSTED_SEMANTIC_PROBES),
         )
+        self.assertEqual(
+            tuple(TRUSTED_SEMANTIC_PROBES),
+            tuple(sorted(TRUSTED_SEMANTIC_PROBES)),
+        )
 
         for name, probe in TRUSTED_SEMANTIC_PROBES.items():
             with self.subTest(case=name):
@@ -169,7 +173,8 @@ end
                 "s7:enabled;b0;s7:message;s5:medal;}]"
             ),
             "02_expression_precedence": (
-                "p7[d14.199999999999999;d11;d0;d0;s9:value:0:7;b0;b0;]"
+                "p15[d14.199999999999999;d-1;s9:value:5:4;b1;b1;d11;d24;s9:value:4:2;b0;"
+                "b1;d0;d0;s9:value:0:7;b0;b0;]"
             ),
             "03_parallel_assignment": "p6[d1;n;d3;d3;d2;d1;]",
             "04_calls_multireturn": "p2[s5:q=5:4;d12;]",
@@ -193,51 +198,53 @@ end
                 "s5:child;t2{d1;d42;s7:enabled;b1;}s5:extra;d42;}]"
             ),
             "09_if_elseif_else": (
-                "p4[s6:inside;s7:outside;s7:outside;s8:negative;]"
+                "p6[s6:inside;s7:outside;s7:outside;s8:negative;s4:zero;s6:almost;]"
             ),
             "10_short_circuit": (
-                "p4[b0;b1;d7;"
-                "t5{d1;s1:a;d2;s1:b;d3;s1:x;d4;s4:left;d5;s8:fallback;}]"
+                "p12[b0;b1;d7;t5{d1;s1:a;d2;s1:b;d3;s1:x;d4;s4:left;d5;s8:fallback;}d9;b"
+                "1;b1;t5{d1;s1:a;d2;s1:b;d3;s1:c;d4;s1:x;d5;s4:left;}b0;d3;d3;t5{d1;s1:a"
+                ";d2;s1:x;d3;s1:y;d4;s1:z;d5;s8:fallback;}]"
             ),
             "11_conditional_expression": (
-                "p3[t2{s3:tag;s3:low;s5:value;d1;}"
-                "t2{s3:tag;s6:inside;s5:value;d7;}"
-                "t2{s3:tag;s4:high;s5:value;d12;}]"
+                "p5[t2{s3:tag;s3:low;s5:value;d1;}t2{s3:tag;s6:inside;s5:value;d7;}t2{s3"
+                ":tag;s4:high;s5:value;d12;}t2{s3:tag;s3:low;s5:value;d-4;}t2{s3:tag;s4:"
+                "high;s5:value;d18;}]"
             ),
-            "12_while_break_continue": "p2[d20;d7;]",
+            "12_while_break_continue": "p4[d20;d7;d4;d6;]",
             "13_repeat_until": "p2[d10;d6;]",
-            "14_numeric_for": "p1[d81;]",
+            "14_numeric_for": "p2[d81;d72;]",
             "15_generic_for": (
                 "p1[t8{d1;d4;d2;d8;d3;d20;d4;d12;"
                 "d5;d6;d6;d2;d7;d0;s4:name;s4:kept;}]"
             ),
             "16_closure_capture": (
-                "p4[s9:transform;s9:transform;s9:transform;d53;]"
+                "p6[s9:transform;d8;s9:transform;d13;s9:transform;d53;]"
             ),
-            "17_mutable_upvalue": "p3[d5;d6;d7;]",
+            "17_mutable_upvalue": "p6[d5;d3;d3;d8;d8;d7;]",
             "19_callback_factory": "p5[s4:id-a;d16;d3;s3:id-;d16;]",
             "20_pcall_style_flow": (
                 "p3[p2[d7;d8;]p2[d9;s9:recovered;]"
                 "p2[n;s13:still missing;]]"
             ),
             "21_state_machine": "p3[s4:done;d1;d3;]",
-            "22_nested_early_exits": "p2[d3;n;]",
+            "22_nested_early_exits": "p4[d4;d1;s6:target;n;]",
             "23_register_pressure_aliases": (
-                "p6[d94;d194;"
-                "t14{d10;d29;d11;d30;d12;d31;d13;d32;d14;d33;"
-                "d1;d20;d2;d21;d3;d22;d4;d23;d5;d24;"
-                "d6;d25;d7;d26;d8;d27;d9;d28;}"
-                "d6;d14;d22;]"
+                "p12[d94;d194;t14{d10;d29;d11;d30;d12;d31;d13;d32;d14;d33;d1;d20;d2;d21;"
+                "d3;d22;d4;d23;d5;d24;d6;d25;d7;d26;d8;d27;d9;d28;}d6;d14;d22;d118;d218;"
+                "t14{d10;d29;d11;d30;d12;d31;d13;d32;d14;d33;d1;d20;d2;d21;d3;d22;d4;d23"
+                ";d5;d24;d6;d25;d7;d26;d8;d27;d9;d28;}d6;b0;d22;]"
             ),
             "24_wonky_integration": (
-                "p3[s4:done;d15;t6{"
-                "d1;t3{s5:label;s5:start;s5:state;s7:running;s5:value;d1;}"
-                "d2;t3{s5:label;s3:add;s5:state;s7:running;s5:value;d9;}"
-                "d3;t3{s5:label;s5:pause;s5:state;s6:paused;s5:value;d9;}"
-                "d4;t3{s5:label;s6:resume;s5:state;s7:running;s5:value;d9;}"
-                "d5;t3{s5:label;s3:add;s5:state;s7:running;s5:value;d15;}"
-                "d6;t3{s5:label;s4:stop;s5:state;s4:done;s5:value;d15;}"
-                "}]"
+                "p6[s4:done;d15;t6{d1;t3{s5:label;s5:start;s5:state;s7:running;s5:value;"
+                "d1;}d2;t3{s5:label;s3:add;s5:state;s7:running;s5:value;d9;}d3;t3{s5:lab"
+                "el;s5:pause;s5:state;s6:paused;s5:value;d9;}d4;t3{s5:label;s6:resume;s5"
+                ":state;s7:running;s5:value;d9;}d5;t3{s5:label;s3:add;s5:state;s7:runnin"
+                "g;s5:value;d15;}d6;t3{s5:label;s4:stop;s5:state;s4:done;s5:value;d15;}}"
+                "s7:running;d2;t5{d1;t3{s5:label;s5:start;s5:state;s7:running;s5:value;d"
+                "1;}d2;t3{s5:label;s7:unknown;s5:state;s7:running;s5:value;s5:weird;}d3;"
+                "t2{s5:label;s7:unknown;s5:state;s7:running;}d4;t3{s5:label;s5:error;s5:"
+                "state;s7:running;s5:value;d3;}d5;t3{s5:label;s7:unknown;s5:state;s7:run"
+                "ning;s5:value;b0;}}]"
             ),
             "25_product_controller": (
                 "p5[b1;s6:pong:1;b1;s16:fallback:missing;d2;]"
