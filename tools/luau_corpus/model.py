@@ -20,6 +20,14 @@ class RuntimeResult:
 
 
 @dataclass(frozen=True)
+class ReadabilityMetrics:
+    blank_lines: int
+    generated_placeholder_locals: int
+    slot_assignments: int
+    long_lines: int
+
+
+@dataclass(frozen=True)
 class CaseResult:
     case_name: str
     profile: str
@@ -37,6 +45,10 @@ class CaseResult:
     source_runtime: RuntimeResult | None = None
     generated_runtime: RuntimeResult | None = None
     semantic_match: bool | None = None
+    blank_lines: int = 0
+    generated_placeholder_locals: int = 0
+    slot_assignments: int = 0
+    long_lines: int = 0
 
 
 @dataclass(frozen=True)

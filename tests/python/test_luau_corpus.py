@@ -17,6 +17,7 @@ from tools.luau_corpus.process import (
     compiler_command,
     count_trivial_aliases,
     decompiler_command,
+    readability_metrics,
     run_corpus,
 )
 from tools.luau_corpus.report import write_json_summary, write_markdown_summary
@@ -300,6 +301,43 @@ end
             observed.append(compiled.stdout[0])
 
         self.assertEqual(observed, [9, 10, 11, 12])
+
+    def test_readability_metrics_count_spacing_names_and_slots(self) -> None:
+        source = textwrap.dedent(
+            """\
+            local v1 = {}
+
+            v1[1] = "a"
+            v1[2] = "b"
+            local named = v1
+
+            local wide = "0123456789"
+            """
+        )
+
+        metrics = readability_metrics(source)
+
+        self.assertEqual(metrics.blank_lines, 2)
+        self.assertEqual(metrics.generated_placeholder_locals, 1)
+        self.assertEqual(metrics.slot_assignments, 2)
+        self.assertEqual(metrics.long_lines, 0)
+
+    def test_readability_metrics_flag_only_lines_past_the_column_budget(
+        self,
+    ) -> None:
+        short = "local a = " + '"' + "x" * 100 + '"'
+        long = "local b = " + '"' + "y" * 130 + '"'
+
+        metrics = readability_metrics(f"{short}\n{long}\n")
+
+        self.assertEqual(metrics.long_lines, 1)
+
+    def test_placeholder_local_metric_ignores_meaningful_names(self) -> None:
+        source = "local v1, v2 = 1, 2\nlocal stack = {}\nlocal p3 = 4\n"
+
+        metrics = readability_metrics(source)
+
+        self.assertEqual(metrics.generated_placeholder_locals, 3)
 
 
 class CorpusRunnerTests(unittest.TestCase):
