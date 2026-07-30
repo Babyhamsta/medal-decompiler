@@ -36,6 +36,52 @@ impl Evidence {
     }
 }
 
+/// Names for values whose producing call fixes their meaning.
+///
+/// Only entries whose name is certain belong here. A wrong name is worse
+/// than a generic one, because it asserts something false about the code.
+const LIBRARY_RETURN_NAMES: &[(&[u8], &[u8], &str)] = &[
+    (b"table", b"pack", "packed"),
+    (b"table", b"create", "buffer"),
+    (b"table", b"concat", "text"),
+    (b"string", b"format", "text"),
+    (b"string", b"rep", "text"),
+    (b"coroutine", b"create", "thread"),
+    (b"os", b"clock", "started"),
+];
+
+/// Names a call's result from the specific library function that produced
+/// it. Matches on the global's name alone, not its origin: real-world
+/// bytecode (hardened or reconstructed scripts especially) often reaches
+/// `table.pack` through plain `GETGLOBAL`/`GETTABLEKS` rather than the
+/// compiler's `GETIMPORT` encoding, so restricting to
+/// `GlobalOrigin::CompilerImport` misses the majority of these calls.
+fn library_return_name(value: &RValue) -> Option<&'static str> {
+    let call = match value {
+        RValue::Call(call) | RValue::Select(crate::Select::Call(call)) => call,
+        _ => return None,
+    };
+    match call.value.as_ref() {
+        RValue::Index(index) => {
+            let RValue::Global(namespace) = index.left.as_ref() else {
+                return None;
+            };
+            let RValue::Literal(crate::Literal::String(member)) = index.right.as_ref() else {
+                return None;
+            };
+            LIBRARY_RETURN_NAMES
+                .iter()
+                .find(|(space, name, _)| {
+                    *space == namespace.name() && name == &member.as_slice()
+                })
+                .map(|(_, _, label)| *label)
+        }
+        RValue::Global(global) if global.name() == b"setmetatable" => Some("object"),
+        RValue::Global(global) if global.name() == b"pcall" => Some("ok"),
+        _ => None,
+    }
+}
+
 fn initializer_shape(value: &RValue) -> Option<&'static str> {
     match value {
         RValue::Closure(_) => Some("handler"),
@@ -53,7 +99,9 @@ fn initializer_shape(value: &RValue) -> Option<&'static str> {
             });
             Some(if all_string_keys { "record" } else { "slots" })
         }
-        RValue::Call(_) | RValue::Select(crate::Select::Call(_)) => Some("result"),
+        RValue::Call(_) | RValue::Select(crate::Select::Call(_)) => {
+            Some(library_return_name(value).unwrap_or("result"))
+        }
         RValue::MethodCall(_) => Some("result"),
         RValue::Index(_) | RValue::Global(_) => Some("value"),
         _ => None,
@@ -943,6 +991,52 @@ mod tests {
         name_locals(&mut block, false);
 
         assert_eq!(local_name(&message), "text");
+    }
+
+    #[test]
+    fn table_pack_result_is_named_packed() {
+        let packed = local(None);
+        // `Global::new` (Dynamic origin) rather than `compiler_import`: hardened
+        // and reconstructed bytecode commonly reaches `table.pack` through plain
+        // GETGLOBAL/GETTABLEKS, so the match must not require the compiler's
+        // GETIMPORT encoding.
+        let call = Call::new(
+            crate::Index::new(
+                Global::new(b"table".to_vec()).into(),
+                Literal::String(b"pack".to_vec()).into(),
+            )
+            .into(),
+            Vec::new(),
+        );
+        let mut block = Block(vec![
+            declaration(&packed, call.into()).into(),
+            Return::new(vec![packed.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&packed), "packed");
+    }
+
+    #[test]
+    fn library_call_without_a_lookup_entry_falls_back_to_result() {
+        let outcome = local(None);
+        let call = Call::new(
+            crate::Index::new(
+                Global::new(b"math".to_vec()).into(),
+                Literal::String(b"random".to_vec()).into(),
+            )
+            .into(),
+            Vec::new(),
+        );
+        let mut block = Block(vec![
+            declaration(&outcome, call.into()).into(),
+            Return::new(vec![outcome.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&outcome), "result");
     }
 
     #[test]
