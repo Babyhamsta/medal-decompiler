@@ -20,6 +20,11 @@ decompiles to 5,525,808 bytes across 248,778 lines.
 
 - Decompiled output for any currently-succeeding input must remain
   byte-identical. This is a hard gate, not a goal.
+- Two changes are exempt, each for a stated reason and each shipped alone: the
+  reproducibility repair, which cannot fix run-to-run variation without
+  changing the output it varies over, and phase 6, which repairs an input that
+  currently produces no output at all. Both rebaseline the gate rather than
+  weaken it.
 - Keep the existing lifter, CFG, SSA, restructuring, AST, and formatter
   architecture. No replacement IR.
 - Public API of `cfg` may gain accessors but must not lose capability.
@@ -39,7 +44,8 @@ Release build at `04d7f9d`, single run, Windows 11, stage-27 fixture.
 | Total allocated | 38,032 MB |
 | Total allocations | 235,178,274 |
 | Output | 5,525,808 bytes / 248,778 lines |
-| Output SHA-256 | `4eda076821e7edfdccb6517e464aee9b2d97ece7365a010fd8979ca41a241544` |
+| Output SHA-256 at `04d7f9d` | `4eda076821e7edfdccb6517e464aee9b2d97ece7365a010fd8979ca41a241544` |
+| Output SHA-256 after the reproducibility repair | `b2f2f55ddf93111f21c87d8a702660e0ed82ac82deeb3ac3a9a00c2fb0e2d8ac` |
 
 Exclusive time and allocation by phase, across 486 functions:
 
@@ -238,32 +244,42 @@ repository.
 variable, skipped when unset. Too large to commit, and the primary evidence for
 whether the work succeeded. stage-27 with its recorded hash is the gate.
 
-### Output Is Not Reproducible For Every Input
+### Output Reproducibility (repaired)
 
 Discovered while validating phase 1, and predating all work on this branch.
 
-`component-root-0031.luac` decompiles to a different byte stream on every run
-of an unmodified binary. Three consecutive runs produced three distinct
-SHA-256 values. Byte count and line count are stable; the content is not.
+`component-root-0031.luac` decompiled to a different byte stream on every run
+of an unmodified binary; three consecutive runs produced three distinct
+SHA-256 values. Byte count and line count were stable, the content was not.
 
-Two distinct effects:
+`RcLocal` derived `Eq`, `Ord`, and `Hash` from the heap address of its
+allocation, and rendered an unnamed local by hashing that address. Two
+consequences: `UNNAMED_<n>` identifiers varied per run, and every collection
+keyed by a local iterated in allocator placement order. `BTreeSet<RcLocal>`
+returned from `ast::local_declarations::declarations` drives declaration
+placement, so statement order moved with it — one `local` table-constructor
+declaration shifted 87 lines between runs.
 
-- `RcLocal` implements `Display` for an unnamed local by hashing the local's
-  heap address, so `UNNAMED_<n>` identifiers vary per run.
-- Statement placement itself varies. A `local` table-constructor declaration
-  moved 87 lines between two runs, with local numbering shifting around it.
-  `RcLocal` orders and hashes by address, so any address-keyed collection
-  iterates in allocation order. `ast::local_declarations::declarations`
-  returns `BTreeSet<RcLocal>` and drives declaration placement, which matches
-  the observed symptom.
+Repair: identity is now a process-wide creation sequence number. This
+preserves the identity relation exactly — one id per allocation, shared by
+clones, never reused — while making iteration order reproducible.
+Construction is confined to `RcLocal::new` and `RcLocal::default`, so no path
+can pair an existing allocation with a fresh id.
 
-stage-27 is unaffected: it contains no `UNNAMED_` identifiers and hashed
-identically across four runs spanning three builds. It remains a valid gate.
+The repair changes output for inputs whose ordering previously depended on
+addresses. On stage-27 the byte count and line count are unchanged and the
+diff is confined to independent `local` declarations swapping emission order
+with consistent renumbering; the reordered declarations do not reference each
+other, and `ast::validate_bindings` — which rejects any local reference that
+does not resolve to its lexical binding — passes. The stage-27 gate hash is
+rebaselined accordingly.
 
-Inputs that do contain unnamed locals cannot serve as byte-hash oracles until
-this is repaired, which limits how much of the capture corpus can gate this
-work. Repair is not scheduled here; it changes output for affected inputs and
-belongs in its own change.
+**Constraint on phase 5.** Determinism here relies on single-threaded
+execution. Under cross-function parallelism, relative order within a function
+survives, because one thread creates that function's locals in program order
+against a monotonic counter — but absolute ids depend on interleaving, so
+`UNNAMED_<id>` text would vary per run. Phase 5 must either namespace ids per
+function or assign every unnamed local a deterministic name before formatting.
 
 ## Acceptance Gates
 
@@ -271,8 +287,8 @@ Every phase must pass all four before it lands:
 
 1. `cargo +nightly test --workspace`
 2. `python tools/run_luau_corpus.py --profiles all`
-3. stage-27 output SHA-256 equals
-   `4eda076821e7edfdccb6517e464aee9b2d97ece7365a010fd8979ca41a241544`
+3. stage-27 output SHA-256 equals (rebaselined by the reproducibility repair)
+   `b2f2f55ddf93111f21c87d8a702660e0ed82ac82deeb3ac3a9a00c2fb0e2d8ac`
 4. Generated stress corpus output hashes unchanged from the previous phase
 
 Phase 6 is exempt from gate 3 only for the input it repairs; stage-27 must

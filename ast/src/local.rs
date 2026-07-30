@@ -2,11 +2,11 @@ use crate::{SideEffects, Traverse, Type, TypeSystem, type_system::Infer};
 use by_address::ByAddress;
 use derive_more::From;
 use enum_dispatch::enum_dispatch;
-use nohash_hasher::NoHashHasher;
 use parking_lot::Mutex;
 use std::{
     fmt::{self, Display},
     hash::{Hash, Hasher},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use triomphe::Arc;
 
@@ -75,8 +75,58 @@ impl fmt::Display for Local {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RcLocal(pub ByAddress<Arc<Mutex<Local>>>);
+static NEXT_LOCAL_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_local_id() -> u64 {
+    NEXT_LOCAL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A local's identity is its creation sequence number, not its heap address.
+///
+/// Locals are hashed, compared, and ordered throughout the pipeline, and
+/// several passes iterate collections keyed by them — `BTreeSet<RcLocal>` in
+/// `local_declarations` drives declaration placement. Deriving those traits
+/// from the address made iteration follow allocator placement, so the same
+/// input decompiled to a different byte stream on each run.
+///
+/// A creation counter preserves the identity relation exactly: one id per
+/// allocation, shared by clones, never reused. Construction is confined to
+/// `new` and `default`, so no path can pair an existing allocation with a
+/// fresh id.
+#[derive(Debug, Clone)]
+pub struct RcLocal(pub ByAddress<Arc<Mutex<Local>>>, u64);
+
+impl Default for RcLocal {
+    fn default() -> Self {
+        Self::new(Local::default())
+    }
+}
+
+impl PartialEq for RcLocal {
+    fn eq(&self, other: &Self) -> bool {
+        self.1 == other.1
+    }
+}
+
+impl Eq for RcLocal {}
+
+impl PartialOrd for RcLocal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RcLocal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.1.cmp(&other.1)
+    }
+}
+
+impl Hash for RcLocal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.1.hash(state);
+    }
+}
 
 impl Infer for RcLocal {
     fn infer<'a: 'b, 'b>(&'a mut self, system: &mut TypeSystem<'b>) -> Type {
@@ -88,11 +138,7 @@ impl Display for RcLocal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0.0.lock().0 {
             Some(name) => write!(f, "{}", name),
-            None => {
-                let mut hasher = NoHashHasher::<u8>::default();
-                self.hash(&mut hasher);
-                write!(f, "UNNAMED_{}", hasher.finish())
-            }
+            None => write!(f, "UNNAMED_{}", self.1),
         }
     }
 }
@@ -103,7 +149,12 @@ impl Traverse for RcLocal {}
 
 impl RcLocal {
     pub fn new(local: Local) -> Self {
-        Self(ByAddress(Arc::new(Mutex::new(local))))
+        Self(ByAddress(Arc::new(Mutex::new(local))), next_local_id())
+    }
+
+    /// The creation sequence number that gives this local its identity.
+    pub const fn id(&self) -> u64 {
+        self.1
     }
 }
 
