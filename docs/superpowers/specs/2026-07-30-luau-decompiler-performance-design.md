@@ -207,7 +207,37 @@ Measurements comparing two builds are taken by alternating them within one
 session and comparing minima, never by comparing single runs recorded minutes
 apart.
 
-### Phase 4: Allocation Churn
+### Phase 4: Allocation Churn (landed)
+
+An allocation-size histogram settled what to do. Of 138.8 million allocations,
+89.7% were 64 bytes or smaller and 37.2% were a single pointer — the shape of
+a one-element `Vec<&RcLocal>` returned from a traversal method.
+
+Two independent changes, landed separately:
+
+1. **mimalloc on native builds.** 19.42 s to 14.67 s, a 24% reduction, with
+   allocation counts unchanged; the entire gain is cost per allocation. This
+   trades memory for speed rather than improving both: peak resident set rises
+   from 1,725 MB to 1,822 MB because freed pages are retained in thread-local
+   caches. Default feature; `luau-worker` targets wasm and opts out.
+2. **SmallVec for per-node value lists.** Four inline slots cover the
+   32-byte-and-under tier. Allocations fall 138.8 M to 55.6 M, a 60%
+   reduction; wall clock 14.31 s to 13.87 s, 3%.
+
+The ordering matters and understates the second change. mimalloc had already
+reduced the cost of an allocation to a few nanoseconds, so removing 83 million
+of them recovers only 0.44 s. Measured against the system heap the same change
+would be worth considerably more. It is kept both for that reason and because
+it removes allocator traffic ahead of the parallelism phase, where contention
+costs more than raw allocation does here.
+
+Two hazards for later work in this area. `Box`-typed fields need explicit
+reborrows, because the `smallvec!` macro does not receive the deref coercion
+that `vec!` got from its expected type. `SmallVec`'s `Drop` lacks the dropck
+eyepatch that lets `Vec`'s borrows end early under NLL, so a binding holding
+`values_read()` output keeps its receiver borrowed to end of scope.
+
+### Phase 4 (original plan)
 
 235 million allocations for a 7.8 MB input. `inline` (6.70 s) and `ssa`
 (4.42 s, 53 M allocations) dominate what remains after phases 1-3.
