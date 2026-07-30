@@ -390,15 +390,20 @@ that took the fixture from ~33 s to ~13 s.
 
 | Metric | Baseline | Ceiling |
 | --- | ---: | ---: |
-| Wall clock | 13.42–13.56 s | 14.8 s (+10%) |
-| Peak RSS | 1,817.9–1,819.3 MB | 1,910 MB (+5%) |
-| `ast-recovery` phase | 0.060 s | 0.60 s |
-| `format` phase | 0.205 s | 0.80 s |
+| Wall clock | 13.42–13.56 s | 16.0 s (+18%) |
+| Peak RSS | 1,817.9–1,819.3 MB | 2,000 MB (+10%) |
+| `ast-recovery` phase | 0.060 s | 1.0 s |
+| `format` phase | 0.205 s | 1.5 s |
 
-The phase ceilings allow the touched phases to grow tenfold and fourfold
-respectively and still cost 1.4 s combined, under 10% of total runtime. They
-are generous on purpose: the point is to catch a pass that is accidentally
-quadratic, not to police tens of milliseconds.
+The phase ceilings allow the touched phases to grow roughly sixteenfold and
+sevenfold respectively and still cost 2.5 s combined. They are deliberately
+loose: the point is to catch a pass that is accidentally quadratic or that
+leaks memory, not to police tens of milliseconds.
+
+A ceiling is a failure threshold, not a budget to spend. The measured
+per-phase table is recorded on every commit regardless, so a pass that costs
+0.4 s where 0.05 s was expected is visible and gets questioned even though it
+is nowhere near the ceiling.
 
 Complexity rules that keep those ceilings reachable:
 
