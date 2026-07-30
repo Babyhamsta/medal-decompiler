@@ -459,7 +459,30 @@ rather than only shape:
 | `28_escaping_slot_table` | Table passed to a call mid-sequence — precondition 4 |
 | `29_slot_metatable` | `__index`/`__newindex` on the slot table — precondition 6 |
 | `30_aliased_slot_write` | Two locals bound to the same table — preconditions 2 and 4 |
-| `31_nonconstant_slot_key` | `t[i]` where `i` is computed — preconditions 1 and 5 |
+| `31_nonconstant_slot_key` | `t[i]` where `i` is computed — preconditions 1 and 4 |
+
+### Precondition 5 is subsumed and cannot be isolated
+
+Precondition 5 (no write to `T` anywhere in the function uses a computed key)
+has no case of its own because no such case exists.
+
+Precondition 4 already treats *any* assignment whose target is an index
+expression as side-effecting, with no carve-out for computed versus constant
+keys. That covers every computed-key write inside a fold window. Outside the
+window, a computed-key write before the target write is overwritten by it, so
+folding stays safe; one after the read cannot retroactively change a value
+already read, and any later read of the same slot is blocked independently by
+preconditions 3 and 4.
+
+Two independent attempts to construct a program where precondition 5 is the
+only thing preventing a wrong fold failed, one of them checked against the
+concrete algorithm rather than this document. Precondition 5 is therefore
+redundant given preconditions 3 and 4.
+
+It stays in the implementation as a cheap explicit guard — a redundant check
+that costs nothing is worth keeping when the cost of being wrong is silently
+incorrect output. But it must not be counted as independently verified
+coverage, and no case should claim to test it.
 | `32_slot_across_control_flow` | Write in one branch, read after the join — precondition 3 |
 
 ### Real-file regression fixture
