@@ -60,7 +60,7 @@ impl GraphStructurer {
             function,
             loop_headers: FxHashSet::default(),
             recovery_region_headers: recovery
-                .candidate_regions
+                .candidate_regions()
                 .iter()
                 .map(|region| region.header)
                 .collect(),
@@ -677,9 +677,11 @@ fn collect_region_terminal_returns(
     recovery: &cfg::recovery::RecoveryFacts,
 ) -> Vec<ast::Return> {
     let mut returns = Vec::new();
-    for region in &recovery.candidate_regions {
-        for mut target in recovery
-            .edges
+    let edges = recovery
+        .edges()
+        .expect("reconstruction facts must carry edge facts");
+    for region in recovery.candidate_regions() {
+        for mut target in edges
             .iter()
             .filter(|edge| {
                 region.members.contains(&edge.source) && !region.members.contains(&edge.target)
@@ -974,7 +976,7 @@ mod tests {
         );
         let returned = block.last().unwrap().as_return().unwrap();
         assert_eq!(returned.values[0], previous.clone().into());
-        assert!(facts.candidate_regions[0].members.contains(&header));
+        assert!(facts.candidate_regions()[0].members.contains(&header));
     }
 
     #[test]

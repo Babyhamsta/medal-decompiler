@@ -18,10 +18,16 @@ pub enum Metric {
     Inline,
     StructureConditionals,
     RemoveParams,
+    FactsStatements,
+    FactsEdges,
+    FactsLocals,
+    FactsDominators,
+    FactsPostDominators,
+    FactsCandidateRegions,
 }
 
 impl Metric {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 13;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::FactsDerive,
@@ -31,6 +37,12 @@ impl Metric {
         Self::Inline,
         Self::StructureConditionals,
         Self::RemoveParams,
+        Self::FactsStatements,
+        Self::FactsEdges,
+        Self::FactsLocals,
+        Self::FactsDominators,
+        Self::FactsPostDominators,
+        Self::FactsCandidateRegions,
     ];
 
     const fn index(self) -> usize {
@@ -42,6 +54,12 @@ impl Metric {
             Self::Inline => 4,
             Self::StructureConditionals => 5,
             Self::RemoveParams => 6,
+            Self::FactsStatements => 7,
+            Self::FactsEdges => 8,
+            Self::FactsLocals => 9,
+            Self::FactsDominators => 10,
+            Self::FactsPostDominators => 11,
+            Self::FactsCandidateRegions => 12,
         }
     }
 
@@ -54,6 +72,12 @@ impl Metric {
             Self::Inline => "inline",
             Self::StructureConditionals => "structure-conditionals",
             Self::RemoveParams => "remove-unnecessary-params",
+            Self::FactsStatements => "facts:statements+effects",
+            Self::FactsEdges => "facts:edges",
+            Self::FactsLocals => "facts:locals",
+            Self::FactsDominators => "facts:dominators",
+            Self::FactsPostDominators => "facts:post-dominators",
+            Self::FactsCandidateRegions => "facts:candidate-regions",
         }
     }
 }

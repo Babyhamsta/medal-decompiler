@@ -106,16 +106,57 @@ pub struct CandidateRegion {
     pub members: BTreeSet<NodeIndex>,
 }
 
+/// Selects which optional facts [`RecoveryFacts::derive_subset`] builds.
+///
+/// Facts must be built while the function is still in SSA form, so they cannot
+/// be computed on first access: by the time a consumer reads them, SSA
+/// destruction has already discarded the information they describe. Demand is
+/// therefore declared up front, and an unrequested fact reads back as `None`
+/// rather than as an empty collection that would be indistinguishable from a
+/// genuinely empty result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FactSet(u8);
+
+impl FactSet {
+    pub const LOCALS: Self = Self(1 << 0);
+    pub const STATEMENT_ORIGINS: Self = Self(1 << 1);
+    pub const EDGES: Self = Self(1 << 2);
+    pub const DOMINATORS: Self = Self(1 << 3);
+    pub const POST_DOMINATORS: Self = Self(1 << 4);
+    pub const EFFECTS: Self = Self(1 << 5);
+
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self(0b0011_1111);
+
+    /// What source reconstruction actually reads.
+    ///
+    /// `candidate_regions` is always derived and is not part of this set.
+    /// `restructure` pairs regions with edge facts to find the returns a
+    /// region exits through, so edges belong here too.
+    pub const RECONSTRUCTION: Self = Self::EDGES;
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveryFacts {
     function_id: usize,
-    pub locals: BTreeMap<RcLocal, LocalFact>,
-    pub statement_origins: BTreeMap<StatementLocation, OriginSet>,
-    pub edges: Vec<EdgeFact>,
-    pub dominators: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
-    pub post_dominators: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
-    pub candidate_regions: Vec<CandidateRegion>,
-    pub effects: BTreeMap<StatementLocation, EffectSummary>,
+    derived: FactSet,
+    locals: BTreeMap<RcLocal, LocalFact>,
+    statement_origins: BTreeMap<StatementLocation, OriginSet>,
+    edges: Vec<EdgeFact>,
+    dominators: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
+    post_dominators: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
+    candidate_regions: Vec<CandidateRegion>,
+    effects: BTreeMap<StatementLocation, EffectSummary>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -128,7 +169,16 @@ pub enum RecoveryError {
 }
 
 impl RecoveryFacts {
+    /// Derives the complete evidence surface.
     pub fn derive(function: &Function) -> Result<Self, RecoveryError> {
+        Self::derive_subset(function, FactSet::ALL)
+    }
+
+    /// Derives `candidate_regions` plus the requested optional facts.
+    ///
+    /// `candidate_regions` is unconditional because it is what source
+    /// reconstruction consumes and it costs a single SCC pass.
+    pub fn derive_subset(function: &Function, requested: FactSet) -> Result<Self, RecoveryError> {
         if let Some(entry) = *function.entry()
             && !function.has_block(entry)
         {
@@ -138,76 +188,172 @@ impl RecoveryFacts {
             });
         }
 
-        let mut locals = function.parameters.iter().cloned().collect::<BTreeSet<_>>();
-        let mut statement_origins = BTreeMap::new();
-        let mut effects = BTreeMap::new();
-        for (node, block) in function.blocks() {
-            for (statement, value) in block.iter().enumerate() {
-                let location = StatementLocation {
-                    block: node,
-                    statement,
-                };
-                locals.extend(value.values().into_iter().cloned());
-                if let Some(origins) = function.statement_origins(node, statement) {
-                    statement_origins.insert(location, origins.clone());
-                }
-                effects.insert(location, summarize_effects(function, location, value));
-            }
-        }
+        // `locals` accumulates across both the statement scan and the edge
+        // scan, so either consumer forces the scan that feeds it.
+        let wants_locals = requested.contains(FactSet::LOCALS);
+        let scan_statements = wants_locals
+            || requested.contains(FactSet::STATEMENT_ORIGINS)
+            || requested.contains(FactSet::EFFECTS);
+        let scan_edges = wants_locals || requested.contains(FactSet::EDGES);
 
-        let mut edges = function
-            .graph()
-            .edge_references()
-            .map(|edge| {
-                let merges = edge
-                    .weight()
-                    .arguments
-                    .iter()
-                    .map(|(parameter, argument)| {
-                        locals.insert(parameter.clone());
-                        locals.extend(argument.values_read().into_iter().cloned());
-                        MergeRelationship {
-                            parameter: parameter.clone(),
-                            argument: argument.clone(),
+        let (mut local_names, statement_origins, effects) = if scan_statements {
+            crate::metrics::time(crate::metrics::Metric::FactsStatements, || {
+                let mut local_names = function.parameters.iter().cloned().collect::<BTreeSet<_>>();
+                let mut statement_origins = BTreeMap::new();
+                let mut effects = BTreeMap::new();
+                for (node, block) in function.blocks() {
+                    for (statement, value) in block.iter().enumerate() {
+                        let location = StatementLocation {
+                            block: node,
+                            statement,
+                        };
+                        local_names.extend(value.values().into_iter().cloned());
+                        if let Some(origins) = function.statement_origins(node, statement) {
+                            statement_origins.insert(location, origins.clone());
+                        }
+                        effects.insert(location, summarize_effects(function, location, value));
+                    }
+                }
+                (local_names, statement_origins, effects)
+            })
+        } else {
+            Default::default()
+        };
+
+        let edges = if scan_edges {
+            crate::metrics::time(crate::metrics::Metric::FactsEdges, || {
+                let mut edges = function
+                    .graph()
+                    .edge_references()
+                    .map(|edge| {
+                        let merges = edge
+                            .weight()
+                            .arguments
+                            .iter()
+                            .map(|(parameter, argument)| {
+                                local_names.insert(parameter.clone());
+                                local_names.extend(argument.values_read().into_iter().cloned());
+                                MergeRelationship {
+                                    parameter: parameter.clone(),
+                                    argument: argument.clone(),
+                                }
+                            })
+                            .collect();
+                        EdgeFact {
+                            source: edge.source(),
+                            target: edge.target(),
+                            branch: (&edge.weight().branch_type).into(),
+                            merges,
                         }
                     })
-                    .collect();
-                EdgeFact {
-                    source: edge.source(),
-                    target: edge.target(),
-                    branch: (&edge.weight().branch_type).into(),
-                    merges,
-                }
+                    .collect::<Vec<_>>();
+                edges.sort_by_key(|edge| (edge.source, edge.target, edge.branch));
+                edges
             })
-            .collect::<Vec<_>>();
-        edges.sort_by_key(|edge| (edge.source, edge.target, edge.branch));
+        } else {
+            Vec::new()
+        };
 
-        let locals = locals
-            .into_iter()
-            .map(|local| {
-                let fact = LocalFact {
-                    bindings: function.provenance().bindings(&local),
-                    definitions: function.provenance().origins(&local),
-                    uses: function.provenance().uses(&local),
-                };
-                (local, fact)
+        let locals = if wants_locals {
+            crate::metrics::time(crate::metrics::Metric::FactsLocals, || {
+                local_names
+                    .into_iter()
+                    .map(|local| {
+                        let fact = LocalFact {
+                            bindings: function.provenance().bindings(&local),
+                            definitions: function.provenance().origins(&local),
+                            uses: function.provenance().uses(&local),
+                        };
+                        (local, fact)
+                    })
+                    .collect()
             })
-            .collect();
+        } else {
+            BTreeMap::new()
+        };
+
+        let dominators = if requested.contains(FactSet::DOMINATORS) {
+            crate::metrics::time(crate::metrics::Metric::FactsDominators, || {
+                derive_dominators(function)
+            })
+        } else {
+            BTreeMap::new()
+        };
+
+        let post_dominators = if requested.contains(FactSet::POST_DOMINATORS) {
+            crate::metrics::time(crate::metrics::Metric::FactsPostDominators, || {
+                derive_post_dominators(function)
+            })
+        } else {
+            BTreeMap::new()
+        };
+
+        let candidate_regions =
+            crate::metrics::time(crate::metrics::Metric::FactsCandidateRegions, || {
+                derive_candidate_regions(function)
+            });
 
         Ok(Self {
             function_id: function.id,
+            derived: requested,
             locals,
             statement_origins,
             edges,
-            dominators: derive_dominators(function),
-            post_dominators: derive_post_dominators(function),
-            candidate_regions: derive_candidate_regions(function),
+            dominators,
+            post_dominators,
+            candidate_regions,
             effects,
         })
     }
 
     pub const fn function_id(&self) -> usize {
         self.function_id
+    }
+
+    /// Which optional facts this value carries.
+    pub const fn derived(&self) -> FactSet {
+        self.derived
+    }
+
+    /// Always available; never gated by [`FactSet`].
+    pub fn candidate_regions(&self) -> &[CandidateRegion] {
+        &self.candidate_regions
+    }
+
+    pub fn locals(&self) -> Option<&BTreeMap<RcLocal, LocalFact>> {
+        self.derived
+            .contains(FactSet::LOCALS)
+            .then_some(&self.locals)
+    }
+
+    pub fn statement_origins(&self) -> Option<&BTreeMap<StatementLocation, OriginSet>> {
+        self.derived
+            .contains(FactSet::STATEMENT_ORIGINS)
+            .then_some(&self.statement_origins)
+    }
+
+    pub fn edges(&self) -> Option<&[EdgeFact]> {
+        self.derived
+            .contains(FactSet::EDGES)
+            .then_some(self.edges.as_slice())
+    }
+
+    pub fn dominators(&self) -> Option<&BTreeMap<NodeIndex, BTreeSet<NodeIndex>>> {
+        self.derived
+            .contains(FactSet::DOMINATORS)
+            .then_some(&self.dominators)
+    }
+
+    pub fn post_dominators(&self) -> Option<&BTreeMap<NodeIndex, BTreeSet<NodeIndex>>> {
+        self.derived
+            .contains(FactSet::POST_DOMINATORS)
+            .then_some(&self.post_dominators)
+    }
+
+    pub fn effects(&self) -> Option<&BTreeMap<StatementLocation, EffectSummary>> {
+        self.derived
+            .contains(FactSet::EFFECTS)
+            .then_some(&self.effects)
     }
 }
 
@@ -770,7 +916,7 @@ impl<'a> PassScheduler<'a> {
         crate::metrics::record_scheduler_run();
         let mut facts =
             crate::metrics::time(crate::metrics::Metric::FactsDerive, || {
-                RecoveryFacts::derive(function)
+                RecoveryFacts::derive_subset(function, FactSet::RECONSTRUCTION)
             })?;
         let mut invalidations = InvalidationCounts::default();
         let initial_fingerprint = crate::metrics::time(crate::metrics::Metric::Fingerprint, || {
@@ -801,7 +947,7 @@ impl<'a> PassScheduler<'a> {
             }
 
             facts = crate::metrics::time(crate::metrics::Metric::FactsDerive, || {
-                RecoveryFacts::derive(function)
+                RecoveryFacts::derive_subset(function, FactSet::RECONSTRUCTION)
             })?;
             let fingerprint = crate::metrics::time(crate::metrics::Metric::Fingerprint, || {
                 structural_fingerprint(function)
