@@ -23,10 +23,29 @@ Run one focused case:
 python tools/run_luau_corpus.py --profiles primary --case 21_state_machine
 ```
 
+Run the trusted semantic probes across every compiler configuration:
+
+```powershell
+python tools/run_luau_corpus.py --profiles all --semantic
+```
+
+Run one trusted semantic probe:
+
+```powershell
+python tools/run_luau_corpus.py --profiles primary --semantic --case 04_calls_multireturn
+```
+
 Every attempt records bytecode, decompiled Luau, compiler diagnostics,
 bytecode version, basic output metrics, and a summary. A run succeeds only when
 the original compiles, decompilation succeeds, and the decompiled output
-recompiles.
+recompiles. With `--semantic`, a checked case also requires matching source and
+generated runtime results.
+
+Runtime execution is restricted to six committed probes:
+`04_calls_multireturn`, `05_varargs`, `13_repeat_until`, `15_generic_for`,
+`20_pcall_style_flow`, and `21_state_machine`. Other corpus inputs are never
+executed. `27_orchestration_engine` remains a manual, non-blocking diagnostic
+input.
 
 Primary profiles are `O1/g1`, `O2/g1`, and `O2/g0`. Compatibility profiles use
 the bundled compiler's feature flags to emit bytecode V9, V10, V11, and V12.

@@ -1,6 +1,11 @@
 use std::convert::TryFrom;
 
-use super::{bytecode::Bytecode, constant::Constant, deserialize, version::BytecodeVersion};
+use nom::{Err, error::ErrorKind, number::complete::le_u8};
+
+use super::{
+    bytecode::Bytecode, constant::Constant, deserialize, list::parse_list_len,
+    version::BytecodeVersion,
+};
 use crate::{
     instruction::{Instruction, InstructionEncoding},
     op_code::OpCode,
@@ -123,6 +128,26 @@ fn rejects_v12_prototype_size_past_input() {
     let mut bytes = minimal_chunk(12, false, &[]);
     bytes[4] = bytes[4].saturating_add(10);
     assert!(deserialize(&bytes, 1).is_err());
+}
+
+#[test]
+fn rejects_list_length_larger_than_remaining_input_before_allocation() {
+    let error = parse_list_len(&[0], le_u8, 2).unwrap_err();
+
+    assert!(matches!(
+        error,
+        Err::Failure(error) if error.code == ErrorKind::TooLarge
+    ));
+}
+
+#[test]
+fn rejects_zero_width_list_parser_that_breaks_length_bound() {
+    let error = parse_list_len(&[0], |input| Ok((input, ())), 1).unwrap_err();
+
+    assert!(matches!(
+        error,
+        Err::Failure(error) if error.code == ErrorKind::Verify
+    ));
 }
 
 #[test]

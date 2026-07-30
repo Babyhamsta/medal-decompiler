@@ -33,14 +33,36 @@ impl<'a, 'b> Lifter<'a, 'b> {
     fn allocate_locals(&mut self) {
         self.upvalues
             .reserve(self.bytecode.number_of_upvalues as usize);
-        for _ in 0..self.bytecode.number_of_upvalues {
-            self.upvalues.push(RcLocal::default());
+        for index in 0..self.bytecode.number_of_upvalues {
+            let local = RcLocal::default();
+            self.function.set_binding(
+                local.clone(),
+                cfg::provenance::BindingIdentity::Upvalue {
+                    function_id: self.function.id,
+                    index: index as usize,
+                },
+            );
+            self.upvalues.push(local);
         }
 
         self.locals
             .reserve(self.bytecode.maximum_stack_size as usize);
         for i in 0..self.bytecode.maximum_stack_size {
             let local = RcLocal::default();
+            let binding = if i < self.bytecode.number_of_parameters {
+                cfg::provenance::BindingIdentity::parameter(self.function.id, i as usize)
+            } else {
+                cfg::provenance::BindingIdentity::local(self.function.id, i as usize)
+            };
+            self.function.set_register_family(
+                local.clone(),
+                cfg::provenance::RegisterFamily::new(
+                    self.function.id,
+                    i as usize,
+                    binding,
+                    Vec::new(),
+                ),
+            );
             if i < self.bytecode.number_of_parameters {
                 self.function.parameters.push(local.clone());
             }
@@ -961,6 +983,67 @@ impl<'a, 'b> Lifter<'a, 'b> {
             }
         }
 
+        let instruction_stride = context.bytecode.code.len().max(1);
+        let block_lengths = context
+            .function
+            .blocks()
+            .map(|(node, block)| (node, block.len()))
+            .collect::<Vec<_>>();
+        for (node, statement_count) in block_lengths {
+            let origins = (0..statement_count)
+                .map(|statement| {
+                    std::collections::BTreeSet::from([cfg::provenance::SourceOrigin::new(
+                        context.function.id,
+                        node.index()
+                            .saturating_mul(instruction_stride)
+                            .saturating_add(statement),
+                        None,
+                        "Lua51",
+                    )])
+                })
+                .collect();
+            context.function.set_statement_origins(node, origins);
+        }
+
         (context.function, context.upvalues)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lua51_deserializer::{
+        Function as BytecodeFunction, Instruction, Value,
+        argument::{Constant, Register},
+    };
+
+    use super::Lifter;
+
+    #[test]
+    fn lifted_function_supplies_binding_and_origin_metadata_to_ssa() {
+        let bytecode = BytecodeFunction {
+            name: b"metadata",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: 0,
+            maximum_stack_size: 1,
+            code: vec![
+                Instruction::LoadConstant {
+                    destination: Register(0),
+                    source: Constant(0),
+                },
+                Instruction::Return(Register(0), 2),
+            ],
+            constants: vec![Value::Number(7.0)],
+            closures: Vec::new(),
+            positions: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            number_of_parameters: 0,
+        };
+        let mut lifted = Vec::new();
+        let (mut function, upvalues) = Lifter::lift(&bytecode, &mut lifted);
+
+        cfg::ssa::construct(&mut function, &upvalues).expect("SSA construction");
     }
 }

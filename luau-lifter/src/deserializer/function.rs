@@ -13,6 +13,19 @@ use super::{
 
 use crate::{instruction::*, op_code::OpCode};
 
+fn reserve_input_items<'a, T>(
+    items: &mut Vec<T>,
+    count: usize,
+    input: &'a [u8],
+) -> Result<(), Err<Error<&'a [u8]>>> {
+    if count > input.len() {
+        return Err(Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+    }
+    items
+        .try_reserve_exact(count)
+        .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))
+}
+
 #[derive(Debug)]
 pub struct DebugLocal {
     pub name: usize,
@@ -55,7 +68,10 @@ impl Function {
         encode_key: u8,
         version: BytecodeVersion,
     ) -> Result<Vec<Instruction>, String> {
-        let mut instructions = Vec::with_capacity(words.len());
+        let mut instructions = Vec::new();
+        instructions
+            .try_reserve_exact(words.len())
+            .map_err(|error| format!("unable to reserve decoded instructions: {error}"))?;
         let mut pc = 0;
 
         while pc < words.len() {
@@ -143,7 +159,7 @@ impl Function {
         if has_debug_info != 0 {
             let (next, num_locvars) = leb128_usize(input)?;
             input = next;
-            debug_locals.reserve(num_locvars);
+            reserve_input_items(&mut debug_locals, num_locvars, input)?;
             for _ in 0..num_locvars {
                 let (next, name) = leb128_usize(input)?;
                 let (next, start_pc) = leb128_usize(next)?;
@@ -159,7 +175,7 @@ impl Function {
             }
             let (next, num_debug_upvalues) = leb128_usize(input)?;
             input = next;
-            debug_upvalues.reserve(num_debug_upvalues);
+            reserve_input_items(&mut debug_upvalues, num_debug_upvalues, input)?;
             for _ in 0..num_debug_upvalues {
                 let (next, name) = leb128_usize(input)?;
                 input = next;
@@ -171,7 +187,7 @@ impl Function {
         if version.has_feedback() {
             let (next, feedback_count) = leb128_usize(input)?;
             input = next;
-            feedback.reserve(feedback_count);
+            reserve_input_items(&mut feedback, feedback_count, input)?;
             for _ in 0..feedback_count {
                 let (next, kind) = le_u8(input)?;
                 let (next, pc) = leb128_usize(next)?;

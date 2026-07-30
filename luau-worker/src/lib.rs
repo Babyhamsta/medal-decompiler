@@ -17,7 +17,8 @@ struct DecompileMessage {
 #[derive(Serialize)]
 struct DecompileResponse {
     id: String,
-    decompilation: String,
+    decompilation: Option<String>,
+    error: Option<String>,
 }
 
 #[event(fetch, respond_with_errors)]
@@ -53,9 +54,14 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                         let bytecode = BASE64_STANDARD
                             .decode(msg.encoded_bytecode)
                             .expect("bytecode must be base64 encoded");
+                        let (decompilation, error) = match decompile_bytecode(&bytecode, 1) {
+                            Ok(source) => (Some(source), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        };
                         let resp = DecompileResponse {
                             id: msg.id,
-                            decompilation: decompile_bytecode(&bytecode, 1),
+                            decompilation,
+                            error,
                         };
                         server
                             .send_with_str(serde_json::to_string(&resp).unwrap())
@@ -79,7 +85,10 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             let encoded_bytecode = req.bytes().await?;
             match BASE64_STANDARD.decode(encoded_bytecode) {
-                Ok(bytecode) => Response::ok(decompile_bytecode(&bytecode, 203)),
+                Ok(bytecode) => match decompile_bytecode(&bytecode, 203) {
+                    Ok(source) => Response::ok(source),
+                    Err(error) => Response::error(error.to_string(), 422),
+                },
                 Err(_) => Response::error("invalid bytecode", 400),
             }
         })

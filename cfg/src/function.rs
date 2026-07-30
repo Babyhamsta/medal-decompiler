@@ -1,5 +1,6 @@
 use ast::{LocalRw, RcLocal};
 use contracts::requires;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use petgraph::{
     Direction,
@@ -7,7 +8,13 @@ use petgraph::{
     visit::{EdgeRef, IntoEdgesDirected},
 };
 
-use crate::block::{BlockEdge, BranchType};
+use crate::{
+    block::{BlockEdge, BranchType},
+    provenance::{
+        BindingIdentity, BindingMismatch, OriginSet, Provenance, ReferenceClass, RegisterFamily,
+        validate_reference_binding,
+    },
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct Function {
@@ -17,6 +24,11 @@ pub struct Function {
     pub is_variadic: bool,
     graph: StableDiGraph<ast::Block, BlockEdge>,
     entry: Option<NodeIndex>,
+    provenance: Provenance,
+    bindings: FxHashMap<RcLocal, BindingIdentity>,
+    register_families: FxHashMap<RcLocal, RegisterFamily>,
+    statement_origins: FxHashMap<NodeIndex, Vec<OriginSet>>,
+    next_synthetic_binding: usize,
 }
 
 impl Function {
@@ -28,7 +40,212 @@ impl Function {
             is_variadic: false,
             graph: StableDiGraph::new(),
             entry: None,
+            provenance: Provenance::default(),
+            bindings: FxHashMap::default(),
+            register_families: FxHashMap::default(),
+            statement_origins: FxHashMap::default(),
+            next_synthetic_binding: 0,
         }
+    }
+
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    pub fn validate_reference_bindings(&self) -> Result<(), BindingMismatch> {
+        let mut locals = self.parameters.iter().cloned().collect::<FxHashSet<_>>();
+        for (node, block) in self.blocks() {
+            locals.extend(
+                block
+                    .iter()
+                    .flat_map(|statement| statement.values())
+                    .cloned(),
+            );
+            for edge in self.edges(node) {
+                for (parameter, argument) in &edge.weight().arguments {
+                    locals.insert(parameter.clone());
+                    locals.extend(argument.values().into_iter().cloned());
+                }
+            }
+        }
+        for local in locals {
+            let mut bindings = self.provenance.bindings(&local);
+            if bindings.is_empty()
+                && let Some(binding) = self.bindings.get(&local)
+            {
+                bindings.insert(binding.clone());
+            }
+            for binding in bindings {
+                validate_reference_binding(&binding, ReferenceClass::Local)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_binding(&mut self, local: RcLocal, binding: BindingIdentity) {
+        self.bindings.insert(local.clone(), binding.clone());
+        self.provenance.ensure_local(local, binding);
+    }
+
+    pub fn set_register_family(&mut self, local: RcLocal, family: RegisterFamily) {
+        self.bindings.insert(local.clone(), family.binding.clone());
+        self.register_families.insert(local, family);
+    }
+
+    pub fn set_statement_origins(&mut self, node: NodeIndex, origins: Vec<OriginSet>) {
+        assert_eq!(
+            self.block(node).map_or(0, |block| block.len()),
+            origins.len()
+        );
+        self.statement_origins.insert(node, origins);
+    }
+
+    pub fn statement_origins(&self, node: NodeIndex, statement: usize) -> Option<&OriginSet> {
+        self.statement_origins
+            .get(&node)
+            .and_then(|origins| origins.get(statement))
+    }
+
+    pub fn new_ssa_definition(
+        &mut self,
+        family_local: &RcLocal,
+        node: NodeIndex,
+        statement: usize,
+    ) -> RcLocal {
+        let base_origins = self
+            .statement_origins(node, statement)
+            .cloned()
+            .expect("lifted statement must retain its source origin");
+        let family = self.register_families.get(family_local).cloned();
+        let (definitions, name) = if let Some(family) = family {
+            let names = base_origins
+                .iter()
+                .filter_map(|origin| family.debug_name_at(origin.instruction))
+                .filter(|name| ast::is_valid_identifier(name))
+                .filter_map(|name| String::from_utf8(name.to_vec()).ok())
+                .collect::<std::collections::BTreeSet<_>>();
+            let definitions = base_origins
+                .into_iter()
+                .map(|origin| {
+                    (
+                        family.binding_at(origin.instruction),
+                        family.definition_origin(origin),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let name = (names.len() == 1).then(|| names.into_iter().next().unwrap());
+            (definitions, name)
+        } else {
+            let binding = self
+                .bindings
+                .get(family_local)
+                .cloned()
+                .expect("local must have a binding identity");
+            (
+                base_origins
+                    .into_iter()
+                    .map(|origin| (binding.clone(), origin))
+                    .collect(),
+                None,
+            )
+        };
+        let local = RcLocal::new(ast::Local::new(name));
+        self.bindings.insert(
+            local.clone(),
+            self.bindings
+                .get(family_local)
+                .cloned()
+                .expect("local must have a binding identity"),
+        );
+        for (binding, origin) in definitions {
+            self.provenance
+                .record_definition(local.clone(), binding, origin);
+        }
+        local
+    }
+
+    pub fn new_merge_local(&mut self, family_local: &RcLocal) -> RcLocal {
+        let local = RcLocal::default();
+        let binding = self
+            .bindings
+            .get(family_local)
+            .cloned()
+            .expect("local must have a binding identity");
+        self.bindings.insert(local.clone(), binding.clone());
+        self.provenance.ensure_local(local.clone(), binding);
+        local
+    }
+
+    pub fn new_synthetic_local(&mut self, source: &RcLocal) -> RcLocal {
+        let name = source
+            .0
+            .0
+            .lock()
+            .0
+            .clone()
+            .filter(|name| ast::is_valid_identifier(name.as_bytes()));
+        let local = RcLocal::new(ast::Local::new(name));
+        let binding = BindingIdentity::SyntheticLocal {
+            function_id: self.id,
+            sequence: self.next_synthetic_binding,
+        };
+        self.next_synthetic_binding += 1;
+        self.bindings.insert(local.clone(), binding.clone());
+        self.provenance
+            .derive_local(local.clone(), binding, [source]);
+        local
+    }
+
+    pub fn record_use(&mut self, local: &RcLocal, node: NodeIndex, statement: usize) {
+        if let Some(origins) = self.statement_origins(node, statement).cloned() {
+            let binding = self
+                .provenance
+                .binding(local)
+                .or_else(|| self.bindings.get(local))
+                .cloned();
+            for mut origin in origins {
+                match binding.as_ref() {
+                    Some(BindingIdentity::Local {
+                        register, lifetime, ..
+                    }) => {
+                        origin.register_family = Some(*register);
+                        origin.debug_lifetime =
+                            lifetime.and_then(|(start_instruction, end_instruction)| {
+                                self.register_families
+                                    .values()
+                                    .flat_map(|family| family.debug_lifetimes.iter())
+                                    .find(|candidate| {
+                                        candidate.start_instruction == start_instruction
+                                            && candidate.end_instruction == end_instruction
+                                            && candidate.contains(origin.instruction)
+                                    })
+                                    .cloned()
+                            });
+                    }
+                    Some(BindingIdentity::Parameter { register, .. }) => {
+                        origin.register_family = Some(*register);
+                    }
+                    _ => {}
+                }
+                self.provenance.record_use(local.clone(), origin);
+            }
+        }
+    }
+
+    pub fn merge_local_provenance<'a>(
+        &mut self,
+        target: RcLocal,
+        sources: impl IntoIterator<Item = &'a RcLocal>,
+    ) {
+        let binding = self
+            .bindings
+            .get(&target)
+            .cloned()
+            .or_else(|| self.provenance.binding(&target).cloned())
+            .expect("merged local must have a binding identity");
+        self.provenance
+            .merge_locals(target.clone(), binding.clone(), sources);
+        self.bindings.insert(target, binding);
     }
 
     pub fn name_mut(&mut self) -> &mut Option<String> {
@@ -173,6 +390,7 @@ impl Function {
     }
 
     pub fn remove_block(&mut self, block: NodeIndex) -> Option<ast::Block> {
+        self.statement_origins.remove(&block);
         self.graph.remove_node(block)
     }
 }

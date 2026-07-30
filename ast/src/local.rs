@@ -13,7 +13,19 @@ use triomphe::Arc;
 #[derive(Debug, Default, From, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct Local(pub Option<String>);
 
-pub fn is_valid_identifier(name: &[u8]) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentifierContext {
+    Local,
+    Parameter,
+    GlobalExpression,
+    FunctionName,
+    MethodName,
+    MemberName,
+    TableField,
+    TypeDeclaration,
+}
+
+pub fn is_valid_identifier_in(name: &[u8], context: IdentifierContext) -> bool {
     if name.is_empty()
         || !name.iter().enumerate().all(|(index, character)| {
             (index != 0 && character.is_ascii_digit())
@@ -24,15 +36,28 @@ pub fn is_valid_identifier(name: &[u8]) -> bool {
         return false;
     }
 
-    const RESERVED_KEYWORDS: &[&str] = &[
-        "and", "break", "class", "continue", "do", "else", "elseif", "end", "export", "false",
-        "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
-        "then", "true", "type", "until", "while",
+    const HARD_KEYWORDS: &[&str] = &[
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
     ];
 
+    let hard_keywords = match context {
+        IdentifierContext::Local
+        | IdentifierContext::Parameter
+        | IdentifierContext::GlobalExpression
+        | IdentifierContext::FunctionName
+        | IdentifierContext::MethodName
+        | IdentifierContext::MemberName
+        | IdentifierContext::TableField
+        | IdentifierContext::TypeDeclaration => HARD_KEYWORDS,
+    };
     std::str::from_utf8(name)
         .ok()
-        .is_some_and(|name| !RESERVED_KEYWORDS.contains(&name))
+        .is_some_and(|name| !hard_keywords.contains(&name))
+}
+
+pub fn is_valid_identifier(name: &[u8]) -> bool {
+    is_valid_identifier_in(name, IdentifierContext::Local)
 }
 
 impl Local {
@@ -89,6 +114,52 @@ impl LocalRw for RcLocal {
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
         vec![self]
+    }
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::{IdentifierContext, is_valid_identifier_in};
+
+    #[test]
+    fn contextual_words_are_legal_identifiers_in_supported_luau_contexts() {
+        for context in [
+            IdentifierContext::Local,
+            IdentifierContext::Parameter,
+            IdentifierContext::GlobalExpression,
+            IdentifierContext::FunctionName,
+            IdentifierContext::MethodName,
+            IdentifierContext::MemberName,
+            IdentifierContext::TableField,
+            IdentifierContext::TypeDeclaration,
+        ] {
+            for name in [
+                b"type".as_slice(),
+                b"class",
+                b"continue",
+                b"export",
+                b"goto",
+            ] {
+                assert!(
+                    is_valid_identifier_in(name, context),
+                    "{name:?} in {context:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hard_keywords_and_invalid_shapes_stay_illegal() {
+        for context in [
+            IdentifierContext::Local,
+            IdentifierContext::GlobalExpression,
+            IdentifierContext::MethodName,
+            IdentifierContext::TableField,
+        ] {
+            assert!(!is_valid_identifier_in(b"end", context));
+            assert!(!is_valid_identifier_in(b"bad-name", context));
+            assert!(!is_valid_identifier_in(b"2fast", context));
+        }
     }
 }
 

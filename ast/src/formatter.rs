@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::iter;
 use std::{
     borrow::Cow,
@@ -96,6 +95,16 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         )
     }
 
+    fn starts_with_parenthesis(value: &RValue) -> bool {
+        if Self::should_wrap_left_rvalue(value) {
+            return true;
+        }
+        match value {
+            RValue::Index(index) => Self::starts_with_parenthesis(&index.left),
+            _ => false,
+        }
+    }
+
     fn format_block(&mut self, block: &Block) -> fmt::Result {
         self.indentation_level += 1;
         self.format_block_no_indent(block)?;
@@ -148,14 +157,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                             ..
                         }) => {
                             if let Some(index) = left[0].as_index() {
-                                Self::should_wrap_left_rvalue(&index.left)
+                                Self::starts_with_parenthesis(&index.left)
                             } else {
                                 false
                             }
                         }
                         Statement::Call(Call { value, .. })
                         | Statement::MethodCall(MethodCall { value, .. }) => {
-                            Self::should_wrap_left_rvalue(value)
+                            Self::starts_with_parenthesis(value)
                         }
                         Statement::Comment(_) => unimplemented!(),
                         _ => false,
@@ -272,7 +281,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 if !sequential_keys {
                     if let Some(key) = key {
                         if let RValue::Literal(Literal::String(field)) = key
-                            && Self::is_valid_name(field)
+                            && Self::is_valid_name_in(field, crate::IdentifierContext::TableField)
                         {
                             write!(self.output, "{} = ", std::str::from_utf8(field).unwrap())?;
                         } else {
@@ -369,25 +378,6 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             //     self.indent()?;
             //     writeln!(self.output, "-- line defined: {}", closure.line_defined.as_ref().unwrap())?;
             // }
-            if !closure.upvalues.is_empty() {
-                self.indent()?;
-                write!(self.output, "-- upvalues: ")?;
-                let mut it = closure.upvalues.iter().peekable();
-                while let Some(uv) = it.next() {
-                    match uv {
-                        crate::Upvalue::Copy(copy) => {
-                            write!(self.output, "(copy) {}", copy)?;
-                        }
-                        crate::Upvalue::Ref(lref) => {
-                            write!(self.output, "(ref) {}", lref)?;
-                        }
-                    }
-                    if it.peek().is_some() {
-                        write!(self.output, ", ")?;
-                    }
-                }
-                writeln!(self.output)?;
-            }
             self.indentation_level -= 1;
 
             self.format_block(&function.body)?;
@@ -411,7 +401,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if is_method
             && let LValue::Index(index) = name
             && let RValue::Literal(Literal::String(method)) = index.right.as_ref()
-            && Self::is_valid_name(method)
+            && Self::is_valid_name_in(method, crate::IdentifierContext::MethodName)
         {
             write!(self.output, "function ")?;
             self.format_rvalue(&index.left)?;
@@ -538,8 +528,8 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         Ok(())
     }
-    pub(crate) fn is_valid_name(name: &[u8]) -> bool {
-        crate::is_valid_identifier(name)
+    pub(crate) fn is_valid_name_in(name: &[u8], context: crate::IdentifierContext) -> bool {
+        crate::is_valid_identifier_in(name, context)
     }
 
     // TODO: PERF: Cow like from_utf8_lossy
@@ -602,7 +592,9 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
 
         match index.right.as_ref() {
-            RValue::Literal(super::Literal::String(field)) if Self::is_valid_name(field) => {
+            RValue::Literal(super::Literal::String(field))
+                if Self::is_valid_name_in(field, crate::IdentifierContext::MemberName) =>
+            {
                 write!(self.output, ".{}", std::str::from_utf8(field).unwrap())
             }
             _ => {
@@ -701,7 +693,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                         let mut valid = true;
                         loop {
                             if let box RValue::Literal(Literal::String(key)) = &index.right
-                                && Self::is_valid_name(key)
+                                && Self::is_valid_name_in(key, crate::IdentifierContext::MemberName)
                             {
                                 match index.left {
                                     box RValue::Index(ref i) => {
@@ -750,7 +742,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             if i != 0 {
                 write!(self.output, ", ")?;
             }
-            let wrap = i + 1 == assign.right.len() && matches!(rvalue, RValue::Select(_));
+            let remaining_targets = assign.left.len().saturating_sub(i);
+            let wrap = i + 1 == assign.right.len()
+                && remaining_targets > 1
+                && matches!(rvalue, RValue::Select(_));
             if wrap {
                 write!(self.output, "(")?;
             }
@@ -890,11 +885,23 @@ mod tests {
 
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
-        Index, LValue, Literal, Local, RValue, RcLocal, Select, Table, Upvalue,
+        Index, LValue, Literal, Local, MethodCall, RValue, RcLocal, ResultDemand, Return, Select,
+        Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
+    }
+
+    #[test]
+    fn separates_call_from_following_parenthesized_table_call() {
+        let first = Call::new(Global::from("first").into(), Vec::new());
+        let callable = Table(vec![(None, Global::from("callback").into())]);
+        let indexed = Index::new(callable.into(), Literal::Number(1.0).into());
+        let second = Call::new(indexed.into(), Vec::new());
+        let block = Block(vec![first.into(), second.into()]);
+
+        assert_eq!(block.to_string(), "first();\n({ callback })[1]()");
     }
 
     #[test]
@@ -1043,7 +1050,75 @@ mod tests {
             vec![Literal::Number(1.0).into(), selected.into()],
         );
 
-        assert_eq!(assign.to_string(), "first, second = 1, (produce())");
+        assert_eq!(assign.to_string(), "first, second = 1, produce()");
+
+        let selected = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let assign = Assign::new(
+            vec![
+                LValue::Local(local("first")),
+                LValue::Local(local("second")),
+            ],
+            vec![selected.into()],
+        );
+        assert_eq!(assign.to_string(), "first, second = (produce())");
+    }
+
+    #[test]
+    fn result_demand_matrix_preserves_fixed_and_open_list_semantics() {
+        let selected_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Exact(1));
+        let exact_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Exact(2));
+        let call_assign = Assign::new(
+            vec![
+                LValue::Local(local("first")),
+                LValue::Local(local("second")),
+            ],
+            vec![exact_call],
+        );
+
+        let exact_method = Select::MethodCall(MethodCall::new(
+            local("object").into(),
+            "produce".to_owned(),
+            Vec::new(),
+        ))
+        .into_rvalue(ResultDemand::Exact(1));
+        let method_return = Return::new(vec![exact_method]);
+        let open_method = Select::MethodCall(MethodCall::new(
+            local("object").into(),
+            "produce".to_owned(),
+            Vec::new(),
+        ))
+        .into_rvalue(ResultDemand::Open);
+        let open_method_return = Return::new(vec![open_method]);
+
+        let exact_vararg = Select::VarArg(VarArg).into_rvalue(ResultDemand::Exact(3));
+        let vararg_assign = Assign::new(
+            vec![
+                LValue::Local(local("a")),
+                LValue::Local(local("b")),
+                LValue::Local(local("c")),
+            ],
+            vec![exact_vararg],
+        );
+        let open_vararg = Select::VarArg(VarArg).into_rvalue(ResultDemand::Open);
+        let open_vararg_return = Return::new(vec![Literal::Number(1.0).into(), open_vararg]);
+
+        let open_call = Select::Call(Call::new(Global::from("produce").into(), Vec::new()))
+            .into_rvalue(ResultDemand::Open);
+        let open_return = Return::new(vec![Literal::Number(1.0).into(), open_call]);
+
+        assert_eq!(
+            Return::new(vec![selected_call]).to_string(),
+            "return (produce())"
+        );
+        assert_eq!(call_assign.to_string(), "first, second = produce()");
+        assert_eq!(method_return.to_string(), "return (object:produce())");
+        assert_eq!(open_method_return.to_string(), "return object:produce()");
+        assert_eq!(vararg_assign.to_string(), "a, b, c = ...");
+        assert_eq!(open_vararg_return.to_string(), "return 1, ...");
+        assert_eq!(open_return.to_string(), "return 1, produce()");
+        assert!(!ResultDemand::Exact(0).has_values());
     }
 
     #[test]

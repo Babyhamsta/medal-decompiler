@@ -1,4 +1,8 @@
-use nom::{IResult, bytes::complete::take};
+use nom::{
+    Err, IResult,
+    bytes::complete::take,
+    error::{Error, ErrorKind},
+};
 use nom_leb128::leb128_usize;
 
 pub mod bytecode;
@@ -14,7 +18,12 @@ mod tests;
 fn parse_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     let (input, length) = leb128_usize(input)?;
     let (input, bytes) = take(length)(input)?;
-    Ok((input, bytes.to_owned()))
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(length)
+        .map_err(|_| Err::Failure(Error::new(input, ErrorKind::TooLarge)))?;
+    owned.extend_from_slice(bytes);
+    Ok((input, owned))
 }
 
 pub fn deserialize(bytecode: &[u8], encode_key: u8) -> Result<bytecode::Bytecode, String> {

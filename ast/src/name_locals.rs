@@ -16,11 +16,16 @@ struct Evidence {
     callback_source: bool,
     direct_calls: usize,
     generic_value: bool,
+    field_names: FxHashSet<String>,
 }
 
 impl Evidence {
     fn role(&self) -> Option<&'static str> {
         (self.roles.len() == 1).then(|| *self.roles.iter().next().unwrap())
+    }
+
+    fn field_name(&self) -> Option<&String> {
+        (self.field_names.len() == 1).then(|| self.field_names.iter().next().unwrap())
     }
 }
 
@@ -104,6 +109,26 @@ impl Namer {
         match value {
             RValue::Call(call) | RValue::Select(crate::Select::Call(call)) => {
                 Self::record_call(call, parameters, evidence);
+            }
+            RValue::Table(table) => {
+                for (key, value) in &table.0 {
+                    let Some(RValue::Literal(crate::Literal::String(field))) = key else {
+                        continue;
+                    };
+                    let Ok(field) = std::str::from_utf8(field) else {
+                        continue;
+                    };
+                    if !is_valid_identifier(field.as_bytes()) {
+                        continue;
+                    }
+                    if let RValue::Local(local) = value {
+                        evidence
+                            .entry(local.clone())
+                            .or_default()
+                            .field_names
+                            .insert(field.to_owned());
+                    }
+                }
             }
             _ => {}
         }
@@ -300,9 +325,11 @@ impl Namer {
             .flatten()
             .filter(|name| is_valid_identifier(name.as_bytes()));
         let inferred = evidence.and_then(Evidence::role);
+        let field_name = evidence.and_then(Evidence::field_name).cloned();
         let unused = evidence.is_none_or(|evidence| evidence.reads == 0);
 
-        let name = if let Some(name) = existing.or_else(|| structural_name.cloned()) {
+        let name = if let Some(name) = existing.or_else(|| structural_name.cloned()).or(field_name)
+        {
             self.unique_name(&name)
         } else if let Some(role) = inferred {
             self.unique_name(role)

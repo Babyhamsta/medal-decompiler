@@ -112,7 +112,15 @@ impl<'a> Lifter<'a> {
                 .debug_upvalues
                 .get(index)
                 .and_then(|name| self.debug_name(*name));
-            self.upvalues.push(ast::RcLocal::new(ast::Local::new(name)));
+            let upvalue = ast::RcLocal::new(ast::Local::new(name));
+            self.function.set_binding(
+                upvalue.clone(),
+                cfg::provenance::BindingIdentity::Upvalue {
+                    function_id: self.function.id,
+                    index,
+                },
+            );
+            self.upvalues.push(upvalue);
         }
 
         for i in 0..self.function_list[self.function.id].num_parameters {
@@ -124,10 +132,12 @@ impl<'a> Lifter<'a> {
 
         for (start_pc, end_pc) in block_ranges {
             self.current_node = Some(self.block_to_node(start_pc));
-            let (statements, edges) = self.lift_block(start_pc, end_pc);
-            let block = self.function.block_mut(self.current_node.unwrap()).unwrap();
+            let node = self.current_node.unwrap();
+            let (statements, origins, edges) = self.lift_block(start_pc, end_pc);
+            let block = self.function.block_mut(node).unwrap();
             block.0.extend(statements);
-            self.function.set_edges(self.current_node.unwrap(), edges);
+            self.function.set_statement_origins(node, origins);
+            self.function.set_edges(node, edges);
         }
 
         let entry_node = self.function.new_block();
@@ -265,9 +275,15 @@ impl<'a> Lifter<'a> {
         &mut self,
         block_start: usize,
         block_end: usize,
-    ) -> (Vec<ast::Statement>, Vec<(NodeIndex, BlockEdge)>) {
+    ) -> (
+        Vec<ast::Statement>,
+        Vec<cfg::provenance::OriginSet>,
+        Vec<(NodeIndex, BlockEdge)>,
+    ) {
         let mut statements: Vec<ast::Statement> =
             Vec::with_capacity((block_start..=block_end).count());
+        let mut origins: Vec<cfg::provenance::OriginSet> =
+            Vec::with_capacity(statements.capacity());
         let mut edges = Vec::new();
 
         let mut top: Option<(ast::RValue, u8)> = None;
@@ -277,7 +293,13 @@ impl<'a> Lifter<'a> {
             .enumerate();
 
         while let Some((index, instruction)) = iter.next() {
-            match *instruction {
+            let instruction = *instruction;
+            let mut emitted_origins = cfg::provenance::OriginSet::from([
+                self.source_origin(block_start + index, instruction)
+            ]);
+            let mut origins_attached = false;
+            let mut terminate = false;
+            match instruction {
                 Instruction::BC {
                     op_code,
                     a,
@@ -524,7 +546,7 @@ impl<'a> Lifter<'a> {
                                 .collect()
                         };
                         statements.push(ast::Return::new(values).into());
-                        break;
+                        terminate = true;
                     }
                     OpCode::LOP_FASTCALL
                     | OpCode::LOP_FASTCALL1
@@ -550,7 +572,11 @@ impl<'a> Lifter<'a> {
                                 ..
                             }
                         ));
-                        match iter.next().unwrap().1 {
+                        let (call_index, call_instruction) = iter.next().unwrap();
+                        emitted_origins.insert(
+                            self.source_origin(block_start + call_index, *call_instruction),
+                        );
+                        match call_instruction {
                             &Instruction::BC {
                                 op_code: OpCode::LOP_CALL | OpCode::LOP_CALLFB,
                                 a,
@@ -588,13 +614,19 @@ impl<'a> Lifter<'a> {
                                                 (a..a + c - 1)
                                                     .map(|r| self.register(r as _).into())
                                                     .collect(),
-                                                vec![ast::RValue::Select(call.into())],
+                                                vec![ast::Select::MethodCall(call).into_rvalue(
+                                                    ast::ResultDemand::Exact((c - 1) as usize),
+                                                )],
                                             )
                                             .into(),
                                         );
                                     }
                                 } else {
-                                    top = Some((call.into(), a));
+                                    top = Some((
+                                        ast::Select::MethodCall(call)
+                                            .into_rvalue(ast::ResultDemand::Open),
+                                        a,
+                                    ));
                                 }
                             }
                             instruction => unreachable!("{:?}", instruction),
@@ -624,13 +656,18 @@ impl<'a> Lifter<'a> {
                                         (a..a + c - 1)
                                             .map(|r| self.register(r as _).into())
                                             .collect(),
-                                        vec![ast::RValue::Select(call.into())],
+                                        vec![ast::Select::Call(call).into_rvalue(
+                                            ast::ResultDemand::Exact((c - 1) as usize),
+                                        )],
                                     )
                                     .into(),
                                 );
                             }
                         } else {
-                            top = Some((call.into(), a));
+                            top = Some((
+                                ast::Select::Call(call).into_rvalue(ast::ResultDemand::Open),
+                                a,
+                            ));
                         }
                     }
                     OpCode::LOP_CLOSEUPVALS => {
@@ -660,15 +697,20 @@ impl<'a> Lifter<'a> {
                         });
                         let method = if let Some(method) = inline_method {
                             statements.pop();
+                            emitted_origins.extend(origins.pop().unwrap());
                             method
                         } else {
                             value.into()
                         };
-                        if let Some(class_statement) = statements.iter_mut().rev().find_map(|s| {
-                            s.as_class_mut()
-                                .filter(|statement| statement.target == class)
+                        if let Some(class_index) = statements.iter().rposition(|statement| {
+                            statement
+                                .as_class()
+                                .is_some_and(|statement| statement.target == class)
                         }) {
+                            let class_statement = statements[class_index].as_class_mut().unwrap();
                             class_statement.methods.push((member_name, method));
+                            origins[class_index].extend(emitted_origins.clone());
+                            origins_attached = true;
                         } else {
                             statements.push(
                                 ast::Assign::new(
@@ -794,18 +836,25 @@ impl<'a> Lifter<'a> {
                     ),
                     OpCode::LOP_GETVARARGS => {
                         let vararg = ast::VarArg {};
-                        if b != 0 {
+                        if b > 1 {
                             statements.push(
                                 ast::Assign::new(
                                     (a..a + b - 1)
                                         .map(|r| self.register(r as _).into())
                                         .collect(),
-                                    vec![ast::RValue::Select(vararg.into())],
+                                    vec![
+                                        ast::Select::VarArg(vararg).into_rvalue(
+                                            ast::ResultDemand::Exact((b - 1) as usize),
+                                        ),
+                                    ],
                                 )
                                 .into(),
                             );
-                        } else {
-                            top = Some((vararg.into(), a));
+                        } else if b == 0 {
+                            top = Some((
+                                ast::Select::VarArg(vararg).into_rvalue(ast::ResultDemand::Open),
+                                a,
+                            ));
                         }
                     }
                     OpCode::LOP_NOP => {}
@@ -1377,8 +1426,19 @@ impl<'a> Lifter<'a> {
 
                         let func = &self.function_list[func_index];
                         let mut upvalues_passed = Vec::with_capacity(func.num_upvalues.into());
-                        for _ in 0..func.num_upvalues {
-                            let local = match iter.next().as_ref().unwrap().1 {
+                        for capture_index in 0..func.num_upvalues as usize {
+                            let (capture_instruction_index, capture_instruction) =
+                                iter.next().unwrap();
+                            let mut capture_origin = self.source_origin(
+                                block_start + capture_instruction_index,
+                                *capture_instruction,
+                            );
+                            capture_origin.capture = Some(cfg::provenance::CaptureOrigin {
+                                closure_function_id: func_index,
+                                capture_index,
+                            });
+                            emitted_origins.insert(capture_origin);
+                            let local = match capture_instruction {
                                 &Instruction::BC {
                                     op_code: OpCode::LOP_CAPTURE,
                                     a: capture_type,
@@ -1431,6 +1491,15 @@ impl<'a> Lifter<'a> {
                 },
                 _ => unimplemented!("{:?}", instruction),
             }
+            if !origins_attached {
+                while origins.len() < statements.len() {
+                    origins.push(emitted_origins.clone());
+                }
+            }
+            assert_eq!(statements.len(), origins.len());
+            if terminate {
+                break;
+            }
         }
 
         let last_index = iter
@@ -1451,7 +1520,8 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        (statements, edges)
+        assert_eq!(statements.len(), origins.len());
+        (statements, origins, edges)
     }
 
     fn register(&mut self, index: usize) -> ast::RcLocal {
@@ -1460,8 +1530,64 @@ impl<'a> Lifter<'a> {
         }
 
         let local = ast::RcLocal::new(ast::Local::new(self.debug_name_for_register(index)));
+        let debug_lifetimes = self.function_list[self.function.id]
+            .debug_locals
+            .iter()
+            .filter(|debug_local| debug_local.register as usize == index)
+            .filter_map(|debug_local| {
+                let name = self
+                    .string_table
+                    .get(debug_local.name.checked_sub(1)?)?
+                    .clone();
+                Some(cfg::provenance::DebugLifetime::new(
+                    name,
+                    debug_local.start_pc,
+                    debug_local.end_pc,
+                ))
+            })
+            .collect();
+        let binding = if index < self.function_list[self.function.id].num_parameters as usize {
+            cfg::provenance::BindingIdentity::parameter(self.function.id, index)
+        } else {
+            cfg::provenance::BindingIdentity::local(self.function.id, index)
+        };
+        self.function.set_register_family(
+            local.clone(),
+            cfg::provenance::RegisterFamily::new(self.function.id, index, binding, debug_lifetimes),
+        );
         self.register_map.insert(index, local.clone());
         local
+    }
+
+    fn source_origin(
+        &self,
+        instruction: usize,
+        value: Instruction,
+    ) -> cfg::provenance::SourceOrigin {
+        cfg::provenance::SourceOrigin::new(
+            self.function.id,
+            instruction,
+            self.source_line(instruction),
+            format!("{:?}", value.op_code()),
+        )
+    }
+
+    fn source_line(&self, instruction: usize) -> Option<usize> {
+        let function = &self.function_list[self.function.id];
+        let gap = function.line_gap_log2?;
+        let deltas = function.line_info_delta.as_ref()?;
+        let absolute_deltas = function.abs_line_info_delta.as_ref()?;
+        let relative = deltas
+            .iter()
+            .take(instruction + 1)
+            .fold(0u8, |line, delta| line.wrapping_add(*delta));
+        let interval = instruction >> gap;
+        let absolute = absolute_deltas
+            .iter()
+            .take(interval + 1)
+            .copied()
+            .sum::<i32>();
+        usize::try_from(absolute + i32::from(relative)).ok()
     }
 
     fn debug_name(&self, string_index: usize) -> Option<String> {

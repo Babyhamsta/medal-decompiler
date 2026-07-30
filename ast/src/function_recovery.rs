@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{Block, LValue, Literal, RValue, RcLocal, Statement, Traverse, formatter::Formatter};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +16,7 @@ fn receiver_score_rvalue(value: &RValue, receiver: &RcLocal) -> usize {
         RValue::Index(index) if matches!(index.left.as_ref(), RValue::Local(local) if local == receiver) => {
             1
         }
+        RValue::Closure(closure) => receiver_score_block(&closure.function.lock().body, receiver),
         _ => 0,
     };
     direct_score
@@ -29,7 +32,7 @@ fn receiver_score_lvalue(value: &LValue, receiver: &RcLocal) -> usize {
         LValue::Index(index) => {
             let direct_score = usize::from(
                 matches!(index.left.as_ref(), RValue::Local(local) if local == receiver),
-            ) * 2;
+            );
             direct_score
                 + receiver_score_rvalue(&index.left, receiver)
                 + receiver_score_rvalue(&index.right, receiver)
@@ -57,6 +60,14 @@ fn receiver_score_block(block: &Block, receiver: &RcLocal) -> usize {
                         Statement::Return(r#return) => usize::from(r#return.values.iter().any(
                             |value| matches!(value, RValue::Local(local) if local == receiver),
                         )),
+                        Statement::MethodCall(method_call)
+                            if matches!(
+                                method_call.value.as_ref(),
+                                RValue::Local(local) if local == receiver
+                            ) =>
+                        {
+                            2
+                        }
                         _ => 0,
                     };
             let nested = match statement {
@@ -122,7 +133,80 @@ fn collapse_local_functions(block: &mut Block) -> usize {
     recovered
 }
 
-fn mark_method(assign: &mut crate::Assign) -> bool {
+fn expand_named_returned_functions(block: &mut Block) -> usize {
+    let mut recovered = 0;
+    let mut index = 0;
+    while index < block.len() {
+        let candidate = block[index].as_return().and_then(|r#return| {
+            let [RValue::Closure(closure)] = r#return.values.as_slice() else {
+                return None;
+            };
+            let name = closure.function.lock().name.clone()?;
+            crate::is_valid_identifier(name.as_bytes()).then(|| (closure.clone(), name))
+        });
+        let Some((closure, name)) = candidate else {
+            index += 1;
+            continue;
+        };
+
+        let local = RcLocal::new(crate::Local::new(Some(name)));
+        let mut declaration = crate::Assign::new(vec![local.clone().into()], vec![closure.into()]);
+        declaration.prefix = true;
+        block[index].as_return_mut().unwrap().values[0] = local.into();
+        block.insert(index, declaration.into());
+        recovered += 1;
+        index += 2;
+    }
+    recovered
+}
+
+fn collect_method_names_rvalue(value: &RValue, names: &mut BTreeSet<String>) {
+    match value {
+        RValue::MethodCall(method_call)
+        | RValue::Select(crate::Select::MethodCall(method_call)) => {
+            names.insert(method_call.method.clone());
+        }
+        RValue::Closure(closure) => {
+            collect_method_names_block(&closure.function.lock().body, names);
+        }
+        _ => {}
+    }
+    for child in value.rvalues() {
+        collect_method_names_rvalue(child, names);
+    }
+}
+
+fn collect_method_names_block(block: &Block, names: &mut BTreeSet<String>) {
+    for statement in &block.0 {
+        if let Statement::MethodCall(method_call) = statement {
+            names.insert(method_call.method.clone());
+        }
+        for value in statement.rvalues() {
+            collect_method_names_rvalue(value, names);
+        }
+        match statement {
+            Statement::If(r#if) => {
+                collect_method_names_block(&r#if.then_block.lock(), names);
+                collect_method_names_block(&r#if.else_block.lock(), names);
+            }
+            Statement::While(r#while) => {
+                collect_method_names_block(&r#while.block.lock(), names);
+            }
+            Statement::Repeat(repeat) => {
+                collect_method_names_block(&repeat.block.lock(), names);
+            }
+            Statement::NumericFor(numeric_for) => {
+                collect_method_names_block(&numeric_for.block.lock(), names);
+            }
+            Statement::GenericFor(generic_for) => {
+                collect_method_names_block(&generic_for.block.lock(), names);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn mark_method(assign: &mut crate::Assign, called_methods: &BTreeSet<String>) -> bool {
     if assign.prefix || assign.parallel || assign.left.len() != 1 || assign.right.len() != 1 {
         return false;
     }
@@ -132,7 +216,7 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     let RValue::Literal(Literal::String(method)) = target.right.as_ref() else {
         return false;
     };
-    if !Formatter::<String>::is_valid_name(method) {
+    if !Formatter::<String>::is_valid_name_in(method, crate::IdentifierContext::MethodName) {
         return false;
     }
     let RValue::Closure(closure) = &assign.right[0] else {
@@ -146,7 +230,11 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     let Some(receiver) = function.parameters.first().cloned() else {
         return false;
     };
-    if receiver_score_block(&function.body, &receiver) < 3 {
+    let receiver_score = receiver_score_block(&function.body, &receiver);
+    let called_with_colon = std::str::from_utf8(method)
+        .ok()
+        .is_some_and(|method| called_methods.contains(method));
+    if receiver_score < 2 && !(receiver_score >= 1 && called_with_colon) {
         return false;
     }
 
@@ -155,32 +243,41 @@ fn mark_method(assign: &mut crate::Assign) -> bool {
     true
 }
 
-fn recover_block(block: &mut Block, stats: &mut FunctionRecoveryStats) {
+fn recover_block(
+    block: &mut Block,
+    called_methods: &BTreeSet<String>,
+    stats: &mut FunctionRecoveryStats,
+) {
+    stats.local_functions += expand_named_returned_functions(block);
     stats.local_functions += collapse_local_functions(block);
 
     for statement in &mut block.0 {
         if let Some(assign) = statement.as_assign_mut() {
-            stats.methods += usize::from(mark_method(assign));
+            stats.methods += usize::from(mark_method(assign, called_methods));
         }
 
         statement.traverse_rvalues(&mut |value| {
             if let RValue::Closure(closure) = value {
-                recover_block(&mut closure.function.lock().body, stats);
+                recover_block(&mut closure.function.lock().body, called_methods, stats);
             }
         });
 
         match statement {
             Statement::If(r#if) => {
-                recover_block(&mut r#if.then_block.lock(), stats);
-                recover_block(&mut r#if.else_block.lock(), stats);
+                recover_block(&mut r#if.then_block.lock(), called_methods, stats);
+                recover_block(&mut r#if.else_block.lock(), called_methods, stats);
             }
-            Statement::While(r#while) => recover_block(&mut r#while.block.lock(), stats),
-            Statement::Repeat(repeat) => recover_block(&mut repeat.block.lock(), stats),
+            Statement::While(r#while) => {
+                recover_block(&mut r#while.block.lock(), called_methods, stats)
+            }
+            Statement::Repeat(repeat) => {
+                recover_block(&mut repeat.block.lock(), called_methods, stats)
+            }
             Statement::NumericFor(numeric_for) => {
-                recover_block(&mut numeric_for.block.lock(), stats)
+                recover_block(&mut numeric_for.block.lock(), called_methods, stats)
             }
             Statement::GenericFor(generic_for) => {
-                recover_block(&mut generic_for.block.lock(), stats)
+                recover_block(&mut generic_for.block.lock(), called_methods, stats)
             }
             _ => {}
         }
@@ -189,7 +286,9 @@ fn recover_block(block: &mut Block, stats: &mut FunctionRecoveryStats) {
 
 pub fn recover_function_syntax(block: &mut Block) -> FunctionRecoveryStats {
     let mut stats = FunctionRecoveryStats::default();
-    recover_block(block, &mut stats);
+    let mut called_methods = BTreeSet::new();
+    collect_method_names_block(block, &mut called_methods);
+    recover_block(block, &called_methods, &mut stats);
     stats
 }
 
@@ -200,7 +299,8 @@ mod tests {
     use triomphe::Arc;
 
     use crate::{
-        Assign, Block, Closure, Function, Index, LValue, Literal, Local, RValue, RcLocal, Return,
+        Assign, Block, Closure, Function, Index, LValue, Literal, Local, MethodCall, RValue,
+        RcLocal, Return,
     };
 
     use super::recover_function_syntax;
@@ -387,5 +487,51 @@ mod tests {
 
         assert_eq!(stats.methods, 0);
         assert!(output.starts_with("handlers.ready = function(context)"));
+    }
+
+    #[test]
+    fn recovers_named_returned_closure_as_local_function() {
+        let value = local("value");
+        let body = Block(vec![Return::new(vec![value.clone().into()]).into()]);
+        let mut block = Block(vec![
+            Return::new(vec![closure(Some("run"), vec![value], body)]).into(),
+        ]);
+
+        let stats = recover_function_syntax(&mut block);
+
+        assert_eq!(stats.local_functions, 1);
+        assert_eq!(
+            block.to_string(),
+            "local function run(value)\n\treturn value\nend\nreturn run"
+        );
+    }
+
+    #[test]
+    fn matching_colon_call_recovers_single_use_receiver_method() {
+        let module = local("Module");
+        let instance = local("instance");
+        let receiver = local("receiver");
+        let field = Index::new(
+            receiver.clone().into(),
+            Literal::String(b"items".to_vec()).into(),
+        );
+        let target = Index::new(module.into(), Literal::String(b"iterate".to_vec()).into());
+        let mut block = Block(vec![
+            Assign::new(
+                vec![LValue::Index(target)],
+                vec![closure(
+                    Some("iterate"),
+                    vec![receiver],
+                    Block(vec![Return::new(vec![field.into()]).into()]),
+                )],
+            )
+            .into(),
+            MethodCall::new(instance.into(), "iterate".to_owned(), Vec::new()).into(),
+        ]);
+
+        let stats = recover_function_syntax(&mut block);
+
+        assert_eq!(stats.methods, 1);
+        assert!(block.to_string().starts_with("function Module:iterate()"));
     }
 }

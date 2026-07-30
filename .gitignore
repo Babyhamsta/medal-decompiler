@@ -8,3 +8,4 @@ result.lua
 /.tools/
 __pycache__/
 *.pyc
+.worktrees/
