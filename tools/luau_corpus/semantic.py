@@ -22,12 +22,33 @@ class SemanticProbe:
 
 
 _PROBE_NAMES = (
+    "01_literals_locals",
+    "02_expression_precedence",
+    "03_parallel_assignment",
     "04_calls_multireturn",
     "05_varargs",
+    "06_method_chains",
+    "07_table_literals",
+    "08_table_incremental",
+    "09_if_elseif_else",
+    "10_short_circuit",
+    "11_conditional_expression",
+    "12_while_break_continue",
     "13_repeat_until",
+    "14_numeric_for",
     "15_generic_for",
+    "16_closure_capture",
+    "17_mutable_upvalue",
+    # 18_recursion is absent: it returns three values, and Luau's require
+    # rejects a module that returns more than one, so runner.luau cannot load it.
+    "19_callback_factory",
     "20_pcall_style_flow",
     "21_state_machine",
+    "22_nested_early_exits",
+    "23_register_pressure_aliases",
+    "24_wonky_integration",
+    "25_product_controller",
+    "26_adversarial_dataflow",
 )
 
 TRUSTED_SEMANTIC_PROBES: Mapping[str, SemanticProbe] = MappingProxyType(
