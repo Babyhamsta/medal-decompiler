@@ -17,6 +17,13 @@ struct Evidence {
     direct_calls: usize,
     generic_value: bool,
     field_names: FxHashSet<String>,
+    /// The name suggested by the initializer's form, used only when no
+    /// stronger evidence names this local.
+    shape: Option<&'static str>,
+    /// Written through a computed index, which distinguishes an array used as
+    /// storage from a record with fixed fields.
+    computed_index_writes: usize,
+    constant_index_writes: usize,
 }
 
 impl Evidence {
@@ -26,6 +33,30 @@ impl Evidence {
 
     fn field_name(&self) -> Option<&String> {
         (self.field_names.len() == 1).then(|| self.field_names.iter().next().unwrap())
+    }
+}
+
+fn initializer_shape(value: &RValue) -> Option<&'static str> {
+    match value {
+        RValue::Closure(_) => Some("handler"),
+        RValue::Literal(crate::Literal::String(_)) => Some("text"),
+        RValue::Binary(binary) if matches!(binary.operation, crate::BinaryOperation::Concat) => {
+            Some("text")
+        }
+        RValue::Unary(unary) if matches!(unary.operation, crate::UnaryOperation::Length) => {
+            Some("count")
+        }
+        RValue::Table(table) if table.0.is_empty() => Some("slots"),
+        RValue::Table(table) => {
+            let all_string_keys = table.0.iter().all(|(key, _)| {
+                matches!(key, Some(RValue::Literal(crate::Literal::String(_))))
+            });
+            Some(if all_string_keys { "record" } else { "slots" })
+        }
+        RValue::Call(_) | RValue::Select(crate::Select::Call(_)) => Some("result"),
+        RValue::MethodCall(_) => Some("result"),
+        RValue::Index(_) | RValue::Global(_) => Some("value"),
+        _ => None,
     }
 }
 
@@ -183,6 +214,20 @@ impl Namer {
                             && is_valid_identifier(name.as_bytes())
                         {
                             structural_names.entry(local.clone()).or_insert(name);
+                        }
+                        if let Some(shape) = initializer_shape(value) {
+                            evidence.entry(local.clone()).or_default().shape = Some(shape);
+                        }
+                    }
+
+                    if let [LValue::Index(index)] = assign.left.as_slice()
+                        && let RValue::Local(container) = index.left.as_ref()
+                    {
+                        let container_evidence = evidence.entry(container.clone()).or_default();
+                        if matches!(index.right.as_ref(), RValue::Literal(_)) {
+                            container_evidence.constant_index_writes += 1;
+                        } else {
+                            container_evidence.computed_index_writes += 1;
                         }
                     }
 
@@ -344,6 +389,7 @@ impl Namer {
         let inferred = evidence.and_then(Evidence::role);
         let field_name = evidence.and_then(Evidence::field_name).cloned();
         let unused = evidence.is_none_or(|evidence| evidence.reads == 0);
+        let shape = evidence.and_then(|evidence| evidence.shape);
 
         let name = if let Some(name) = existing.or_else(|| structural_name.cloned()).or(field_name)
         {
@@ -352,6 +398,8 @@ impl Namer {
             self.unique_name(role)
         } else if unused {
             "_".to_owned()
+        } else if let Some(shape) = shape {
+            self.unique_name(shape)
         } else {
             self.fallback_name(prefix)
         };
@@ -366,7 +414,8 @@ impl Namer {
         let mut structural_names = FxHashMap::default();
         Self::collect_evidence(block, &parameter_set, &mut evidence, &mut structural_names);
         for evidence in evidence.values_mut() {
-            if evidence.table_initializer && evidence.returned {
+            if evidence.table_initializer && evidence.returned && evidence.computed_index_writes == 0
+            {
                 evidence.roles.insert("result");
             }
             if evidence.dynamic_callback_fields >= 2 {
@@ -378,6 +427,9 @@ impl Namer {
             if evidence.generic_value && evidence.direct_calls > 0 {
                 evidence.roles.clear();
                 evidence.roles.insert("callback");
+            }
+            if evidence.shape == Some("slots") && evidence.computed_index_writes > 0 {
+                evidence.shape = Some("registers");
             }
         }
 
@@ -847,5 +899,67 @@ mod tests {
         name_locals(&mut block, false);
 
         assert_eq!(local_name(&first), local_name(&second));
+    }
+
+    #[test]
+    fn table_initializer_indexed_in_a_loop_is_named_for_its_shape() {
+        let registers = local(None);
+        let counter = local(None);
+        let body = Block(vec![
+            Assign::new(
+                vec![
+                    crate::Index::new(registers.clone().into(), counter.clone().into()).into(),
+                ],
+                vec![Literal::Number(1.0).into()],
+            )
+            .into(),
+        ]);
+        let mut block = Block(vec![
+            declaration(&registers, Table::default().into()).into(),
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(4.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                body,
+            )
+            .into(),
+            Return::new(vec![registers.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&registers), "registers");
+    }
+
+    #[test]
+    fn string_initializer_is_named_text() {
+        let message = local(None);
+        let mut block = Block(vec![
+            declaration(&message, Literal::String(b"hello".to_vec()).into()).into(),
+            Return::new(vec![message.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&message), "text");
+    }
+
+    #[test]
+    fn a_local_with_no_inferable_shape_is_named_value_not_v1() {
+        let unknown = local(None);
+        let source = local(Some("source"));
+        let mut block = Block(vec![
+            declaration(
+                &unknown,
+                crate::Index::new(source.clone().into(), Literal::Number(1.0).into()).into(),
+            )
+            .into(),
+            Return::new(vec![unknown.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&unknown), "value");
     }
 }
