@@ -143,10 +143,18 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     /// `declaration_run` is the number of declarations immediately preceding
     /// `next`, so a block of locals can be separated from the work that uses
     /// them without splitting the block itself.
+    ///
+    /// `preceding_count` is `next`'s index within its block, i.e. how many
+    /// statements come before it. A lone simple statement followed by
+    /// `return` (`preceding_count == 1`) reads as one thought and stays
+    /// tight; that carve-out only applies here because it is reached solely
+    /// when `previous` isn't itself multi-line — the multi-line check above
+    /// already returned `true` otherwise.
     fn needs_blank_between(
         previous: &Statement,
         next: &Statement,
         declaration_run: usize,
+        preceding_count: usize,
     ) -> bool {
         if matches!(previous, Statement::Comment(_) | Statement::Empty(_))
             || matches!(next, Statement::Comment(_) | Statement::Empty(_))
@@ -159,7 +167,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             return true;
         }
         if matches!(next, Statement::Return(_)) {
-            return true;
+            return preceding_count != 1;
         }
         declaration_run >= 2 && !Self::is_declaration(next)
     }
@@ -173,6 +181,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     &block[i - 1],
                     statement,
                     declaration_run,
+                    i,
                 ) {
                     writeln!(self.output)?;
                 }
@@ -314,16 +323,24 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         same_target.then_some((target, binary.operation, binary.right.as_ref()))
     }
 
+    /// Whether an already-compacted table (see
+    /// `Table::without_shadowed_literal_fields`) will have its fields placed
+    /// on their own lines.
+    ///
+    /// The blank-line predicate and the table writer must agree, so both
+    /// funnel through this one definition rather than each deciding for
+    /// themselves. Callers that haven't compacted their table yet should use
+    /// `table_renders_multiline` instead.
+    fn compacted_table_renders_multiline(compacted: &Table) -> bool {
+        let sequential_keys = Self::are_table_keys_sequential(compacted);
+        !compacted.0.is_empty() && (!sequential_keys || compacted.0.len() > 3)
+            || Self::contains_table(compacted)
+    }
+
     /// Whether `format_table` will place this table's fields on their own
     /// lines.
-    ///
-    /// The blank-line predicate and the table writer must agree, so both read
-    /// this one definition rather than each deciding for themselves.
     pub(crate) fn table_renders_multiline(table: &Table) -> bool {
-        let compacted = table.without_shadowed_literal_fields();
-        let sequential_keys = Self::are_table_keys_sequential(&compacted);
-        !compacted.0.is_empty() && (!sequential_keys || compacted.0.len() > 3)
-            || Self::contains_table(&compacted)
+        Self::compacted_table_renders_multiline(&table.without_shadowed_literal_fields())
     }
 
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
@@ -331,7 +348,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         let table = &compacted;
         let sequential_keys = Self::are_table_keys_sequential(table);
         let should_space = !table.0.is_empty();
-        let should_format = Self::table_renders_multiline(&compacted);
+        let should_format = Self::compacted_table_renders_multiline(table);
         write!(self.output, "{{")?;
         if should_format {
             writeln!(self.output)?;
@@ -960,9 +977,9 @@ mod tests {
     use triomphe::Arc;
 
     use crate::{
-        Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
-        Index, LValue, Literal, Local, MethodCall, NumericFor, RValue, RcLocal, ResultDemand,
-        Return, Select, Table, Upvalue, VarArg,
+        Assign, Binary, BinaryOperation, Block, Call, Closure, Comment, Conditional, Empty,
+        Function, Global, Index, LValue, Literal, Local, MethodCall, NumericFor, RValue, RcLocal,
+        ResultDemand, Return, Select, Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1304,13 +1321,52 @@ mod tests {
     }
 
     #[test]
-    fn blank_line_precedes_a_return_that_follows_other_work() {
+    fn two_statement_body_return_stays_tight() {
+        // A single simple statement immediately followed by `return` reads
+        // as one thought (e.g. `self.middleware[...] = p1` then
+        // `return self`), so no blank line is inserted here even though
+        // `return` follows other work in general.
         let block = Block(vec![
             Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
             Return::new(vec![local("a").into()]).into(),
         ]);
 
-        assert_eq!(block.to_string(), "a = 1\n\nreturn a");
+        assert_eq!(block.to_string(), "a = 1\nreturn a");
+    }
+
+    #[test]
+    fn three_statement_body_keeps_blank_before_return() {
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\nb = 2\n\nreturn a");
+    }
+
+    #[test]
+    fn multiline_first_statement_then_return_keeps_blank() {
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n\nreturn a"
+        );
     }
 
     #[test]
@@ -1332,5 +1388,82 @@ mod tests {
         ]);
 
         assert_eq!(block.to_string(), "f = function() end\ng = 1");
+    }
+
+    #[test]
+    fn comment_before_multiline_statement_suppresses_blank_line() {
+        let counter = local("i");
+        let block = Block(vec![
+            Comment::new("note".to_owned()).into(),
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "-- note\nfor i = 1, 2 do\n\tb = 2\nend"
+        );
+    }
+
+    #[test]
+    fn comment_after_multiline_statement_suppresses_blank_line() {
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Comment::new("note".to_owned()).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n-- note"
+        );
+    }
+
+    #[test]
+    fn empty_statement_neighbour_suppresses_blank_line_on_both_sides() {
+        // Without the comment/empty suppression, the transition out of the
+        // multi-line `for` loop would gain a second blank line on top of the
+        // one the `Empty` statement's own (content-free) line already reads
+        // as.
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Empty {}.into(),
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n\na = 1"
+        );
     }
 }
