@@ -32,7 +32,9 @@ impl Evidence {
 struct Namer {
     rename: bool,
     counter: usize,
-    used_names: FxHashSet<String>,
+    /// One frame per enclosing function. A name is taken if any frame holds
+    /// it, so an inner binding cannot shadow one that is still visible.
+    scopes: Vec<FxHashSet<String>>,
 }
 
 impl Namer {
@@ -290,13 +292,28 @@ impl Namer {
         }
     }
 
+    fn is_taken(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.contains(name))
+    }
+
+    fn claim(&mut self, name: String) -> bool {
+        if self.is_taken(&name) {
+            return false;
+        }
+        self.scopes
+            .last_mut()
+            .expect("namer always has an open scope")
+            .insert(name);
+        true
+    }
+
     fn unique_name(&mut self, base: &str) -> String {
-        if self.used_names.insert(base.to_owned()) {
+        if self.claim(base.to_owned()) {
             return base.to_owned();
         }
         for suffix in 2.. {
             let name = format!("{base}{suffix}");
-            if self.used_names.insert(name.clone()) {
+            if self.claim(name.clone()) {
                 return name;
             }
         }
@@ -307,7 +324,7 @@ impl Namer {
         loop {
             let name = format!("{prefix}{}", self.counter);
             self.counter += 1;
-            if self.used_names.insert(name.clone()) {
+            if self.claim(name.clone()) {
                 return name;
             }
         }
@@ -387,8 +404,8 @@ impl Namer {
         self.name_scope(&mut function.body, &parameters);
     }
 
-    fn name_closure(&self, closure: &crate::Closure) {
-        let used_names = closure
+    fn name_closure(&mut self, closure: &crate::Closure) {
+        let upvalue_names = closure
             .upvalues
             .iter()
             .filter_map(|upvalue| {
@@ -405,24 +422,28 @@ impl Namer {
             })
             .collect::<FxHashSet<_>>();
         let mut function = closure.function.lock();
-        if function.is_method && used_names.contains("self") {
+        if function.is_method && self.is_taken("self") {
             function.is_method = false;
         }
-        Namer {
-            rename: self.rename,
-            counter: 1,
-            used_names,
-        }
-        .name_function(&mut function);
+
+        let outer_counter = std::mem::replace(&mut self.counter, 1);
+        self.scopes.push(upvalue_names);
+        self.name_function(&mut function);
+        self.scopes.pop();
+        self.counter = outer_counter;
     }
 
     fn name_child_functions(&mut self, block: &mut Block) {
         for statement in &mut block.0 {
+            let mut children = Vec::new();
             statement.traverse_rvalues(&mut |value| {
                 if let RValue::Closure(closure) = value {
-                    self.name_closure(closure);
+                    children.push(closure.clone());
                 }
             });
+            for closure in &children {
+                self.name_closure(closure);
+            }
             match statement {
                 Statement::If(r#if) => {
                     self.name_child_functions(&mut r#if.then_block.lock());
@@ -450,7 +471,7 @@ pub fn name_locals(block: &mut Block, rename: bool) {
     Namer {
         rename,
         counter: 1,
-        used_names: FxHashSet::default(),
+        scopes: vec![FxHashSet::default()],
     }
     .name_scope(block, &[]);
 }
@@ -768,5 +789,63 @@ mod tests {
 
         assert_eq!(local_name(&indexed_callback), "callback");
         assert_ne!(local_name(&helper), "callback");
+    }
+
+    #[test]
+    fn inner_scope_never_shadows_a_visible_outer_name() {
+        let outer = local(None);
+        let inner = local(None);
+        let mut inner_body = Block(vec![
+            declaration(&inner, Literal::Number(2.0).into()).into(),
+            crate::Return::new(vec![inner.clone().into()]).into(),
+        ]);
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                name: None,
+                parameters: Vec::new(),
+                is_variadic: false,
+                is_method: false,
+                body: std::mem::take(&mut inner_body),
+            }))),
+            upvalues: Vec::new(),
+        };
+        let holder = local(None);
+        let mut block = Block(vec![
+            declaration(&outer, Literal::Number(1.0).into()).into(),
+            declaration(&holder, closure.into()).into(),
+            crate::Return::new(vec![outer.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_ne!(local_name(&outer), local_name(&inner));
+    }
+
+    #[test]
+    fn sibling_scopes_may_reuse_a_name() {
+        let first = local(None);
+        let second = local(None);
+        let mut left = Block(vec![declaration(&first, Literal::Number(1.0).into()).into()]);
+        let mut right = Block(vec![declaration(&second, Literal::Number(2.0).into()).into()]);
+        let make = |body: &mut Block| Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                name: None,
+                parameters: Vec::new(),
+                is_variadic: false,
+                is_method: false,
+                body: std::mem::take(body),
+            }))),
+            upvalues: Vec::new(),
+        };
+        let left_holder = local(None);
+        let right_holder = local(None);
+        let mut block = Block(vec![
+            declaration(&left_holder, make(&mut left).into()).into(),
+            declaration(&right_holder, make(&mut right).into()).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&first), local_name(&second));
     }
 }
