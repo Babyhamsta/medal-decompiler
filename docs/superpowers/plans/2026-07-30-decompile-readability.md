@@ -1913,6 +1913,11 @@ fn record_rvalue(
     }
 }
 
+/// Visits every block nested inside a statement, including closure bodies.
+///
+/// Closure bodies matter most: a helper is declared once at the top level
+/// and called from inside other functions, so skipping closure bodies would
+/// miss nearly every call site worth naming.
 fn for_each_child_block(statement: &Statement, visit: &mut impl FnMut(&Block)) {
     match statement {
         Statement::If(r#if) => {
@@ -1924,6 +1929,25 @@ fn for_each_child_block(statement: &Statement, visit: &mut impl FnMut(&Block)) {
         Statement::NumericFor(numeric_for) => visit(&numeric_for.block.lock()),
         Statement::GenericFor(generic_for) => visit(&generic_for.block.lock()),
         _ => {}
+    }
+
+    for value in statement.rvalues() {
+        visit_closure_bodies(value, visit);
+    }
+}
+
+/// Visits the body of every closure reachable from an expression.
+///
+/// `Closure` holds `Arc<Mutex<Function>>` and the body is a plain `Block`
+/// field inside it, so the lock is taken here and the borrow handed straight
+/// to the visitor.
+fn visit_closure_bodies(value: &RValue, visit: &mut impl FnMut(&Block)) {
+    if let RValue::Closure(closure) = value {
+        let function = closure.function.lock();
+        visit(&function.body);
+    }
+    for child in value.rvalues() {
+        visit_closure_bodies(child, visit);
     }
 }
 
@@ -1952,7 +1976,56 @@ pub fn propagate_parameter_names(block: &mut Block) {
 }
 ```
 
-Closure bodies are not walked by `for_each_child_block`, so a nested function's calls are not visited. That is deliberate for this task: closure bodies reach this pass through their own `Statement::Assign` entries only if they are top-level declarations. Extending into closure bodies is a separate change and is not required to name the register-array call sites this pass targets.
+Recursion into closure bodies is what makes this pass useful: helpers are declared once at the top level and called from inside other functions. `RcLocal` identity is by address, not by name, so a callee resolved inside a nested body is the same map entry as the one declared outside it — no scope tracking is needed.
+
+Add a test proving the recursion works:
+
+```rust
+    #[test]
+    fn a_call_inside_a_closure_body_still_proposes_a_name() {
+        let stack_parameter = local(Some("stack"));
+        let callee = local(Some("pushValue"));
+        let argument = local(None);
+
+        let helper = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                name: None,
+                parameters: vec![stack_parameter],
+                is_variadic: false,
+                is_method: false,
+                body: Block::default(),
+            }))),
+            upvalues: Vec::new(),
+        };
+
+        let caller = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                name: None,
+                parameters: Vec::new(),
+                is_variadic: false,
+                is_method: false,
+                body: Block(vec![
+                    declaration(&argument, Table::default().into()).into(),
+                    Statement::Call(Call::new(
+                        callee.clone().into(),
+                        vec![argument.clone().into()],
+                    )),
+                ]),
+            }))),
+            upvalues: Vec::new(),
+        };
+
+        let holder = local(Some("caller"));
+        let mut block = Block(vec![
+            declaration(&callee, helper.into()).into(),
+            declaration(&holder, caller.into()).into(),
+        ]);
+
+        propagate_parameter_names(&mut block);
+
+        assert_eq!(argument.0.0.lock().0.as_deref(), Some("stack"));
+    }
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
