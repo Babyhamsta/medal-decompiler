@@ -968,16 +968,29 @@ fn decompile_function(
             })
         });
         scheduler.add_pass("inline", |function| {
-            let before = cfg::metrics::time(cfg::metrics::Metric::Fingerprint, || {
-                cfg::recovery::structural_fingerprint(function)
-            });
-            cfg::metrics::time(cfg::metrics::Metric::Inline, || {
+            #[cfg(feature = "verify-inline-change")]
+            let before = cfg::recovery::structural_fingerprint(function);
+
+            let changed = cfg::metrics::time(cfg::metrics::Metric::Inline, || {
                 ssa::inline::inline(function, &local_to_group, &upvalue_to_group)
             });
-            let after = cfg::metrics::time(cfg::metrics::Metric::Fingerprint, || {
-                cfg::recovery::structural_fingerprint(function)
-            });
-            if after != before {
+
+            // The reported flag must agree with the fingerprint in both
+            // directions. A false negative ends a round early; a false
+            // positive drives a round that changes nothing, which the
+            // scheduler reports as a repeated state and fails the decompile.
+            #[cfg(feature = "verify-inline-change")]
+            {
+                let after = cfg::recovery::structural_fingerprint(function);
+                assert_eq!(
+                    changed,
+                    before != after,
+                    "inline reported changed={changed} but the structural \
+                     fingerprint disagrees"
+                );
+            }
+
+            if changed {
                 cfg::recovery::PassChange::dataflow().union(cfg::recovery::PassChange::ast())
             } else {
                 cfg::recovery::PassChange::none()

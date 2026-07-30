@@ -162,25 +162,50 @@ One behavioural caveat: `derive` returns `Result` and can fail with
 would defer that detection. `InvalidEntry` is a cheap structural check, so the
 check stays per-round while the expensive construction moves to exit.
 
-### Phase 3: Streaming Structural Fingerprint
+### Phase 3: Streaming Fingerprint and Direct Change Reporting (landed)
 
-`structural_fingerprint` writes the entire function — every block's full AST
-via `Debug`, every edge's arguments via `format!` — into one `String`, then
-hashes it. It is called three times per round: once by the scheduler and twice
-by the `inline` pass to detect its own change.
+`structural_fingerprint` wrote the entire function — every block's full AST via
+`Debug`, every edge's arguments via `format!` — into one `String`, then hashed
+it. It ran three times per round: once for the scheduler's repeated-state
+check, and twice inside the `inline` pass purely to detect its own change.
 
 Two changes:
 
-1. Hash structure directly into a `Hasher` instead of materializing a `String`.
-   The fingerprint's only contract is that equal structures hash equally and
-   the value is stable within a run; it is never persisted or compared across
-   builds.
-2. Have `ssa::inline::inline` report whether it changed anything, removing two
-   of the three fingerprint calls per round.
+1. Hash directly into a `Hasher` through a `fmt::Write` adapter. The byte
+   stream fed to the hasher is unchanged, so equal structures still fingerprint
+   equally; only the intermediate string disappears. Worth 0.37 s and 2 GB of
+   churn — the cost is the `Debug` traversal, not the allocation.
+2. `ssa::inline::inline` reports whether it rewrote anything, removing two of
+   the three fingerprints per round. Three sites in `inline_rvalues` mutate:
+   statement inlining, generic-for-init merging, and edge-argument inlining.
+   The pop/push pair around a failed `try_inline` is a net no-op and is
+   deliberately not counted.
 
-Change 2 alters a change-detection signal, which can alter round counts, which
-can alter output. It ships as its own commit, gated on the output hash, and is
-reverted if the hash moves.
+The reported flag has to be exact in both directions. A false negative ends a
+round early; a false positive drives a round that changes nothing, which the
+scheduler reports as a repeated state and fails the decompile outright. The
+internal fixed-point condition is therefore left untouched — `inline_rvalues`
+feeds a separate `any_change` accumulator, not the loop's `changed` flag — so
+round counts are preserved rather than merely expected to be.
+
+A `verify-inline-change` feature cross-checks the flag against a full
+fingerprint on every round. It reported zero disagreements across stage-27's
+486 functions, 301 prototypes, 19 components, and 260 corpus cases over every
+profile. Scheduler rounds on stage-27 remained at 1,812, unchanged.
+
+Result, interleaved minimum of three runs: 21.12 s to 19.09 s total,
+fingerprint 3.27 s to 1.22 s, `inline` unchanged.
+
+### Measurement Protocol
+
+Phase 3 was initially misread from unpaired runs, which showed `inline`
+apparently 1.0 s slower and the total flat. Every unrelated phase had drifted
+2-4% between those runs, which no change to fingerprinting can cause.
+Interleaved A/B runs comparing minima showed the true result.
+
+Measurements comparing two builds are taken by alternating them within one
+session and comparing minima, never by comparing single runs recorded minutes
+apart.
 
 ### Phase 4: Allocation Churn
 

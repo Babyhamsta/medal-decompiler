@@ -1011,13 +1011,38 @@ pub enum SchedulerError {
     },
 }
 
-pub fn structural_fingerprint(function: &Function) -> u64 {
-    let mut representation = String::new();
-    use fmt::Write;
-    let _ = write!(representation, "entry={:?};", function.entry());
-    for (node, block) in function.blocks() {
-        let _ = write!(representation, "node={}:block={block:?};", node.index());
+/// Feeds formatted output straight into a hasher.
+///
+/// The fingerprint covers whole block contents, so materializing the
+/// rendering first meant building — and repeatedly reallocating — a string
+/// proportional to the function's entire AST on every call.
+struct HashWriter<'a, H: Hasher>(&'a mut H);
+
+impl<H: Hasher> fmt::Write for HashWriter<'_, H> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.write(text.as_bytes());
+        Ok(())
     }
+}
+
+/// Hashes the function's structure and contents.
+///
+/// The value is compared only against other fingerprints from the same run,
+/// to detect a reconstruction round that reproduced an earlier state. It is
+/// never persisted, so only the equality relation matters, not the value.
+pub fn structural_fingerprint(function: &Function) -> u64 {
+    use fmt::Write;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut sink = HashWriter(&mut hasher);
+
+    let _ = write!(sink, "entry={:?};", function.entry());
+    for (node, block) in function.blocks() {
+        let _ = write!(sink, "node={}:block={block:?};", node.index());
+    }
+
+    // Edge order is not stable across graph mutations, so the rendered edges
+    // are sorted before hashing. Sorting requires them materialized.
     let mut edges = function
         .graph()
         .edge_references()
@@ -1031,10 +1056,8 @@ pub fn structural_fingerprint(function: &Function) -> u64 {
         })
         .collect::<Vec<_>>();
     edges.sort();
-    let _ = write!(representation, "edges={edges:?};");
+    let _ = write!(sink, "edges={edges:?};");
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    representation.hash(&mut hasher);
     hasher.finish()
 }
 

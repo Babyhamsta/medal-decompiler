@@ -31,3 +31,6 @@ walkdir = "2.3.2"
 dhat-heap = []
 panic-handled = []
 profiling = []
+# Cross-checks the inline pass's change flag against a full structural
+# fingerprint on every round. Validation only; never enable in a release build.
+verify-inline-change = []
