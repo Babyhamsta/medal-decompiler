@@ -14,12 +14,51 @@
 //! | # | Condition | Enforced by |
 //! | --- | --- | --- |
 //! | 1 | `T` local, `K` constant literal | [`slot_write`] and [`slot_key`] |
-//! | 2 | `T`'s binding is a table literal | [`table_bindings`], filtered in [`foldable_tables`] |
-//! | 3 | write and read straight-line in one block | [`find_fold`] scans one block; [`blocks_window`] stops at structure |
+//! | 2 | `T`'s binding is a table literal | [`collect_table_bindings`], filtered in [`foldable_tables`] |
+//! | 3 | write and read straight-line in one block | [`find_fold`] scans one block; [`is_structured`] stops it |
 //! | 4 | no intervening call or side effect | [`blocks_window`] |
-//! | 5 | no computed-key write to `T` anywhere | [`SlotUses::computed_key_writes`] |
+//! | 5 | *removed* — see below | — |
 //! | 6 | `setmetatable` never applied to `T` | [`SlotUses::metatable_targets`] |
 //! | 7 | the write is dead after the read | [`SlotUses::opaque`] plus [`slot_dead_after`] |
+//!
+//! # Why precondition 5 is gone
+//!
+//! Precondition 5 said no write to `T` anywhere in the function may use a
+//! computed key. It was recorded as redundant when the design was written —
+//! two independent analyses failed to construct a program where it is the
+//! only thing preventing a wrong fold — and kept as a cheap guard. Measured
+//! against the stage-27 capture it turned out to be the dominant filter: it
+//! rejected 386 of 720 candidate tables, because every function in that
+//! capture opens by copying varargs into its register table through a loop
+//! index. It is removed. A computed-key write no longer disqualifies a table.
+//!
+//! The argument, restated for the pass as it now stands. `T` never escapes
+//! ([`SlotUses::opaque`]), and every read of `T` uses a constant key, so the
+//! only things that can touch `T[K]` are the `T[constant]` expressions in
+//! this function plus computed-key *writes*. Take a fold of `T[K] = E` at
+//! `w` into a read at `r`. A computed-key write sits somewhere, and there
+//! are only four places it can sit:
+//!
+//! - **Before `w`.** Whatever it left in `T[K]` is overwritten by `w` before
+//!   anything in the window reads the slot. On a loop back-edge it is still
+//!   ordered before `w` within the iteration, so a read positioned ahead of
+//!   `w` sees the same value with or without the fold.
+//! - **Between `w` and `r`, not carrying the read.** It is an assignment
+//!   through an index, so [`blocks_window`] ends the window and no fold
+//!   happens. This is the case precondition 5 was protecting, and
+//!   precondition 4 already covers it.
+//! - **Carrying the read**, as in `T[i] = T[K]`. The read is taken from the
+//!   blocking statement, then the scan stops. The statement may clobber
+//!   `T[K]` when `i == K`, so it does not count as redefining the slot —
+//!   [`writes_slot`] only recognises a constant-key target. That forces
+//!   [`slot_dead_after`] onto its second arm, which requires `T[K]` to have
+//!   no other read in the function, so the divergence is unobservable.
+//! - **After `r`.** It cannot change a value already read, and any later
+//!   read of `T[K]` is what [`slot_dead_after`] is already checking.
+//!
+//! A computed-key *read* is not covered by any of this: an unknown key could
+//! name the folded slot and make the read counts wrong. Those still mark the
+//! table opaque.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -174,11 +213,9 @@ struct SlotUses {
     /// closes the hole the spec flags under precondition 6: `setmetatable`
     /// cannot be applied to a table that is never named as a value.
     opaque: FxHashSet<RcLocal>,
-    /// Precondition 5. Subsumed by `opaque` — a computed key is a
-    /// non-constant index, which is an opaque use — and kept anyway, because
-    /// a redundant check costs nothing and being wrong here is silent.
-    computed_key_writes: FxHashSet<RcLocal>,
-    /// Precondition 6. Also subsumed by `opaque`, for the same reason.
+    /// Precondition 6. Subsumed by `opaque` — `setmetatable(T, …)` has to
+    /// name `T` as a bare value — and kept anyway, because a redundant check
+    /// costs nothing and being wrong here is silent.
     metatable_targets: FxHashSet<RcLocal>,
     /// How often each slot is read across the whole function.
     reads: FxHashMap<(RcLocal, SlotKey), usize>,
@@ -239,6 +276,18 @@ fn scan_rvalue(value: &RValue, candidates: &FxHashSet<RcLocal>, uses: &mut SlotU
                 return;
             }
         }
+        RValue::Closure(closure) => {
+            // A closure body is a separate function this pass never walks, so
+            // a captured table's slots could be read or written out of sight.
+            // `Upvalue::Copy` shares the table object just as `Ref` does —
+            // only the binding differs — so both forms escape.
+            for captured in closure.values_read() {
+                if candidates.contains(captured) {
+                    uses.opaque.insert(captured.clone());
+                }
+            }
+            return;
+        }
         RValue::Call(call) | RValue::Select(Select::Call(call)) => {
             reject_metatable_targets(call, candidates, uses);
         }
@@ -257,11 +306,15 @@ fn scan_lvalue(lvalue: &LValue, candidates: &FxHashSet<RcLocal>, uses: &mut Slot
     if let RValue::Local(table) = index.left.as_ref()
         && candidates.contains(table)
     {
-        if slot_key(&index.right).is_none() {
-            // Precondition 5.
-            uses.computed_key_writes.insert(table.clone());
-            uses.opaque.insert(table.clone());
-        }
+        // A computed-key *write* does not disqualify the table. It cannot
+        // reach a fold: one between the write and the read blocks the window
+        // under precondition 4, one before the write is overwritten by it,
+        // and one after the read cannot change a value already read. See the
+        // module comment.
+        //
+        // A computed-key *read* is a different matter and falls through to
+        // `scan_rvalue`, which marks the table opaque — an unknown key could
+        // name the folded slot, which would make the read counts wrong.
         scan_rvalue(&index.right, candidates, uses);
         return;
     }
@@ -352,9 +405,7 @@ fn foldable_tables(block: &Block, protected: &FxHashSet<RcLocal>) -> (FxHashSet<
     let foldable = candidates
         .into_iter()
         .filter(|table| {
-            !uses.opaque.contains(table)
-                && !uses.computed_key_writes.contains(table)
-                && !uses.metatable_targets.contains(table)
+            !uses.opaque.contains(table) && !uses.metatable_targets.contains(table)
         })
         .collect();
     (foldable, uses)
@@ -745,12 +796,121 @@ mod tests {
         assert_eq!(fold_table_slots(&mut block, &[]), 0);
     }
 
-    /// Precondition 5: a computed key anywhere could collide with a constant
-    /// one. The write here is after the read, so only the whole-function
-    /// check can reject it.
+    /// Precondition 5 removed: a computed-key write *after* the read cannot
+    /// change a value already read, so it no longer disqualifies the table.
+    /// This case returned 0 before the precondition was dropped.
     #[test]
-    fn keeps_the_write_when_a_computed_key_is_written_anywhere() {
+    fn folds_when_a_computed_key_is_written_after_the_read() {
         let mut block = fixture_chain_with_computed_key_write();
+        assert_eq!(fold_table_slots(&mut block, &[]), 1);
+    }
+
+    /// What keeps the removal of precondition 5 sound: a computed-key write
+    /// *between* the write and the read may collide with the folded slot, and
+    /// `blocks_window` ends the window at it. Precondition 4 carries the
+    /// weight precondition 5 used to.
+    #[test]
+    fn keeps_the_write_when_a_computed_key_write_intervenes() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let other = local(Some("other"));
+        let key = local(Some("index"));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.into()]).into(),
+            Assign::new(
+                vec![LValue::Index(Index::new(
+                    registers.clone().into(),
+                    key.into(),
+                ))],
+                vec![other.into()],
+            )
+            .into(),
+            Assign::new(
+                vec![slot(&registers, 2.0)],
+                vec![slot_read(&registers, 1.0)],
+            )
+            .into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
+    }
+
+    /// A computed-key *read* still disqualifies the table: an unknown key
+    /// could name the folded slot, which would make the read counts wrong.
+    #[test]
+    fn keeps_the_write_when_a_computed_key_is_read() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let sink = local(Some("sink"));
+        let key = local(Some("index"));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.into()]).into(),
+            Assign::new(
+                vec![slot(&registers, 2.0)],
+                vec![slot_read(&registers, 1.0)],
+            )
+            .into(),
+            Assign::new(
+                vec![sink.into()],
+                vec![RValue::Index(Index::new(registers.into(), key.into()))],
+            )
+            .into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
+    }
+
+    /// The read is taken from the statement that also ends the window. This
+    /// is the capture's dominant shape — `value[1] = registers[1]` — where
+    /// the read lives inside an index assignment.
+    #[test]
+    fn folds_into_a_blocking_index_assignment() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let destination = local(Some("destination"));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.clone().into()]).into(),
+            Assign::new(
+                vec![slot(&destination, 1.0)],
+                vec![slot_read(&registers, 1.0)],
+            )
+            .into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 1);
+        assert_eq!(block.0.len(), 2);
+        let merged = block.0[1].as_assign().unwrap();
+        assert_eq!(merged.right, vec![RValue::Local(source)]);
+    }
+
+    /// A closure captures the table by copy. The binding is copied but the
+    /// table object is shared, so the closure body — which this pass never
+    /// walks — can read the slot.
+    #[test]
+    fn keeps_the_write_when_the_table_is_captured_by_a_closure() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let holder = local(Some("holder"));
+        let closure = crate::Closure {
+            function: by_address::ByAddress(triomphe::Arc::new(parking_lot::Mutex::new(
+                crate::Function::default(),
+            ))),
+            upvalues: vec![crate::Upvalue::Copy(registers.clone())],
+        };
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.into()]).into(),
+            Assign::new(
+                vec![slot(&registers, 2.0)],
+                vec![slot_read(&registers, 1.0)],
+            )
+            .into(),
+            Assign::new(vec![holder.into()], vec![closure.into()]).into(),
+        ]);
+
         assert_eq!(fold_table_slots(&mut block, &[]), 0);
     }
 
