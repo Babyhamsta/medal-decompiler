@@ -264,17 +264,19 @@ class RealBinaryIntegrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("MEDAL_BUGB_FIXTURE"),
-    "set MEDAL_BUGB_FIXTURE to the stage-147 capture to run this regression",
+    os.environ.get("MEDAL_LARGE_CAPTURE"),
+    "set MEDAL_LARGE_CAPTURE to a large obfuscated capture to run this check",
 )
-class KnownRecompileFailureRegressionTest(unittest.TestCase):
-    """Pins the real Bug B failure: this specific capture must fail to
-    recompile with the register-limit error, decompiled by the release
-    binary. Not part of the default suite because the fixture lives
-    outside the repository."""
+class LargeCaptureRecompilesTest(unittest.TestCase):
+    """Checks a capture large enough to strain Luau's 200-local ceiling.
 
-    def test_stage_147_exceeds_local_register_limit(self) -> None:
-        fixture = Path(os.environ["MEDAL_BUGB_FIXTURE"])
+    Such a capture declares far more locals than the ceiling allows unless
+    scope narrowing groups them, so it is the shape most likely to regress.
+    Not part of the default suite because the capture lives outside the
+    repository."""
+
+    def test_a_large_capture_recompiles(self) -> None:
+        fixture = Path(os.environ["MEDAL_LARGE_CAPTURE"])
         result = run_gate_one(
             fixture,
             WORKSPACE / DEFAULT_DECOMPILER,
@@ -283,8 +285,9 @@ class KnownRecompileFailureRegressionTest(unittest.TestCase):
         )
 
         self.assertEqual(result.decompile_exit, 0)
-        self.assertNotEqual(result.recompile_exit, 0)
-        self.assertIn("exceeded limit 200", result.first_compile_error or "")
+        self.assertEqual(
+            result.recompile_exit, 0, result.first_compile_error or "recompile failed"
+        )
 
 
 if __name__ == "__main__":

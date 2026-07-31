@@ -20,7 +20,7 @@ def _rules(source: str) -> list[str]:
 
 
 class DiscardThenCallTests(unittest.TestCase):
-    """Rule (a): Bug A's exact shape -- a discarded field load immediately
+    """Rule (a): a discarded field load immediately
     followed by a call to the same base name."""
 
     def test_bare_call_is_flagged(self) -> None:
@@ -62,7 +62,7 @@ class DiscardThenCallTests(unittest.TestCase):
         self,
     ) -> None:
         # The discard is real, but the very next statement calls a
-        # different name -- this is not Bug A's shape, and the file's own
+        # different name -- this is not the defect's shape, and the file's own
         # ground truth (v4's alias-then-call sequence) shows the discard
         # here can be an unrelated, harmless leftover.
         source = """
@@ -91,7 +91,7 @@ class DiscardThenCallTests(unittest.TestCase):
     def test_discard_of_named_local_other_than_underscore_is_not_flagged(
         self,
     ) -> None:
-        # Only the exact "_" discard idiom is Bug A's signature; a real
+        # Only the exact "_" discard idiom is the defect's signature; a real
         # named local holding a field is a legitimate value, not a
         # discard, even if something calls the same base right after.
         source = """
@@ -124,8 +124,8 @@ class TableLiteralCalledTests(unittest.TestCase):
         self.assertEqual(_rules(source), [RULE_TABLE_LITERAL_CALLED])
 
     def test_single_element_box_literal_called_is_flagged(self) -> None:
-        # The other real shape found in the stage-147 capture: an
-        # upvalue-style box `{ x }` called directly instead of indexed.
+        # An upvalue-style box `{ x }` called directly instead of indexed:
+        # the call should have gone through the boxed value, not the box.
         source = """
             local v573 = { v571 }
             v573(p1)
@@ -177,7 +177,7 @@ class TableLiteralCalledTests(unittest.TestCase):
         self.assertEqual(_rules(source), [RULE_TABLE_LITERAL_CALLED])
 
     def test_calling_a_field_of_a_table_literal_local_is_not_flagged(self) -> None:
-        # `t.Start(t)` is exactly the correct shape Bug A should have
+        # `t.Start(t)` is exactly the correct shape the defect should have
         # produced; the call target here is the field, not `t` itself.
         source = """
             local t = {}
@@ -281,17 +281,17 @@ class FunctionParameterShadowTests(unittest.TestCase):
 
 
 class RealFixtureRegressionTest(unittest.TestCase):
-    """Pins the auditor against the actual stage-147 capture used as
-    ground truth for this task. Skipped unless the decompiled output has
-    been staged locally, since the source capture lives outside the
-    repository."""
+    """Checks the auditor against decompiled output known to contain the
+    discarded-lookup defect, to confirm the rule fires at scale and not
+    just on the hand-written shapes above. Skipped unless that output has
+    been staged locally, since the capture lives outside the repository."""
 
-    def test_stage_147_reports_at_least_121_discard_then_call_sites(self) -> None:
-        path_text = os.environ.get("MEDAL_BUGA_DECOMPILED_LUA")
+    def test_known_bad_output_reports_many_discard_then_call_sites(self) -> None:
+        path_text = os.environ.get("MEDAL_DISCARDED_LOOKUP_SAMPLE")
         if not path_text:
             self.skipTest(
-                "set MEDAL_BUGA_DECOMPILED_LUA to the stage-147 decompiled "
-                ".lua output to run this regression"
+                "set MEDAL_DISCARDED_LOOKUP_SAMPLE to decompiled .lua output "
+                "containing the defect to run this check"
             )
         path = Path(path_text)
         findings = audit_text(path, path.read_text(encoding="utf-8"))

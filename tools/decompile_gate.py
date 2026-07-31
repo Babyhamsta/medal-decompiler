@@ -1,19 +1,16 @@
 """Real-file correctness gate: decompile bytecode captures and confirm the
 output actually recompiles.
 
-Two live bugs prompted this tool. Both compiled bad Luau (Bug A: a
-`X.method(args)` call split into a discarded field load plus a call to the
-plain table `X`) or failed to recompile at all (Bug B: more than 200 live
-locals in one function, past Luau's register limit) -- and neither was
-caught by any automated check in the project, because:
+Real captures reach shapes and sizes the corpus fixtures never do. Two
+classes of defect illustrate why that gap matters:
 
-  - Bug A still compiles. Calling a table is a runtime error, not a syntax
-    error, so a plain compile check passes. Catching that class of defect
-    is the job of `audit_decompiled.py`, not this gate.
-  - Bug B was never observed because the recompile gate that already
-    existed (`tools/luau_corpus`) had only ever been run against 25 tiny
-    corpus fixtures, none of which were large enough to hit a register
-    limit.
+  - A method call `X.method(args)` reconstructed as a discarded field load
+    plus a call to the plain table `X`. Calling a table is a runtime error,
+    not a syntax error, so a compile check passes it. Catching that class of
+    defect is the job of `audit_decompiled.py`, not this gate.
+  - More than 200 live locals in one function, past Luau's register limit.
+    Only a function large enough to reach that limit exercises it, and the
+    corpus fixtures are all far too small.
 
 This tool's only job is: decompile a real capture, then recompile the
 result, and report whether the round trip actually works. It is not a

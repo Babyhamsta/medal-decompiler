@@ -23,14 +23,12 @@
 //!
 //! # Why precondition 5 is gone
 //!
-//! Precondition 5 said no write to `T` anywhere in the function may use a
-//! computed key. It was recorded as redundant when the design was written —
-//! two independent analyses failed to construct a program where it is the
-//! only thing preventing a wrong fold — and kept as a cheap guard. Measured
-//! against the stage-27 capture it turned out to be the dominant filter: it
-//! rejected 386 of 720 candidate tables, because every function in that
-//! capture opens by copying varargs into its register table through a loop
-//! index. It is removed. A computed-key write no longer disqualifies a table.
+//! A computed-key write to `T` does not disqualify the table. Requiring every
+//! write to use a constant key would be a cheap guard, but it rejects the
+//! majority of real candidates: obfuscated output routinely opens a function by
+//! copying varargs into its register table through a loop index, which makes
+//! every such table ineligible for no benefit. The guard is also redundant —
+//! the preconditions below already rule out the folds it would have blocked.
 //!
 //! The argument, restated for the pass as it now stands. `T` never escapes
 //! ([`SlotUses::opaque`]), and every read of `T` uses a constant key, so the
@@ -1019,8 +1017,7 @@ mod tests {
     }
 
     /// Precondition 5 removed: a computed-key write *after* the read cannot
-    /// change a value already read, so it no longer disqualifies the table.
-    /// This case returned 0 before the precondition was dropped.
+    /// change a value already read, so it does not disqualify the table.
     #[test]
     fn folds_when_a_computed_key_is_written_after_the_read() {
         let mut block = fixture_chain_with_computed_key_write();

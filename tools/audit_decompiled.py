@@ -2,12 +2,12 @@
 
 `decompile_gate.py` answers "does this output recompile"; it cannot answer
 "is this output correct", because a construct can be syntactically valid
-Luau and still be semantically wrong. Bug A is the motivating example: a
-method call `X.method(args)` decompiled into a discarded field load plus a
-call to the plain table `X`. The result compiles fine -- calling a table
-without `__call` is only a runtime error -- so no compile-time check can
-ever catch it. This module looks for the textual shapes that prove a
-runtime failure is coming, without running anything.
+Luau and still be semantically wrong. The motivating example: a method call
+`X.method(args)` reconstructed into a discarded field load plus a call to
+the plain table `X`. The result compiles fine -- calling a table without
+`__call` is only a runtime error -- so no compile-time check can ever catch
+it. This module looks for the textual shapes that prove a runtime failure is
+coming, without running anything.
 
 Every rule here is held to one bar: it must be able to point at a
 construct that is *definitely* wrong, not merely unusual. A rule that
@@ -21,23 +21,21 @@ share a decompiler-generated name across sibling blocks).
 Rule (a) -- discard-then-call
     `local _ = X.field` immediately followed (blank lines aside) by a
     call whose callee is exactly `X`, either as a bare statement `X(...)`
-    or as the right-hand side of an assignment `... = X(...)`. This is
-    Bug A's exact shape: bytecode for `X.method(args)` decompiled as a
-    discarded GETINDEX for the method lookup plus a separate CALL that
-    degraded to the object itself. Validated against the stage-147
-    capture: this rule reports exactly 121 bare-call sites plus 1
-    assigned-call site (122 total) for a file independently confirmed by
-    hand to contain 121+ instances of this defect.
+    or as the right-hand side of an assignment `... = X(...)`. That is the
+    shape left behind when bytecode for `X.method(args)` reconstructs as a
+    discarded index for the method lookup plus a separate call that
+    degraded to the object itself. The discarded lookup is the tell: code
+    that meant to call `X` would not read a field off it first.
 
 Rule (b) -- table-literal-called
     A local whose *only* binding anywhere in the file is a table literal
     (`local X = { ... }`, never reassigned) is later used as a call
     target `X(...)`. A table without `__call` cannot be called; Lua would
     raise `attempt to call a table value` the moment this line runs. This
-    rule does not depend on Bug A's specific discard-then-call shape, so
-    it independently confirms the same class of defect through a
-    different mechanism -- and, on stage-147, it catches call sites Rule
-    (a) cannot, because the discard and the call are not adjacent.
+    rule does not depend on rule (a)'s discard-then-call shape, so it
+    catches the same class of defect through an independent mechanism,
+    including call sites rule (a) cannot see because the discard and the
+    call are not adjacent.
 
 Rule (c) -- nonfunction-literal-called
     Same reasoning as (b), for the other literal kinds that can never be
@@ -71,11 +69,9 @@ SCOPE TRACKING (rules b/c only)
 
     Known limitation: function parameters are not parsed from the
     function header, so a parameter that happens to reuse an outer
-    flagged name would shadow it incorrectly. This was checked against
-    the stage-147 fixture (no parameter there reuses an outer table's
-    name) but is not structurally impossible in other captures -- a
-    finding whose "detail" cites a name that is also used as a parameter
-    nearby is worth a second look before triaging.
+    flagged name would shadow it without this noticing, producing a false
+    positive. A finding whose "detail" cites a name that is also used as a
+    parameter nearby is worth a second look before triaging.
 """
 
 from __future__ import annotations
