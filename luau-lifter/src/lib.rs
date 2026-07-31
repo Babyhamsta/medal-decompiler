@@ -512,7 +512,7 @@ fn decompile_chunk(
         let (function, upvalues_in, child_functions) =
             catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
                 Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
-            })?;
+            })??;
         *remaining -= 1;
         if *remaining == 0 {
             release_lifted_prototype(&mut chunk.functions[func_id]);
