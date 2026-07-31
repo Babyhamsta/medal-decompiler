@@ -515,6 +515,46 @@ impl Namer {
         }
     }
 
+    /// Ranks a local by how certain the name it wants is, so that within a
+    /// scope the most certain names are claimed first. Two locals with no
+    /// relation to each other can independently want the same word — a
+    /// `pairs` loop's value variable has a genuine, high-confidence claim on
+    /// `value` from its role, while an unrelated local with nothing
+    /// inferable also falls back to `value` as a generic shape. Naming them
+    /// in declaration order lets whichever happens to come first squat on
+    /// the word, silently bumping the other to `value2` regardless of which
+    /// one actually earned it. Ranking by evidence tier instead means the
+    /// high-confidence name always wins the word it wants, independent of
+    /// where either local sits in the source.
+    fn naming_tier(
+        &self,
+        local: &RcLocal,
+        evidence: Option<&Evidence>,
+        structural_name: Option<&String>,
+    ) -> u8 {
+        let existing = (!self.rename)
+            .then(|| local.0.0.lock().0.clone())
+            .flatten()
+            .filter(|name| is_valid_identifier(name.as_bytes()));
+        let field_name = evidence.and_then(Evidence::field_name);
+        if existing.is_some() || structural_name.is_some() || field_name.is_some() {
+            return 0;
+        }
+        if evidence.and_then(Evidence::role).is_some() {
+            return 1;
+        }
+        let unused = evidence.is_none_or(|evidence| evidence.reads == 0);
+        if unused {
+            // Named "_" and never added to the claimed-name pool, so its
+            // position among the tiers cannot cause a collision either way.
+            return 3;
+        }
+        if evidence.and_then(|evidence| evidence.shape).is_some() {
+            return 2;
+        }
+        3
+    }
+
     fn assign_name(
         &mut self,
         local: &RcLocal,
@@ -597,10 +637,18 @@ impl Namer {
                 structural_names.get(parameter),
             );
         }
-        for local in declarations
+        // Sorted by evidence tier (stable, so declaration order still breaks
+        // ties within a tier) rather than named in raw declaration order: a
+        // role-backed name must claim its word before a same-named generic
+        // shape gets the chance to squat on it first. See `naming_tier`.
+        let mut ordered_declarations = declarations
             .iter()
             .filter(|local| !parameter_set.contains(*local))
-        {
+            .collect::<Vec<_>>();
+        ordered_declarations.sort_by_key(|local| {
+            self.naming_tier(local, evidence.get(*local), structural_names.get(*local))
+        });
+        for local in ordered_declarations {
             self.assign_name(local, "v", evidence.get(local), structural_names.get(local));
         }
 
