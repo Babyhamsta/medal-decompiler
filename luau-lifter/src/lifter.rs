@@ -120,23 +120,32 @@ impl<'a> Lifter<'a> {
         blocks.sort_unstable();
 
         // TODO: code_ranges in lua51-lifter
-        let mut block_end = self.function_list[self.function.id].instructions.len();
+        let instruction_count = self.function_list[self.function.id].instructions.len();
+        if instruction_count == 0 {
+            return Err(self.lift_error(
+                None,
+                "prototype has instructions",
+                "the prototype's instruction stream is empty, so it has no entry block",
+            ));
+        }
+        // Ranges are half-open. A boundary at exactly `instruction_count` is the implicit
+        // end-of-function boundary that a branch or a trailing conditional's fallthrough can
+        // name; it materialises as an empty terminal block. `jump_target` accepts the same
+        // upper bound, so the two agree on what a reachable boundary is.
+        let mut block_end = instruction_count;
         let mut block_ranges = Vec::with_capacity(blocks.len());
         for &block_start in blocks.iter().rev() {
-            let end = block_end
-                .checked_sub(1)
-                .filter(|&end| block_start <= end)
-                .ok_or_else(|| {
-                    self.lift_error(
-                        None,
-                        "non-empty block range",
-                        format!(
-                            "block starting at instruction {block_start} has no instructions \
-                             before the next block boundary at {block_end}"
-                        ),
-                    )
-                })?;
-            block_ranges.push((block_start, end));
+            if block_start > instruction_count {
+                return Err(self.lift_error(
+                    None,
+                    "block boundary within instruction stream",
+                    format!(
+                        "block starts at instruction {block_start} but the prototype only has \
+                         {instruction_count} instruction(s)"
+                    ),
+                ));
+            }
+            block_ranges.push((block_start, block_end));
             block_end = if block_start != 0 { block_start } else { block_end };
         }
 
@@ -166,6 +175,7 @@ impl<'a> Lifter<'a> {
         for (start_pc, end_pc) in block_ranges {
             let node = self.block_to_node(start_pc)?;
             self.current_node = Some(node);
+            // `end_pc` is exclusive: `start_pc == end_pc` is the empty terminal block.
             let (statements, origins, edges) = self.lift_block(start_pc, end_pc)?;
             let block = self.function.block_mut(node).unwrap();
             block.0.extend(statements);
@@ -188,6 +198,11 @@ impl<'a> Lifter<'a> {
     /// Resolves a branch operand into an absolute instruction index, returning an error
     /// instead of over/underflowing when the offset would land before the first instruction
     /// or past the end of the prototype's instruction stream.
+    ///
+    /// A target of exactly `instruction_count` names the implicit end-of-function boundary.
+    /// [`Lifter::lift_function`] accepts the same upper bound and materialises that boundary
+    /// as an empty terminal block, so a target this returns is always a block a later
+    /// [`Lifter::block_to_node`] can resolve.
     fn jump_target(
         &self,
         base: usize,
@@ -324,6 +339,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Lifts the half-open instruction range `block_start..block_end`. An empty range is
+    /// legal and yields a block with no statements and no edges.
     fn lift_block(
         &mut self,
         block_start: usize,
@@ -337,14 +354,14 @@ impl<'a> Lifter<'a> {
         DecompileError,
     > {
         let mut statements: Vec<ast::Statement> =
-            Vec::with_capacity((block_start..=block_end).count());
+            Vec::with_capacity(block_end.saturating_sub(block_start));
         let mut origins: Vec<cfg::provenance::OriginSet> =
             Vec::with_capacity(statements.capacity());
         let mut edges = Vec::new();
 
         let mut top: Option<(ast::RValue, u8)> = None;
 
-        let mut iter = self.function_list[self.function.id].instructions[block_start..=block_end]
+        let mut iter = self.function_list[self.function.id].instructions[block_start..block_end]
             .iter()
             .enumerate();
 
@@ -591,13 +608,13 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_RETURN => {
                         let values = if b != 0 {
-                            (a..a + (b - 1))
-                                .map(|r| self.register(r as _).into())
+                            (a as usize..a as usize + (b as usize - 1))
+                                .map(|r| self.register(r).into())
                                 .collect()
                         } else {
                             let (tail, end) = self.take_open_result(&mut top, block_start + index)?;
-                            (a..end)
-                                .map(|r| self.register(r as _).into())
+                            (a as usize..end as usize)
+                                .map(|r| self.register(r).into())
                                 .chain(std::iter::once(tail))
                                 .collect()
                         };
@@ -685,14 +702,14 @@ impl<'a> Lifter<'a> {
                                 }
                                 // TODO: repeated code :(
                                 let arguments = if b != 0 {
-                                    (a + 2..a + b)
-                                        .map(|r| self.register(r as _).into())
+                                    (a as usize + 2..a as usize + b as usize)
+                                        .map(|r| self.register(r).into())
                                         .collect()
                                 } else {
                                     let top =
                                         self.take_open_result(&mut top, block_start + call_index)?;
-                                    (a + 2..top.1)
-                                        .map(|r| self.register(r as _).into())
+                                    (a as usize + 2..top.1 as usize)
+                                        .map(|r| self.register(r).into())
                                         .chain(std::iter::once(top.0))
                                         .collect()
                                 };
@@ -710,8 +727,8 @@ impl<'a> Lifter<'a> {
                                     } else {
                                         statements.push(
                                             ast::Assign::new(
-                                                (a..a + c - 1)
-                                                    .map(|r| self.register(r as _).into())
+                                                (a as usize..a as usize + c as usize - 1)
+                                                    .map(|r| self.register(r).into())
                                                     .collect(),
                                                 vec![ast::Select::MethodCall(call).into_rvalue(
                                                     ast::ResultDemand::Exact((c - 1) as usize),
@@ -742,13 +759,13 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_CALL | OpCode::LOP_CALLFB => {
                         let arguments = if b != 0 {
-                            (a + 1..a + b)
-                                .map(|r| self.register(r as _).into())
+                            (a as usize + 1..a as usize + b as usize)
+                                .map(|r| self.register(r).into())
                                 .collect()
                         } else {
                             let top = self.take_open_result(&mut top, block_start + index)?;
-                            (a + 1..top.1)
-                                .map(|r| self.register(r as _).into())
+                            (a as usize + 1..top.1 as usize)
+                                .map(|r| self.register(r).into())
                                 .chain(std::iter::once(top.0))
                                 .collect()
                         };
@@ -761,8 +778,8 @@ impl<'a> Lifter<'a> {
                             } else {
                                 statements.push(
                                     ast::Assign::new(
-                                        (a..a + c - 1)
-                                            .map(|r| self.register(r as _).into())
+                                        (a as usize..a as usize + c as usize - 1)
+                                            .map(|r| self.register(r).into())
                                             .collect(),
                                         vec![ast::Select::Call(call).into_rvalue(
                                             ast::ResultDemand::Exact((c - 1) as usize),
@@ -841,8 +858,8 @@ impl<'a> Lifter<'a> {
                             ast::SetList::new(
                                 self.register(a as _),
                                 aux as usize,
-                                (b..b + c - 1)
-                                    .map(|r| self.register(r as _).into())
+                                (b as usize..b as usize + c as usize - 1)
+                                    .map(|r| self.register(r).into())
                                     .collect(),
                                 None,
                             )
@@ -851,7 +868,9 @@ impl<'a> Lifter<'a> {
                             ast::SetList::new(
                                 self.register(a as _).clone(),
                                 aux as usize,
-                                (b..top.1).map(|r| self.register(r as _).into()).collect(),
+                                (b as usize..top.1 as usize)
+                                    .map(|r| self.register(r).into())
+                                    .collect(),
                                 Some(top.0),
                             )
                         };
@@ -957,8 +976,8 @@ impl<'a> Lifter<'a> {
                         if b > 1 {
                             statements.push(
                                 ast::Assign::new(
-                                    (a..a + b - 1)
-                                        .map(|r| self.register(r as _).into())
+                                    (a as usize..a as usize + b as usize - 1)
+                                        .map(|r| self.register(r).into())
                                         .collect(),
                                     vec![
                                         ast::Select::VarArg(vararg).into_rvalue(
@@ -1427,8 +1446,8 @@ impl<'a> Lifter<'a> {
                     OpCode::LOP_FORNPREP => {
                         // TODO: do this properly
                         let limit = self.register(a as _);
-                        let step = self.register((a + 1) as _);
-                        let counter = self.register((a + 2) as _);
+                        let step = self.register(a as usize + 1);
+                        let counter = self.register(a as usize + 2);
                         statements.push(ast::NumForInit::new(counter, limit, step).into());
 
                         let loop_node = self
@@ -1454,8 +1473,8 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_FORNLOOP => {
                         let limit = self.register(a as _);
-                        let step = self.register((a + 1) as _);
-                        let counter = self.register((a + 2) as _);
+                        let step = self.register(a as usize + 1);
+                        let counter = self.register(a as usize + 2);
                         statements
                             .push(ast::NumForNext::new(counter, limit.into(), step.into()).into());
                         edges.push((
@@ -1473,8 +1492,8 @@ impl<'a> Lifter<'a> {
                     | OpCode::LOP_FORGPREP_INEXT
                     | OpCode::LOP_FORGPREP_NEXT => {
                         let generator = self.register(a as _);
-                        let state = self.register((a + 1) as _);
-                        let counter = self.register((a + 2) as _);
+                        let state = self.register(a as usize + 1);
+                        let counter = self.register(a as usize + 2);
                         statements.push(ast::GenericForInit::new(generator, state, counter).into());
                         let loop_index =
                             self.jump_target(block_start + index + 1, d as isize, block_start + index)?;
@@ -1507,8 +1526,8 @@ impl<'a> Lifter<'a> {
                     // same applies to fastcall
                     OpCode::LOP_FORGLOOP => {
                         let generator = self.register(a as _);
-                        let state = self.register((a + 1) as _);
-                        let _counter = self.register((a + 2) as _);
+                        let state = self.register(a as usize + 1);
+                        let _counter = self.register(a as usize + 2);
                         statements.push(
                             ast::GenericForNext::new(
                                 (a as usize + 3..a as usize + 3 + (aux & 0xff) as usize)
@@ -1575,20 +1594,69 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_DUPCLOSURE | OpCode::LOP_NEWCLOSURE => {
                         let dest_local = self.register(a as _);
+                        let operand = usize::try_from(d).map_err(|_| {
+                            self.lift_error(
+                                Some(block_start + index),
+                                "closure operand is non-negative",
+                                format!("{op_code:?} references child index {d}"),
+                            )
+                        })?;
                         let func_index = match op_code {
-                            OpCode::LOP_NEWCLOSURE => {
-                                self.function_list[self.function.id].functions[d as usize]
+                            OpCode::LOP_NEWCLOSURE => self.function_list[self.function.id]
+                                .functions
+                                .get(operand)
+                                .copied()
+                                .ok_or_else(|| {
+                                    self.lift_error(
+                                        Some(block_start + index),
+                                        "closure index within declared children",
+                                        format!(
+                                            "instruction references child {operand} but the \
+                                             prototype declares {} child function(s)",
+                                            self.function_list[self.function.id].functions.len()
+                                        ),
+                                    )
+                                })?,
+                            _ => {
+                                let constant = self.function_list[self.function.id]
+                                    .constants
+                                    .get(operand)
+                                    .ok_or_else(|| {
+                                        self.lift_error(
+                                            Some(block_start + index),
+                                            "constant index within constant table",
+                                            format!(
+                                                "instruction references constant {operand} but \
+                                                 the prototype declares {} constant(s)",
+                                                self.function_list[self.function.id].constants.len()
+                                            ),
+                                        )
+                                    })?;
+                                match constant {
+                                    &BytecodeConstant::Closure(func_index) => func_index,
+                                    other => {
+                                        return Err(self.lift_error(
+                                            Some(block_start + index),
+                                            "DUPCLOSURE operand names a closure constant",
+                                            format!(
+                                                "constant {operand} is {other:?}, not a closure"
+                                            ),
+                                        ));
+                                    }
+                                }
                             }
-                            OpCode::LOP_DUPCLOSURE => match self.function_list[self.function.id]
-                                .constants
-                                .get(d as usize)
-                                .unwrap()
-                            {
-                                &BytecodeConstant::Closure(func_index) => func_index,
-                                _ => unreachable!(),
-                            },
-                            _ => unreachable!(),
                         };
+                        if func_index >= self.function_list.len() {
+                            return Err(self.lift_error(
+                                Some(block_start + index),
+                                "closure target within prototype table",
+                                format!(
+                                    "closure names prototype {func_index} but the bytecode \
+                                     contains {} prototype(s)",
+                                    self.function_list.len()
+                                ),
+                            ));
+                        }
                         let func_name_index = self.function_list[func_index].function_name;
                         let func_name = self.debug_name(func_name_index);
 
@@ -1721,7 +1789,7 @@ impl<'a> Lifter<'a> {
         let last_index = iter
             .next()
             .map(|(i, _)| block_start + i - 1)
-            .unwrap_or(block_end);
+            .unwrap_or(block_end.saturating_sub(1));
         if edges.is_empty()
             && !Self::is_terminator(self.function_list[self.function.id].instructions[last_index])
         {
@@ -2025,7 +2093,7 @@ mod naming_tests {
 
 #[cfg(test)]
 mod robustness_tests {
-    use super::{BytecodeFunction, Instruction, Lifter, OpCode};
+    use super::{BytecodeFunction, Instruction, Lifter, OpCode, ast};
 
     /// A minimal prototype with no upvalues, no parameters, and the given instructions --
     /// enough to drive [`Lifter::lift`] directly without going through the deserializer.
@@ -2120,5 +2188,241 @@ mod robustness_tests {
 
         assert_eq!(error.phase, super::DecompilePhase::Lift);
         assert_eq!(error.invariant, "jump target within instruction stream");
+    }
+
+    /// A conditional branch in the last slot makes its fallthrough boundary land exactly one
+    /// past the last instruction. That boundary is the implicit end of the function and lifts
+    /// to an empty terminal block.
+    #[test]
+    fn trailing_conditional_fallthrough_lifts_to_an_empty_terminal_block() {
+        let functions = vec![prototype(vec![
+            Instruction::BC {
+                op_code: OpCode::LOP_LOADNIL,
+                a: 0,
+                b: 0,
+                c: 0,
+                aux: 0,
+            },
+            Instruction::AD {
+                op_code: OpCode::LOP_JUMPIF,
+                a: 0,
+                d: -1,
+                aux: 0,
+            },
+        ])];
+        let strings = Vec::new();
+
+        let (function, _, _) = Lifter::lift(&functions, &strings, 0)
+            .expect("a fallthrough boundary at the end of the function is liftable");
+
+        assert_eq!(
+            function
+                .blocks()
+                .filter(|(_, block)| block.is_empty())
+                .count(),
+            2,
+            "the entry block and the terminal boundary block are both empty"
+        );
+    }
+
+    /// A branch whose target is exactly one past the last instruction names the same implicit
+    /// end-of-function boundary and is equally liftable.
+    #[test]
+    fn branch_to_end_of_function_lifts_to_an_empty_terminal_block() {
+        let functions = vec![prototype(vec![
+            Instruction::AD {
+                op_code: OpCode::LOP_JUMP,
+                a: 0,
+                d: 1,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_RETURN,
+                a: 0,
+                b: 1,
+                c: 0,
+                aux: 0,
+            },
+        ])];
+        let strings = Vec::new();
+
+        let (function, _, _) =
+            Lifter::lift(&functions, &strings, 0).expect("a branch to the end of the function is liftable");
+
+        assert!(
+            function
+                .blocks()
+                .any(|(_, block)| block.iter().any(|s| matches!(s, ast::Statement::Return(_)))),
+            "the reachable RETURN survives the empty terminal block"
+        );
+    }
+
+    /// An aux-carrying conditional in the last slot pushes its fallthrough boundary two past
+    /// the last instruction, which no instruction stream can contain.
+    #[test]
+    fn block_boundary_past_end_of_function_errors_instead_of_panicking() {
+        let functions = vec![prototype(vec![
+            Instruction::BC {
+                op_code: OpCode::LOP_LOADNIL,
+                a: 0,
+                b: 0,
+                c: 0,
+                aux: 0,
+            },
+            Instruction::AD {
+                op_code: OpCode::LOP_JUMPIFEQ,
+                a: 0,
+                d: -1,
+                aux: 0,
+            },
+        ])];
+        let strings = Vec::new();
+
+        let error = Lifter::lift(&functions, &strings, 0).unwrap_err();
+
+        assert_eq!(error.phase, super::DecompilePhase::Lift);
+        assert_eq!(error.invariant, "block boundary within instruction stream");
+        assert!(error.detail.contains("block starts at instruction 3"));
+        assert!(error.detail.contains("only has 2 instruction(s)"));
+    }
+
+    /// Adding to a `u8` operand before widening overflows once the argument window reaches
+    /// past register 255: a panic under `overflow-checks`, and a wrapped -- here empty --
+    /// register range without them. Widening first keeps the full window in both profiles.
+    #[test]
+    fn call_spanning_the_top_register_keeps_its_arguments_instead_of_overflowing() {
+        let functions = vec![prototype(vec![
+            Instruction::BC {
+                op_code: OpCode::LOP_CALL,
+                a: 254,
+                b: 4,
+                c: 1,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_RETURN,
+                a: 0,
+                b: 1,
+                c: 0,
+                aux: 0,
+            },
+        ])];
+        let strings = Vec::new();
+
+        let (function, _, _) = Lifter::lift(&functions, &strings, 0)
+            .expect("a call spanning the top register is liftable");
+
+        let argument_counts = function
+            .blocks()
+            .flat_map(|(_, block)| block.iter())
+            .filter_map(|statement| match statement {
+                ast::Statement::Call(call) => Some(call.arguments.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(argument_counts, vec![3]);
+    }
+
+    /// `LOP_CAPTURE` with capture type 2 reads the *enclosing* prototype's upvalue list, the
+    /// sibling of the `LOP_GETUPVAL`/`LOP_SETUPVAL` site.
+    #[test]
+    fn capture_of_undeclared_upvalue_errors_instead_of_panicking() {
+        let mut parent = prototype(vec![
+            Instruction::AD {
+                op_code: OpCode::LOP_NEWCLOSURE,
+                a: 0,
+                d: 0,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_CAPTURE,
+                a: 2,
+                b: 0,
+                c: 0,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_RETURN,
+                a: 0,
+                b: 1,
+                c: 0,
+                aux: 0,
+            },
+        ]);
+        parent.functions = vec![1];
+        let mut child = prototype(vec![Instruction::BC {
+            op_code: OpCode::LOP_RETURN,
+            a: 0,
+            b: 1,
+            c: 0,
+            aux: 0,
+        }]);
+        child.num_upvalues = 1;
+        let functions = vec![parent, child];
+        let strings = Vec::new();
+
+        let error = Lifter::lift(&functions, &strings, 0).unwrap_err();
+
+        assert_eq!(error.phase, super::DecompilePhase::Lift);
+        assert_eq!(error.invariant, "upvalue index within declared upvalues");
+        assert!(error.detail.contains("upvalue index 0"));
+        assert!(error.detail.contains("declares 0 upvalue"));
+    }
+
+    /// `LOP_NEWCLOSURE` indexes the prototype's child table with a raw operand.
+    #[test]
+    fn newclosure_beyond_declared_children_errors_instead_of_panicking() {
+        let functions = vec![prototype(vec![
+            Instruction::AD {
+                op_code: OpCode::LOP_NEWCLOSURE,
+                a: 0,
+                d: 4,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_RETURN,
+                a: 0,
+                b: 1,
+                c: 0,
+                aux: 0,
+            },
+        ])];
+        let strings = Vec::new();
+
+        let error = Lifter::lift(&functions, &strings, 0).unwrap_err();
+
+        assert_eq!(error.phase, super::DecompilePhase::Lift);
+        assert_eq!(error.invariant, "closure index within declared children");
+    }
+
+    /// `LOP_DUPCLOSURE` reads a constant that a malformed chunk need not have made a closure.
+    #[test]
+    fn dupclosure_naming_a_non_closure_constant_errors_instead_of_panicking() {
+        let mut function = prototype(vec![
+            Instruction::AD {
+                op_code: OpCode::LOP_DUPCLOSURE,
+                a: 0,
+                d: 0,
+                aux: 0,
+            },
+            Instruction::BC {
+                op_code: OpCode::LOP_RETURN,
+                a: 0,
+                b: 1,
+                c: 0,
+                aux: 0,
+            },
+        ]);
+        function.constants = vec![super::BytecodeConstant::Boolean(true)];
+        let functions = vec![function];
+        let strings = Vec::new();
+
+        let error = Lifter::lift(&functions, &strings, 0).unwrap_err();
+
+        assert_eq!(error.phase, super::DecompilePhase::Lift);
+        assert_eq!(
+            error.invariant,
+            "DUPCLOSURE operand names a closure constant"
+        );
     }
 }
