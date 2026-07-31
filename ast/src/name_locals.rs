@@ -53,12 +53,22 @@ impl Evidence {
 /// than a generic one, because it asserts something false about the code.
 const LIBRARY_RETURN_NAMES: &[(&[u8], &[u8], &str)] = &[
     (b"table", b"pack", "packed"),
-    (b"table", b"create", "buffer"),
+    // Not "buffer": Luau has a genuine native `buffer` type and `buffer.*`
+    // library. A `table.create(n)` array is unrelated to it — this is
+    // exactly the same shape as an empty `{}` initializer (see the `slots`
+    // arm below), just sized up front, so it gets the same name for the
+    // same reason instead of a name that would misread as the other type.
+    (b"table", b"create", "slots"),
     (b"table", b"concat", "text"),
     (b"string", b"format", "text"),
     (b"string", b"rep", "text"),
     (b"coroutine", b"create", "thread"),
-    (b"os", b"clock", "started"),
+    // Not "started": os.clock() is a monotonic timestamp with no inherent
+    // direction. It is read as an end marker and fed straight into a
+    // subtraction just as often as it opens a measurement, so "started"
+    // would assert a fact the call itself does not establish. "timestamp"
+    // is true at every call site.
+    (b"os", b"clock", "timestamp"),
 ];
 
 /// Names a call's result from the specific library function that produced
@@ -1135,6 +1145,77 @@ mod tests {
         name_locals(&mut block, false);
 
         assert_eq!(local_name(&outcome), "result");
+    }
+
+    #[test]
+    fn dotted_call_on_a_lookalike_namespace_does_not_match() {
+        let outcome = local(None);
+        let call = Call::new(
+            crate::Index::new(
+                Global::new(b"notthetable".to_vec()).into(),
+                Literal::String(b"pack".to_vec()).into(),
+            )
+            .into(),
+            Vec::new(),
+        );
+        let mut block = Block(vec![
+            declaration(&outcome, call.into()).into(),
+            Return::new(vec![outcome.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&outcome), "result");
+    }
+
+    #[test]
+    fn colon_method_call_named_pack_does_not_match() {
+        let outcome = local(None);
+        let receiver = local(Some("receiver"));
+        let call = crate::MethodCall::new(receiver.into(), "pack".to_owned(), Vec::new());
+        let mut block = Block(vec![
+            declaration(&outcome, call.into()).into(),
+            Return::new(vec![outcome.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&outcome), "result");
+    }
+
+    #[test]
+    fn indexing_a_local_alias_of_table_does_not_match() {
+        let outcome = local(None);
+        let aliased_table = local(Some("t"));
+        let call = Call::new(
+            crate::Index::new(
+                aliased_table.into(),
+                Literal::String(b"pack".to_vec()).into(),
+            )
+            .into(),
+            Vec::new(),
+        );
+        let mut block = Block(vec![
+            declaration(&outcome, call.into()).into(),
+            Return::new(vec![outcome.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&outcome), "result");
+    }
+
+    #[test]
+    fn setmetatable_read_as_a_value_is_not_named_object() {
+        let outcome = local(None);
+        let mut block = Block(vec![
+            declaration(&outcome, Global::new(b"setmetatable".to_vec()).into()).into(),
+            Return::new(vec![outcome.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&outcome), "value");
     }
 
     #[test]
