@@ -1,6 +1,7 @@
+use indexmap::IndexSet;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{Block, Do, LocalRw, RValue, RcLocal, Statement, Traverse};
+use crate::{Assign, Block, Do, LocalRw, RValue, RcLocal, Statement, Traverse};
 
 /// Declarations one function may hold in scope at once before its locals are
 /// grouped into `do ... end` scopes.
@@ -41,17 +42,19 @@ const MAX_ADDED_DEPTH: usize = 16;
 /// expression changes, and every reference keeps resolving to the same
 /// declaration.
 pub fn narrow_local_scopes(block: &mut Block) {
-    narrow(block, FUNCTION_BUDGET, 0);
+    narrow(block, FUNCTION_BUDGET, 0, &FxHashSet::default());
 }
 
 /// Groups this block's declarations, then hands what is left of the budget to
 /// the blocks nested inside it.
 ///
 /// `depth` counts only the scopes this pass has added on the way here, so a
-/// block already wrapped several times stops being wrapped again.
-fn narrow(block: &mut Block, budget: usize, depth: usize) {
+/// block already wrapped several times stops being wrapped again. `pinned`
+/// names locals that something outside the statement list reads, so no scope
+/// may close over them.
+fn narrow(block: &mut Block, budget: usize, depth: usize, pinned: &FxHashSet<RcLocal>) {
     let held = if depth < MAX_ADDED_DEPTH {
-        group_declarations(block, budget)
+        group_declarations(block, budget, pinned)
     } else {
         block.iter().map(|s| declared_locals(s).len()).sum()
     };
@@ -64,23 +67,35 @@ fn narrow(block: &mut Block, budget: usize, depth: usize) {
 }
 
 fn narrow_nested(statement: &mut Statement, budget: usize, depth: usize) {
+    let none = FxHashSet::default();
     match statement {
         Statement::If(r#if) => {
-            narrow(&mut r#if.then_block.lock(), budget, depth);
-            narrow(&mut r#if.else_block.lock(), budget, depth);
+            narrow(&mut r#if.then_block.lock(), budget, depth, &none);
+            narrow(&mut r#if.else_block.lock(), budget, depth, &none);
         }
         // Every `do` block in the tree at this point is one this pass added.
-        Statement::Do(r#do) => narrow(&mut r#do.block.lock(), budget, depth + 1),
-        Statement::While(r#while) => narrow(&mut r#while.block.lock(), budget, depth),
-        Statement::Repeat(repeat) => narrow(&mut repeat.block.lock(), budget, depth),
+        Statement::Do(r#do) => narrow(&mut r#do.block.lock(), budget, depth + 1, &none),
+        Statement::While(r#while) => narrow(&mut r#while.block.lock(), budget, depth, &none),
+        Statement::Repeat(repeat) => {
+            // The `until` condition is evaluated in the body's scope, so it
+            // reads locals that no statement in the body mentions again.
+            let condition = repeat
+                .condition
+                .values_read()
+                .into_iter()
+                .cloned()
+                .collect::<FxHashSet<_>>();
+            narrow(&mut repeat.block.lock(), budget, depth, &condition);
+        }
         // The counter and the result locals live in the loop body's scope.
         Statement::NumericFor(r#for) => {
-            narrow(&mut r#for.block.lock(), budget.saturating_sub(1), depth)
+            narrow(&mut r#for.block.lock(), budget.saturating_sub(1), depth, &none)
         }
         Statement::GenericFor(r#for) => narrow(
             &mut r#for.block.lock(),
             budget.saturating_sub(r#for.res_locals.len()),
             depth,
+            &none,
         ),
         _ => {}
     }
@@ -89,7 +104,7 @@ fn narrow_nested(statement: &mut Statement, budget: usize, depth: usize) {
             // A closure compiles into its own function, with its own registers.
             let mut function = closure.function.lock();
             let budget = FUNCTION_BUDGET.saturating_sub(function.parameters.len());
-            narrow(&mut function.body, budget, 0);
+            narrow(&mut function.body, budget, 0, &FxHashSet::default());
         }
     });
 }
@@ -163,16 +178,25 @@ fn is_terminator(statement: &Statement) -> bool {
     )
 }
 
-/// Whether grouping would change what the block means.
+/// Whether the block holds a statement that grouping cannot reason about.
 ///
-/// A `goto` and its label must stay in one scope, and an explicit upvalue close
-/// is tied to the scope it was emitted for. Neither survives being wrapped, so
-/// blocks holding them keep their declarations where they are.
+/// A `goto` and its label must stay in one scope, and an upvalue close is tied
+/// to the scope it was emitted for. The unlowered loop-header nodes render as
+/// declarations that [`declared_locals`] does not report, so a run could close
+/// over one. None of these should reach this pass, but a block holding one
+/// keeps its declarations where they are rather than relying on that.
 fn resists_grouping(block: &Block) -> bool {
     let last = block.len().saturating_sub(1);
     block.iter().enumerate().any(|(index, statement)| {
-        matches!(statement, Statement::Label(_) | Statement::Close(_))
-            || (is_terminator(statement) && index != last)
+        matches!(
+            statement,
+            Statement::Label(_)
+                | Statement::Close(_)
+                | Statement::NumForInit(_)
+                | Statement::NumForNext(_)
+                | Statement::GenericForInit(_)
+                | Statement::GenericForNext(_)
+        ) || (is_terminator(statement) && index != last)
     })
 }
 
@@ -193,71 +217,79 @@ fn last_references(block: &Block) -> FxHashMap<RcLocal, usize> {
 /// Cuts a block into runs that each hold the whole live range of every local
 /// they declare.
 ///
-/// Locals in `kept` stay at block level: the statements declaring them become
-/// run boundaries, and any other local whose live range would cross such a
-/// boundary joins `kept` too. The result is the run list once that has settled.
+/// Locals in `kept` are ignored: their declarations are split when the run is
+/// wrapped, so they stay in the block's scope no matter which run they sit in
+/// and their live ranges cannot hold a run open.
 fn partition(
     declared: &[Vec<RcLocal>],
     last_reference: &FxHashMap<RcLocal, usize>,
-    kept: &mut FxHashSet<RcLocal>,
+    kept: &FxHashSet<RcLocal>,
 ) -> Vec<(usize, usize)> {
     let count = declared.len();
-    let reach = |index: usize, kept: &FxHashSet<RcLocal>| {
-        declared[index]
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut open_until = 0;
+    for index in 0..count {
+        let reach = declared[index]
             .iter()
             .filter(|local| !kept.contains(*local))
             .filter_map(|local| last_reference.get(local).copied())
-            .fold(index, usize::max)
-    };
-    loop {
-        let boundary = |index: usize| declared[index].iter().any(|local| kept.contains(local));
-        // A local whose live range runs past the next boundary cannot sit in
-        // any run, so it is kept and the split recomputed.
-        let mut escaped = None;
-        let mut segment_start = 0;
-        for index in 0..count {
-            if boundary(index) {
-                for inner in segment_start..index {
-                    for local in &declared[inner] {
-                        if !kept.contains(local)
-                            && last_reference.get(local).is_some_and(|last| *last >= index)
-                        {
-                            escaped = Some(local.clone());
-                        }
-                    }
-                }
-                segment_start = index + 1;
-            }
+            .fold(index, usize::max);
+        open_until = open_until.max(reach);
+        if index >= open_until {
+            runs.push((start, index));
+            start = index + 1;
+            open_until = start;
         }
-        if let Some(local) = escaped {
-            kept.insert(local);
+    }
+    if start < count {
+        runs.push((start, count - 1));
+    }
+    runs
+}
+
+/// Moves the declarations of `kept` locals out of a run and into the block that
+/// will hold the scope, leaving the assignments behind.
+///
+/// `local x = f()` inside the run becomes `local x` before it and `x = f()`
+/// within, so the scope closing does not end `x`'s life. Returns the bare
+/// declaration to place ahead of the scope, if any is needed.
+fn split_kept_declarations(body: &mut Block, kept: &FxHashSet<RcLocal>) -> Option<Statement> {
+    let mut hoisted: IndexSet<RcLocal> = IndexSet::new();
+    let mut emptied = Vec::new();
+    for (index, statement) in body.iter_mut().enumerate() {
+        let Statement::Assign(assign) = statement else {
+            continue;
+        };
+        if !assign.prefix {
             continue;
         }
-
-        let mut runs = Vec::new();
-        let mut start = 0;
-        let mut open_until = 0;
-        for index in 0..count {
-            if boundary(index) {
-                if index > start {
-                    runs.push((start, index - 1));
-                }
-                start = index + 1;
-                open_until = start;
-                continue;
-            }
-            open_until = open_until.max(reach(index, kept));
-            if index >= open_until {
-                runs.push((start, index));
-                start = index + 1;
-                open_until = start;
-            }
+        let declared = assign
+            .left
+            .iter()
+            .filter_map(|target| target.as_local())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !declared.iter().any(|local| kept.contains(local)) {
+            continue;
         }
-        if start < count {
-            runs.push((start, count - 1));
+        // Splitting one name of a multiple declaration would leave the rest
+        // bound inside the scope, so the whole statement is hoisted together.
+        hoisted.extend(declared);
+        if assign.right.is_empty() {
+            emptied.push(index);
+        } else {
+            assign.prefix = false;
         }
-        return runs;
     }
+    for index in emptied.into_iter().rev() {
+        body.0.remove(index);
+    }
+    (!hoisted.is_empty()).then(|| {
+        let mut declaration = Assign::new(hoisted.into_iter().map(Into::into).collect(), vec![]);
+        declaration.prefix = true;
+        declaration.into()
+    })
 }
 
 fn declarations_in(declared: &[Vec<RcLocal>], run: (usize, usize)) -> usize {
@@ -291,7 +323,7 @@ fn merge_runs(declared: &[Vec<RcLocal>], runs: Vec<(usize, usize)>) -> Vec<(usiz
 ///
 /// Scopes that are themselves over budget are narrowed again by the caller's
 /// descent, which is what bounds the nesting this adds.
-fn group_declarations(block: &mut Block, budget: usize) -> usize {
+fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLocal>) -> usize {
     let total: usize = block.iter().map(|s| declared_locals(s).len()).sum();
     if total <= budget || resists_grouping(block) {
         return total;
@@ -304,21 +336,33 @@ fn group_declarations(block: &mut Block, budget: usize) -> usize {
             && (run.0 > 0 || run.1 + 1 < declared.len())
     };
 
-    // A local spanning the whole block admits no split at all, and one spanning
-    // most of it leaves a scope nearly as crowded as the block. Keeping the
-    // widest-ranged one at block level exposes the runs underneath it, so this
-    // repeats until the scopes on offer fit the budget.
-    let mut kept = FxHashSet::default();
+    // Keeping a local back means splitting its declaration from its assignment,
+    // which only an `Assign` can be. A class binds its target as part of one
+    // statement, so those stay bound wherever the statement lands.
+    let unsplittable = block
+        .iter()
+        .filter_map(Statement::as_class)
+        .map(|class| class.target.clone())
+        .collect::<FxHashSet<_>>();
+    // A pinned local that cannot be split out of its scope has to keep the
+    // scope it is already in, so the block is left alone.
+    if pinned.iter().any(|local| unsplittable.contains(local)) {
+        return total;
+    }
+
+    // A local live across most of the block holds every run open around it.
+    // Keeping the widest-ranged one at block level lets the runs underneath it
+    // close, and this repeats until the scopes on offer fit the budget.
+    let mut kept = pinned.clone();
     let runs = loop {
-        let runs = merge_runs(&declared, partition(&declared, &last_reference, &mut kept));
-        // Splitting further costs block-level registers for the locals held
-        // back, so it is worth doing only while the scopes on offer are still
-        // over budget.
+        let runs = merge_runs(&declared, partition(&declared, &last_reference, &kept));
         let largest = runs
             .iter()
             .filter(|run| worth_wrapping(run))
             .map(|run| declarations_in(&declared, *run))
             .max();
+        // Each local kept back costs a block-level register, so this stops once
+        // the scopes fit or the locals held back would fill the budget alone.
         if let Some(largest) = largest
             && (largest <= budget || kept.len() >= budget)
         {
@@ -328,7 +372,7 @@ fn group_declarations(block: &mut Block, budget: usize) -> usize {
             .iter()
             .enumerate()
             .flat_map(|(index, locals)| locals.iter().map(move |local| (index, local)))
-            .filter(|(_, local)| !kept.contains(*local))
+            .filter(|(_, local)| !kept.contains(*local) && !unsplittable.contains(*local))
             .max_by_key(|(index, local)| {
                 last_reference.get(*local).copied().unwrap_or(*index) - index
             })
@@ -339,16 +383,24 @@ fn group_declarations(block: &mut Block, budget: usize) -> usize {
         };
     };
 
-    let wrapped = runs
+    // A kept local's declaration is split out of its scope, so it still costs a
+    // block-level register. Only the rest are actually moved out of the block.
+    let relieved = runs
         .iter()
         .filter(|run| worth_wrapping(run))
-        .map(|run| declarations_in(&declared, *run))
-        .sum::<usize>();
+        .flat_map(|run| declared[run.0..=run.1].iter())
+        .flatten()
+        .filter(|local| !kept.contains(*local))
+        .count();
     for run in runs.into_iter().rev().filter(|run| worth_wrapping(&run)) {
-        let body = Block(block.0.drain(run.0..=run.1).collect());
+        let mut body = Block(block.0.drain(run.0..=run.1).collect());
+        let hoisted = split_kept_declarations(&mut body, &kept);
         block.0.insert(run.0, Do::new(body).into());
+        if let Some(declaration) = hoisted {
+            block.0.insert(run.0, declaration);
+        }
     }
-    total - wrapped
+    total - relieved
 }
 
 #[cfg(test)]
@@ -445,6 +497,43 @@ mod tests {
         let first = block[0].as_assign().unwrap();
         assert!(first.prefix);
         assert_eq!(first.left[0].as_local(), Some(&carried));
+    }
+
+    #[test]
+    fn a_repeat_condition_keeps_the_local_it_reads_in_scope() {
+        let count = FUNCTION_BUDGET + 40;
+        let done = local("done");
+        let mut declaration = Assign::new(
+            vec![done.clone().into()],
+            vec![Call::new(Global::new(b"check".to_vec()).into(), vec![]).into()],
+        );
+        declaration.prefix = true;
+
+        // `done` sits mid-body, surrounded by short-lived declarations, so it
+        // lands inside a run the pass wants to wrap.
+        let mut body: Vec<Statement> = (0..count / 2)
+            .flat_map(|i| declare_then_consume(&format!("v{i}")))
+            .collect();
+        body.push(declaration.into());
+        body.extend((count / 2..count).flat_map(|i| declare_then_consume(&format!("v{i}"))));
+        let repeat = crate::Repeat::new(RValue::Local(done.clone()), Block(body));
+        let repeat_body = repeat.block.clone();
+        let mut block = Block(vec![repeat.into()]);
+
+        narrow_local_scopes(&mut block);
+
+        // `done` is read by the `until`, which sits outside every scope the
+        // pass can add, so its declaration has to stay in the body's own scope.
+        let body = repeat_body.lock();
+        assert!(
+            body.iter().any(|statement| matches!(
+                statement,
+                Statement::Assign(assign)
+                    if assign.prefix
+                        && assign.left.iter().any(|l| l.as_local() == Some(&done))
+            )),
+            "the declaration of `done` was moved inside a scope"
+        );
     }
 
     #[test]

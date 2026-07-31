@@ -598,7 +598,12 @@ fn decompile_chunk(
     profiling::checkpoint("chunk-dropped");
 
     let main = ByAddress(main);
-    decompiled_upvalues.remove(&main);
+    // The chunk's own upvalues are bound by the host, not by anything in the
+    // body, so they are visible from the first statement.
+    let main_upvalues = decompiled_upvalues
+        .remove(&main)
+        .map(FxHashSet::from_iter)
+        .unwrap_or_default();
     let mut body = catch_phase(DecompilePhase::Link, None, None, || {
         let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
         link_upvalues(&mut body, &mut decompiled_upvalues);
@@ -624,11 +629,28 @@ fn decompile_chunk(
         profiling::checkpoint("parameter-names-propagated");
         name_locals(&mut body, false);
         profiling::checkpoint("locals-named");
+        // Narrowing is the last pass, so no later stage would notice a scope
+        // that closed over a local something after it still reads. Recovery can
+        // leave a reference unresolved on its own, though, so only a binding
+        // that narrowing breaks is worth failing over.
+        let resolved_before = ast::validate_bindings(&body, &main_upvalues).is_ok();
         ast::narrow_local_scopes(&mut body);
         profiling::checkpoint("scopes-narrowed");
+        if resolved_before {
+            ast::validate_bindings(&body, &main_upvalues)?;
+        }
         let source = body.to_string();
         profiling::checkpoint("formatted");
-        source
+        Ok(source)
+    })?
+    .map_err(|error: ast::BindingResolutionError| {
+        DecompileError::new(
+            DecompilePhase::Format,
+            None,
+            None,
+            "every local reference resolves to its lexical binding",
+            error.to_string(),
+        )
     })
 }
 
