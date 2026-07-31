@@ -276,13 +276,48 @@ This distinction is what makes `27_register_array_vm` fold. Forbidding `E`
 from reading `T` at all — the stricter reading — leaves that case, and most
 of the capture, untouched.
 
-### Why precondition 4 removes the need for escape analysis
+### Escape analysis, and why this reasoning did not survive
 
-`T` may have leaked to a closure before the fold window. Only a call can run
-that closure. Precondition 4 forbids any call between the write and the read,
-so no leaked reference can observe the slot in that window. This buys
-soundness without a whole-function escape analysis, and without the cost such
-an analysis would add to a phase that currently runs in 60 ms.
+This document originally argued that precondition 4 removed the need for
+escape analysis: `T` may have leaked to a closure before the fold window, only
+a call can run that closure, and precondition 4 forbids any call between the
+write and the read — so no leaked reference could observe the slot in that
+window.
+
+That argument was insufficient. Implementation found two holes it does not
+cover. A table captured by `Upvalue::Copy` was never marked opaque at all,
+because `impl Traverse for Closure` is empty and captures live in
+`LocalRw::values_read` — so the closure body was never walked and its slot
+reads went uncounted. And precondition 7's liveness condition says nothing
+about reads that do not go through `T[K]`, so a table passed whole to a callee
+after the fold could observe a slot the fold had already removed.
+
+The pass therefore performs whole-function escape analysis. `foldable_tables`
+marks a table opaque on any bare-value use of `T` anywhere in the function,
+before or after the window, and the check is order-insensitive by design.
+
+Two further rules were added for hazards this list did not anticipate, both
+found during implementation and both load-bearing:
+
+**Evaluation order.** A folded value must not be reordered relative to side
+effects inside the read statement. `v[1] = produce(); sink = observe() + v[1]`
+must not fold to `sink = observe() + produce()`, which runs `produce()` after
+`observe()`. Guarded by `is_order_sensitive`, pinned by corpus case
+`36_slot_effect_order`.
+
+A blunt refusal on `has_side_effects()` is wrong here: `Index::has_side_effects`
+is `true` for every index, so a constant-key read of a table already proven
+non-escaping and metatable-free would count as an effect. That costs 404 folds
+and stops case 27 folding. Constant-key reads of foldable tables are exempt,
+which is sound on exactly the two properties the escape check and the
+table-literal binding already establish: no metatable, and no external
+reference.
+
+**Source overwrite.** `blocks_window` admits assignments to plain locals with
+pure values, and such a statement can overwrite a local the folded value
+*reads*. `v[1] = source; source = 5; sink = v[1]` must not fold to
+`sink = source`, which reads 5. Pinned by
+`keeps_the_write_when_the_values_source_is_overwritten`.
 
 ### The precondition least likely to survive contact
 
