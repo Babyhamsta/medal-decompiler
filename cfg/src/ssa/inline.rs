@@ -97,11 +97,21 @@ fn fold_table_fields(
                 break;
             }
 
-            block[table_index].as_assign_mut().unwrap().right[0]
+            let table = block[table_index].as_assign_mut().unwrap().right[0]
                 .as_table_mut()
-                .unwrap()
-                .0
-                .push((Some(key), value));
+                .unwrap();
+            // A constructor template reserves a slot for every key the author
+            // wrote, holding nil where the value is computed. Filling that slot
+            // keeps the field in its original position; only a key with no slot
+            // is appended.
+            let reserved_slot = table.0.iter_mut().find(|(slot_key, slot_value)| {
+                slot_key.as_ref() == Some(&key)
+                    && matches!(slot_value, ast::RValue::Literal(ast::Literal::Nil))
+            });
+            match reserved_slot {
+                Some(slot) => slot.1 = value,
+                None => table.0.push((Some(key), value)),
+            }
             block.remove(index);
             folded += 1;
         }

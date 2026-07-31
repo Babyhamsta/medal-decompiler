@@ -1,7 +1,7 @@
-use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
 use crate::{
     Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse, formatter::Formatter,
 };
+use crate::{LocalRefs, LocalRefsMut, RValueRefs, RValueRefsMut};
 
 use std::{fmt, iter};
 
@@ -163,6 +163,6 @@ mod tests {
             (Some(key), Literal::Number(7.0).into()),
         ]);
 
-        assert_eq!(table.to_string(), "{\n\tname = 7\n}");
+        assert_eq!(table.to_string(), "{ name = 7 }");
     }
 }

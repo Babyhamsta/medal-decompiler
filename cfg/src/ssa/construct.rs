@@ -191,6 +191,49 @@ fn apply_local_map_to_values_referenced<T: LocalRw + Traverse>(
     // });
 }
 
+fn resolve_local_map(local_map: &FxHashMap<RcLocal, RcLocal>, local: &RcLocal) -> RcLocal {
+    let Some(mut target) = local_map.get(local) else {
+        return local.clone();
+    };
+    while let Some(next) = local_map.get(target) {
+        target = next;
+    }
+    target.clone()
+}
+
+/// Renames the members of by-reference capture groups through `local_map`.
+///
+/// A capture group is the set of SSA values that alias one runtime box, so a
+/// pass that renames a value has to rename it inside the group as well.
+/// Leaving a stale name behind drops the value out of its group: SSA
+/// destruction then gives it a local of its own, and a write that the closure
+/// is supposed to observe silently lands somewhere else. Callers must invoke
+/// this alongside every [`apply_local_map`] that runs between capture marking
+/// and SSA destruction.
+pub fn apply_local_map_to_upvalue_groups(
+    upvalue_to_group: &mut IndexMap<RcLocal, RcLocal>,
+    local_map: &FxHashMap<RcLocal, RcLocal>,
+) {
+    if local_map.is_empty() || upvalue_to_group.is_empty() {
+        return;
+    }
+    let mut renamed = IndexMap::with_capacity(upvalue_to_group.len());
+    for (upvalue, group) in upvalue_to_group.iter() {
+        let target = resolve_local_map(local_map, upvalue);
+        // Members of one group collapsing onto a single local is expected;
+        // members of *different* groups doing so would mean two distinct
+        // boxes were merged, which the renaming passes never do.
+        debug_assert!(
+            renamed
+                .get(&target)
+                .is_none_or(|existing: &RcLocal| existing == group),
+            "capture groups must not collapse onto one local"
+        );
+        renamed.entry(target).or_insert_with(|| group.clone());
+    }
+    *upvalue_to_group = renamed;
+}
+
 // does not replace locals in child closures
 pub fn apply_local_map(function: &mut Function, local_map: FxHashMap<RcLocal, RcLocal>) {
     let mut provenance_groups = FxHashMap::<RcLocal, FxHashSet<RcLocal>>::default();
@@ -451,6 +494,26 @@ impl<'a> SsaConstructor<'a> {
         }
     }
 
+    /// Keeps the recorded capture groups in step with a pending `local_map`.
+    ///
+    /// The renames applied after [`Self::mark_upvalues`] rewrite the function
+    /// but not the groups, so a member that gets renamed would otherwise be
+    /// left out of its group and lose its by-reference binding.
+    fn rename_upvalues_passed(&mut self) {
+        if self.local_map.is_empty() {
+            return;
+        }
+        let local_map = &self.local_map;
+        for sites in self.upvalues_passed.values_mut() {
+            for members in sites.values_mut() {
+                *members = members
+                    .iter()
+                    .map(|member| resolve_local_map(local_map, member))
+                    .collect();
+            }
+        }
+    }
+
     fn mark_upvalues(&mut self) -> Result<(), SsaError> {
         let upvalues_open = UpvaluesOpen::try_new(self.function, self.old_locals.clone())?;
         for &node in &self.dfs {
@@ -638,6 +701,7 @@ impl<'a> SsaConstructor<'a> {
 
         self.mark_upvalues()?;
         self.propagate_copies();
+        self.rename_upvalues_passed();
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
         // TODO: loop until returns false?
@@ -689,6 +753,7 @@ impl<'a> SsaConstructor<'a> {
             target.0.0.lock().0 = (names.len() == 1).then(|| names.into_iter().next().unwrap());
         }
 
+        self.rename_upvalues_passed();
         apply_local_map(self.function, std::mem::take(&mut self.local_map));
 
         Ok((
@@ -816,5 +881,192 @@ mod provenance_tests {
 
         assert_eq!(function.provenance().origins(&first).len(), 2);
         assert_eq!(function.provenance().bindings(&first).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod upvalue_group_tests {
+    use ast::{Assign, Binary, BinaryOperation, Closure, Literal, RcLocal, Return, Upvalue};
+    use indexmap::IndexMap;
+    use rustc_hash::FxHashMap;
+
+    use crate::{
+        block::{BlockEdge, BranchType},
+        function::Function,
+        provenance::{BindingIdentity, SourceOrigin},
+    };
+
+    use super::{apply_local_map, apply_local_map_to_upvalue_groups, remove_unnecessary_params};
+
+    #[test]
+    fn renaming_rewrites_group_members_and_follows_chains() {
+        let group = RcLocal::default();
+        let first = RcLocal::default();
+        let second = RcLocal::default();
+        let third = RcLocal::default();
+        let survivor = RcLocal::default();
+        let mut upvalue_to_group = IndexMap::from_iter([
+            (first.clone(), group.clone()),
+            (second.clone(), group.clone()),
+            (third.clone(), group.clone()),
+        ]);
+
+        apply_local_map_to_upvalue_groups(
+            &mut upvalue_to_group,
+            // `first -> second -> survivor` has to be followed all the way,
+            // and `third` collapsing onto `survivor` too must not drop it.
+            &FxHashMap::from_iter([
+                (first, second.clone()),
+                (second, survivor.clone()),
+                (third, survivor.clone()),
+            ]),
+        );
+
+        let expected: IndexMap<RcLocal, RcLocal> = IndexMap::from_iter([(survivor, group)]);
+        assert_eq!(
+            upvalue_to_group, expected,
+            "every renamed member must land on its group under its new name"
+        );
+    }
+
+    /// A register captured by reference on one path and written after the
+    /// merge must stay in one capture group across the renames the structuring
+    /// passes perform.
+    ///
+    /// This is the SSA form the pipeline reaches once the conditional has been
+    /// structured: the closure captures a block parameter, and collapsing the
+    /// redundant parameters rewrites that member onto the entry definition -
+    /// a local that was never a group member. Leaving the group keyed on the
+    /// old names drops the captured value out of it, SSA destruction then gives
+    /// the write a local of its own, and the closure keeps observing the value
+    /// from before the write.
+    #[test]
+    fn write_after_conditional_capture_stays_in_the_capture_group() {
+        let entry_value = RcLocal::default();
+        let capture_param = RcLocal::default();
+        let merge_param = RcLocal::default();
+        let written = RcLocal::default();
+        let closure_slot = RcLocal::default();
+        let group = RcLocal::default();
+
+        let mut function = Function::new(0);
+        for (index, local) in [
+            &entry_value,
+            &capture_param,
+            &merge_param,
+            &written,
+            &closure_slot,
+            &group,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            function.set_binding(local.clone(), BindingIdentity::local(0, index));
+        }
+
+        let entry = function.new_block();
+        let captures = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(
+            Assign::new(
+                vec![entry_value.clone().into()],
+                vec![Literal::String(b"a".to_vec().into()).into()],
+            )
+            .into(),
+        );
+        function.block_mut(captures).unwrap().push(
+            Assign::new(
+                vec![closure_slot.clone().into()],
+                vec![
+                    Closure {
+                        function: Default::default(),
+                        upvalues: vec![Upvalue::Ref(capture_param.clone())],
+                    }
+                    .into(),
+                ],
+            )
+            .into(),
+        );
+        function.block_mut(merge).unwrap().extend([
+            Assign::new(
+                vec![written.clone().into()],
+                vec![
+                    Binary::new(
+                        merge_param.clone().into(),
+                        Literal::String(b"+mutated".to_vec().into()).into(),
+                        BinaryOperation::Concat,
+                    )
+                    .into(),
+                ],
+            )
+            .into(),
+            Return::new(vec![written.clone().into()]).into(),
+        ]);
+
+        let mut to_captures = BlockEdge::new(BranchType::Then);
+        to_captures
+            .arguments
+            .push((capture_param.clone(), entry_value.clone().into()));
+        let mut bypass = BlockEdge::new(BranchType::Else);
+        bypass
+            .arguments
+            .push((merge_param.clone(), entry_value.clone().into()));
+        let mut to_merge = BlockEdge::default();
+        to_merge
+            .arguments
+            .push((merge_param.clone(), capture_param.clone().into()));
+        function.graph_mut().add_edge(entry, captures, to_captures);
+        function.graph_mut().add_edge(entry, merge, bypass);
+        function.graph_mut().add_edge(captures, merge, to_merge);
+
+        // What `mark_upvalues` records: every value that aliases the box the
+        // closure holds, which is the captured parameter, the value flowing
+        // into the merge, and the write after it.
+        let mut upvalue_to_group = IndexMap::from_iter([
+            (capture_param, group.clone()),
+            (merge_param, group.clone()),
+            (written.clone(), group.clone()),
+        ]);
+
+        // Mirror the structuring pipeline: collapse redundant block parameters
+        // until a fixed point, keeping the groups in step with every rename.
+        loop {
+            let mut local_map = FxHashMap::default();
+            if !remove_unnecessary_params(&mut function, &mut local_map) {
+                break;
+            }
+            apply_local_map_to_upvalue_groups(&mut upvalue_to_group, &local_map);
+            apply_local_map(&mut function, local_map);
+        }
+
+        let captured = function
+            .blocks()
+            .flat_map(|(_, block)| block.iter())
+            .filter_map(|statement| statement.as_assign())
+            .flat_map(|assign| &assign.right)
+            .filter_map(|value| value.as_closure())
+            .flat_map(|closure| &closure.upvalues)
+            .find_map(|upvalue| match upvalue {
+                Upvalue::Ref(local) => Some(local.clone()),
+                Upvalue::Copy(_) => None,
+            })
+            .expect("the closure must still capture by reference");
+        assert_eq!(
+            captured, entry_value,
+            "collapsing the parameters must rewrite the capture onto the entry \
+             definition, otherwise this shape does not exercise the rename"
+        );
+
+        assert_eq!(
+            upvalue_to_group.get(&captured),
+            Some(&group),
+            "the captured value must still be a group member after renaming"
+        );
+        assert_eq!(
+            upvalue_to_group.get(&written),
+            Some(&group),
+            "the write after the merge must share the captured value's group"
+        );
     }
 }

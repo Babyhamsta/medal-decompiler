@@ -634,6 +634,11 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 values: else_values,
             })) = function.block(else_target).unwrap().iter().exactly_one()
             && let Ok(else_value) = else_values.iter().exactly_one()
+            // A returned call or `...` yields every result it produces. Folding
+            // it into a conditional would nest it inside an expression, which
+            // keeps only the first result.
+            && !then_value.is_open_multi_value()
+            && !else_value.is_open_multi_value()
         {
             // TODO: unnecessary clones
             let then_value = then_value.clone();

@@ -228,6 +228,8 @@ impl UpvaluesOpen {
             &nodes,
             &exit_states,
             &old_locals,
+            &site_epochs,
+            &mut epochs,
             captured_local_count,
         )?;
         let open = materialize_ranges(
@@ -355,6 +357,8 @@ fn validate_merge_openness(
     nodes: &[NodeIndex],
     exit_states: &FxHashMap<NodeIndex, OpenState>,
     old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    site_epochs: &SiteEpochs,
+    epochs: &mut EpochForest,
     captured_local_count: usize,
 ) -> Result<(), UpvalueAnalysisError> {
     let mut presence = FxHashMap::default();
@@ -389,26 +393,48 @@ fn validate_merge_openness(
                 continue;
             }
             if validated.insert(local.clone()) {
-                validate_local_merge_openness(function, nodes, exit_states, old_locals, local)?;
+                validate_local_merge_openness(
+                    function,
+                    nodes,
+                    exit_states,
+                    old_locals,
+                    site_epochs,
+                    epochs,
+                    local,
+                )?;
             }
         }
     }
     Ok(())
 }
 
+/// Rejects merges where a capture epoch is live on one path and already
+/// detached on another.
+///
+/// Divergent openness is only ambiguous when the *same* epoch is involved: a
+/// merge that joins an open epoch with a path on which that epoch was closed
+/// cannot decide whether writes after the merge are still observed by the
+/// closure created at that epoch's capture site. Joining an open epoch with a
+/// path that never opened it, or that opened and closed an unrelated earlier
+/// epoch, is unambiguous - `CLOSEUPVALS` detaches the earlier box, so the
+/// register behaves exactly as if it had never been captured on that path.
 fn validate_local_merge_openness(
     function: &Function,
     nodes: &[NodeIndex],
     exit_states: &FxHashMap<NodeIndex, OpenState>,
     old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    site_epochs: &SiteEpochs,
+    epochs: &mut EpochForest,
     local: &ast::RcLocal,
 ) -> Result<(), UpvalueAnalysisError> {
-    let history = capture_history_flags(function, nodes, old_locals, local)?;
+    let mut detached = FxHashMap::default();
+    let mut open_epochs = Vec::new();
     for &node in nodes {
         let mut predecessor_count = 0usize;
         let mut open_count = 0usize;
         let mut first_epoch = None;
         let mut distinct_epoch = false;
+        open_epochs.clear();
         for predecessor in function.predecessor_blocks(node) {
             let Some(state) = exit_states.get(&predecessor) else {
                 continue;
@@ -425,6 +451,11 @@ fn validate_local_merge_openness(
                 } else {
                     first_epoch = Some(*epoch);
                 }
+                let canonical = epochs.find(*epoch);
+                if !open_epochs.contains(&canonical) {
+                    reserve(open_epochs.try_reserve(1))?;
+                    open_epochs.push(canonical);
+                }
             }
         }
         if predecessor_count <= 1
@@ -434,47 +465,66 @@ fn validate_local_merge_openness(
             continue;
         }
 
-        let mut reopened = false;
-        for predecessor in function.predecessor_blocks(node) {
-            let Some(state) = exit_states.get(&predecessor) else {
-                continue;
-            };
-            let flags = history[predecessor.index()];
-            if state.contains_key(local) {
-                reopened |= flags & CAPTURE_REOPENED != 0;
-            } else if flags & CAPTURE_CLOSED != 0 {
-                return Err(UpvalueAnalysisError::PathDependentMerge {
-                    block: node.index(),
-                });
+        for index in 0..open_epochs.len() {
+            let epoch = open_epochs[index];
+            if !detached.contains_key(&epoch) {
+                let flags = epoch_detachment(
+                    function,
+                    nodes,
+                    old_locals,
+                    site_epochs,
+                    epochs,
+                    local,
+                    epoch,
+                )?;
+                reserve(detached.try_reserve(1))?;
+                detached.insert(epoch, flags);
             }
-        }
-        if distinct_epoch && reopened {
-            return Err(UpvalueAnalysisError::PathDependentMerge {
-                block: node.index(),
-            });
+            let flags = &detached[&epoch];
+            for predecessor in function.predecessor_blocks(node) {
+                if !exit_states.contains_key(&predecessor) {
+                    continue;
+                }
+                if flags
+                    .get(predecessor.index())
+                    .is_some_and(|flags| flags & EPOCH_DETACHED != 0)
+                {
+                    return Err(UpvalueAnalysisError::PathDependentMerge {
+                        block: node.index(),
+                    });
+                }
+            }
         }
     }
     Ok(())
 }
 
-const CAPTURE_NEVER: u8 = 1;
-const CAPTURE_OPEN: u8 = 2;
-const CAPTURE_CLOSED: u8 = 4;
-const CAPTURE_REOPENED: u8 = 8;
+const EPOCH_LIVE: u8 = 1;
+const EPOCH_DETACHED: u8 = 2;
 
-fn capture_history_flags(
+/// Tracks one capture epoch of `tracked_local` through the graph.
+///
+/// `EPOCH_LIVE` marks block exits where the epoch's box is still attached to
+/// the register on some path, `EPOCH_DETACHED` marks block exits where some
+/// path has already closed it. Both are may-properties, so a block exit can
+/// carry either, both, or neither.
+fn epoch_detachment(
     function: &Function,
     nodes: &[NodeIndex],
     old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    site_epochs: &SiteEpochs,
+    epochs: &mut EpochForest,
     tracked_local: &ast::RcLocal,
+    tracked_epoch: EpochId,
 ) -> Result<Vec<u8>, UpvalueAnalysisError> {
-    let state_count = if let Some(node) = nodes.last() {
-        node.index()
+    let mut state_count = 0usize;
+    for node in function.graph().node_indices() {
+        let bound = node
+            .index()
             .checked_add(1)
-            .ok_or_else(|| UpvalueAnalysisError::Resource("node index overflow".into()))?
-    } else {
-        0
-    };
+            .ok_or_else(|| UpvalueAnalysisError::Resource("node index overflow".into()))?;
+        state_count = state_count.max(bound);
+    }
     let mut exit_flags = Vec::new();
     reserve(exit_flags.try_reserve_exact(state_count))?;
     exit_flags.resize(state_count, 0u8);
@@ -486,39 +536,35 @@ fn capture_history_flags(
         worklist.push_back(node);
         queued.insert(node);
     }
-    let entry = function.entry().unwrap();
 
     while let Some(node) = worklist.pop_front() {
         queued.remove(&node);
-        let mut flags = if node == entry { CAPTURE_NEVER } else { 0 };
+        let mut flags = 0u8;
         for predecessor in function.predecessor_blocks(node) {
-            flags |= exit_flags[predecessor.index()];
+            if let Some(predecessor_flags) = exit_flags.get(predecessor.index()) {
+                flags |= predecessor_flags;
+            }
         }
-        for statement in function.block(node).unwrap().iter() {
-            let mut captures = false;
+        for (statement_index, statement) in function.block(node).unwrap().iter().enumerate() {
+            let mut opens_tracked_epoch = None;
             for_each_reference_capture(statement, old_locals, |local| {
-                captures |= &local == tracked_local;
+                if &local == tracked_local {
+                    let site_epoch = site_epochs[&(local, node, statement_index)];
+                    opens_tracked_epoch = Some(epochs.find(site_epoch) == tracked_epoch);
+                }
             });
-            if captures && flags != 0 {
-                flags = if flags & (CAPTURE_NEVER | CAPTURE_OPEN) != 0 {
-                    CAPTURE_OPEN
-                } else {
-                    0
-                } | if flags & (CAPTURE_CLOSED | CAPTURE_REOPENED) != 0 {
-                    CAPTURE_REOPENED
-                } else {
-                    0
-                };
+            // A capture makes the site's epoch the only one attached to the
+            // register, so any other epoch stops being live here.
+            if let Some(opens_tracked_epoch) = opens_tracked_epoch {
+                flags = (flags & EPOCH_DETACHED) | if opens_tracked_epoch { EPOCH_LIVE } else { 0 };
             }
             if let ast::Statement::Close(close) = statement
                 && close.locals.contains(tracked_local)
             {
-                flags = (flags & CAPTURE_NEVER)
-                    | if flags & (CAPTURE_OPEN | CAPTURE_CLOSED | CAPTURE_REOPENED) != 0 {
-                        CAPTURE_CLOSED
-                    } else {
-                        0
-                    };
+                if flags & EPOCH_LIVE != 0 {
+                    flags |= EPOCH_DETACHED;
+                }
+                flags &= !EPOCH_LIVE;
             }
         }
         if exit_flags[node.index()] != flags {
@@ -786,6 +832,141 @@ mod tests {
             analysis.opening_location(merge, &captured, 0),
             Some((captures, 0))
         );
+    }
+
+    #[test]
+    fn closed_epoch_does_not_conflict_with_a_later_open_epoch() {
+        // An inlined helper whose body conditionally captures its parameter is
+        // emitted twice into the same register: the first epoch is closed
+        // before the second one opens, so the merge after the second `if` sees
+        // one predecessor holding the second epoch open and one predecessor on
+        // which nothing is attached to the register any more.
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let captures_first = function.new_block();
+        let closes = function.new_block();
+        let captures_second = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(marker());
+        function
+            .block_mut(captures_first)
+            .unwrap()
+            .push(capture(&captured));
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function
+            .block_mut(captures_second)
+            .unwrap()
+            .push(capture(&captured));
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, captures_first, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, closes, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(captures_first, closes, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(closes, captures_second, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(closes, merge, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(captures_second, merge, BlockEdge::default());
+
+        let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+
+        assert_eq!(
+            analysis.opening_location(merge, &captured, 0),
+            Some((captures_second, 0))
+        );
+    }
+
+    #[test]
+    fn closed_epoch_still_conflicts_with_the_same_open_epoch() {
+        // Same shape as above, except the *second* epoch is the one closed on
+        // only one path. Whether writes after the merge reach the closure built
+        // at that epoch's capture site is path dependent, so the earlier
+        // already-closed epoch must not excuse it.
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let captures_first = function.new_block();
+        let closes_first = function.new_block();
+        let captures_second = function.new_block();
+        let closes_second = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(marker());
+        function
+            .block_mut(captures_first)
+            .unwrap()
+            .push(capture(&captured));
+        function.block_mut(closes_first).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function
+            .block_mut(captures_second)
+            .unwrap()
+            .push(capture(&captured));
+        function.block_mut(closes_second).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function.block_mut(keeps_open).unwrap().push(marker());
+        function.block_mut(merge).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, captures_first, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, closes_first, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(captures_first, closes_first, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(closes_first, captures_second, BlockEdge::default());
+        function.graph_mut().add_edge(
+            captures_second,
+            closes_second,
+            BlockEdge::new(BranchType::Then),
+        );
+        function.graph_mut().add_edge(
+            captures_second,
+            keeps_open,
+            BlockEdge::new(BranchType::Else),
+        );
+        function
+            .graph_mut()
+            .add_edge(closes_second, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+
+        let error = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::UpvalueAnalysisError::PathDependentMerge { block }
+                if block == merge.index()
+        ));
     }
 
     #[test]

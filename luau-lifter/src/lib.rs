@@ -9,6 +9,8 @@ mod profiling;
 #[cfg(test)]
 mod compatibility_tests;
 
+use std::cell::RefCell;
+
 use ast::{
     Traverse, local_declarations::LocalDeclarer, name_locals::name_locals,
     replace_locals::replace_locals,
@@ -509,6 +511,8 @@ fn decompile_chunk(
                     "processed instruction count overflow",
                 )
             })?;
+        let declared_parameters = chunk.functions[func_id].num_parameters;
+        let declared_variadic = chunk.functions[func_id].is_vararg;
         let (function, upvalues_in, child_functions) =
             catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
                 Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
@@ -565,7 +569,20 @@ fn decompile_chunk(
             }
             stack.push((function, child_id));
         }
-        let (function, function_upvalues) = decompile_function(ast_func, function, upvalues_in)?;
+        let upvalues_out = upvalues_in.clone();
+        let (function, function_upvalues) =
+            match decompile_function(ast_func.clone(), function, upvalues_in) {
+                Ok(decompiled) => decompiled,
+                Err(error) => {
+                    stub_unrecovered_function(
+                        &ast_func,
+                        &error,
+                        declared_parameters,
+                        declared_variadic,
+                    );
+                    (ByAddress(ast_func), upvalues_out)
+                }
+            };
         decompiled_upvalues.try_reserve(1).map_err(|error| {
             DecompileError::new(
                 DecompilePhase::Lift,
@@ -612,6 +629,11 @@ fn decompile_chunk(
     profiling::checkpoint("linked");
     drop(decompiled_upvalues);
     profiling::checkpoint("upvalues-dropped");
+    catch_phase(DecompilePhase::AstRecovery, None, None, || {
+        ast::lower_residual_set_lists(&mut body);
+        ast::drop_unfilled_table_slots(&mut body);
+    })?;
+    profiling::checkpoint("set-lists-lowered");
     if let Some(kind) = unsupported_node_kind(&mut body) {
         return Err(DecompileError::new(
             DecompilePhase::Validate,
@@ -636,6 +658,8 @@ fn decompile_chunk(
         let resolved_before = ast::validate_bindings(&body, &main_upvalues).is_ok();
         ast::narrow_local_scopes(&mut body);
         profiling::checkpoint("scopes-narrowed");
+        ast::combine_local_declarations(&mut body);
+        profiling::checkpoint("declarations-combined");
         if resolved_before {
             ast::validate_bindings(&body, &main_upvalues)?;
         }
@@ -652,6 +676,39 @@ fn decompile_chunk(
             error.to_string(),
         )
     })
+}
+
+/// Replaces one function's body after a phase gave up on it.
+///
+/// A prototype that no pass can express is a defect in that prototype's
+/// recovery, not in the rest of the chunk. Failing the whole file for it throws
+/// away every function that did decompile, which on a large script is all of
+/// them. The stub keeps the surrounding output intact and refuses to pretend
+/// the body was recovered: the comment names the phase that stopped, and the
+/// `error` call makes running it fail loudly rather than silently returning
+/// nothing.
+fn stub_unrecovered_function(
+    ast_function: &Arc<Mutex<ast::Function>>,
+    error: &DecompileError,
+    declared_parameters: u8,
+    declared_variadic: bool,
+) {
+    let reason = error.to_string();
+    let mut ast_function = ast_function.lock();
+    // The prototype header still gives the signature even when the body was
+    // lost, and a caller reads arity from the declaration.
+    ast_function.parameters = (0..declared_parameters)
+        .map(|_| ast::RcLocal::default())
+        .collect();
+    ast_function.is_variadic = declared_variadic;
+    ast_function.body = ast::Block(vec![
+        ast::Comment::new(format!("decompilation failed: {reason}")).into(),
+        ast::Call::new(
+            ast::Global::new(b"error".to_vec()).into(),
+            vec![ast::Literal::String(format!("unrecovered function: {reason}").into_bytes()).into()],
+        )
+        .into(),
+    ]);
 }
 
 fn block_contains_unsupported_nodes(block: &mut ast::Block) -> bool {
@@ -992,6 +1049,11 @@ fn decompile_function(
     )?;
     let (local_count, upvalue_to_group, local_to_group) =
         ssa_result.map_err(|error| ssa_error(function_id, error))?;
+    // The structuring passes rename locals, and a by-reference capture group
+    // that is not renamed with them stops being recognised as captured. Shared
+    // so `remove-unnecessary-params` can keep it current while `inline` reads
+    // it; the passes never run concurrently.
+    let upvalue_to_group = RefCell::new(upvalue_to_group);
 
     let recovery_report = catch_phase(DecompilePhase::Structure, Some(function_id), None, || {
         let mut scheduler = cfg::recovery::PassScheduler::new(32);
@@ -1012,7 +1074,7 @@ fn decompile_function(
             let before = cfg::recovery::structural_fingerprint(function);
 
             let changed = cfg::metrics::time(cfg::metrics::Metric::Inline, || {
-                ssa::inline::inline(function, &local_to_group, &upvalue_to_group)
+                ssa::inline::inline(function, &local_to_group, &upvalue_to_group.borrow())
             });
 
             // The reported flag must agree with the fingerprint in both
@@ -1051,6 +1113,10 @@ fn decompile_function(
             cfg::metrics::time(cfg::metrics::Metric::RemoveParams, || {
                 let mut local_map = FxHashMap::default();
                 if ssa::construct::remove_unnecessary_params(function, &mut local_map) {
+                    ssa::construct::apply_local_map_to_upvalue_groups(
+                        &mut upvalue_to_group.borrow_mut(),
+                        &local_map,
+                    );
                     ssa::construct::apply_local_map(function, local_map);
                     cfg::recovery::PassChange::cfg()
                         .union(cfg::recovery::PassChange::dataflow())
@@ -1084,7 +1150,7 @@ fn decompile_function(
         || {
             ssa::Destructor::new(
                 &mut function,
-                upvalue_to_group,
+                upvalue_to_group.into_inner(),
                 upvalues_in.iter().cloned().collect(),
                 local_count,
             )
