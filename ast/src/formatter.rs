@@ -12,6 +12,7 @@ use crate::{
     Table, Unary, While,
 };
 
+#[derive(Clone, Copy)]
 pub enum IndentationMode {
     Spaces(u8),
     Tab,
@@ -41,6 +42,13 @@ impl Default for IndentationMode {
         Self::Tab
     }
 }
+
+/// Line width at which an argument list is wrapped to one argument per
+/// line instead of staying on a single line. Folding (see `fold.rs`)
+/// merges statements together, which can push an argument list that was
+/// short on its own past a readable width; this is the only place that
+/// budget is enforced.
+const COLUMN_BUDGET: usize = 120;
 
 pub(crate) fn format_arg_list(list: &[RValue]) -> String {
     let mut s = String::new();
@@ -603,7 +611,54 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
     }
 
+    /// Number of columns `indent()` currently emits.
+    fn indentation_width(&self) -> usize {
+        let per_level = match self.indentation_mode {
+            IndentationMode::Spaces(spaces) => spaces as usize,
+            IndentationMode::Tab => 1,
+        };
+        per_level * self.indentation_level
+    }
+
     fn format_arg_list(&mut self, list: &[RValue]) -> fmt::Result {
+        // A single argument has no sibling to move off its line, so
+        // wrapping it can only add an indentation level without removing
+        // anything — never a net improvement under this column-only model
+        // (it has no notion of the call prefix sharing that line). Likewise
+        // an argument that already renders multiline (a table or closure
+        // with a body) contributes only its own short opening token to the
+        // shared line, so if the list is over budget with one of those
+        // present, the excess belongs to that argument's own content or to
+        // the call's prefix, not to the argument list — wrapping the list
+        // wouldn't fix it. Only multi-argument lists of otherwise
+        // single-line values are candidates.
+        //
+        // A cheap sum of each argument's own display length (no
+        // separators, no wrap parentheses) is enough to rule out the
+        // common case of a short list without paying for a scratch
+        // render.
+        if list.len() > 1 && !list.iter().any(Self::value_renders_multiline) {
+            let cheap_estimate = self.indentation_width()
+                + list.iter().map(|rvalue| rvalue.to_string().len()).sum::<usize>()
+                + (list.len() - 1) * ", ".len();
+            if cheap_estimate > COLUMN_BUDGET {
+                let mut scratch = String::new();
+                Formatter {
+                    indentation_level: self.indentation_level,
+                    indentation_mode: self.indentation_mode,
+                    output: &mut scratch,
+                }
+                .format_arg_list_inline(list)?;
+                if self.indentation_width() + scratch.len() > COLUMN_BUDGET {
+                    return self.format_arg_list_wrapped(list);
+                }
+                return write!(self.output, "{scratch}");
+            }
+        }
+        self.format_arg_list_inline(list)
+    }
+
+    fn format_arg_list_inline(&mut self, list: &[RValue]) -> fmt::Result {
         for (index, rvalue) in list.iter().enumerate() {
             if index + 1 == list.len() {
                 let wrap = matches!(rvalue, RValue::Select(_));
@@ -621,6 +676,30 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         Ok(())
     }
+
+    /// One argument per line, at one indentation level deeper than the
+    /// call itself. Leaves the cursor positioned right after `indent()` at
+    /// the call's own level, ready for the caller to close with `)`.
+    fn format_arg_list_wrapped(&mut self, list: &[RValue]) -> fmt::Result {
+        writeln!(self.output)?;
+        self.indentation_level += 1;
+        for (index, rvalue) in list.iter().enumerate() {
+            self.indent()?;
+            let is_last = index + 1 == list.len();
+            let wrap = is_last && matches!(rvalue, RValue::Select(_));
+            if wrap {
+                write!(self.output, "(")?;
+            }
+            self.format_rvalue(rvalue)?;
+            if wrap {
+                write!(self.output, ")")?;
+            }
+            writeln!(self.output, "{}", if is_last { "" } else { "," })?;
+        }
+        self.indentation_level -= 1;
+        self.indent()
+    }
+
     pub(crate) fn is_valid_name_in(name: &[u8], context: crate::IdentifierContext) -> bool {
         crate::is_valid_identifier_in(name, context)
     }
@@ -1465,5 +1544,31 @@ mod tests {
             block.to_string(),
             "for i = 1, 2 do\n\tb = 2\nend\n\na = 1"
         );
+    }
+
+    #[test]
+    fn an_argument_list_past_the_column_budget_wraps_one_per_line() {
+        let call = Call::new(
+            local("someFunctionWithAVeryLongName").into(),
+            (0..8)
+                .map(|index| {
+                    RValue::Local(local(&format!("argumentNumber{index}WithALongName")))
+                })
+                .collect(),
+        );
+        let block = Block(vec![call.into()]);
+
+        let formatted = block.to_string();
+
+        assert!(formatted.contains(",\n"));
+        assert!(formatted.lines().all(|line| line.len() <= 120));
+    }
+
+    #[test]
+    fn a_short_argument_list_stays_on_one_line() {
+        let call = Call::new(local("f").into(), vec![local("a").into(), local("b").into()]);
+        let block = Block(vec![call.into()]);
+
+        assert_eq!(block.to_string(), "f(a, b)");
     }
 }
