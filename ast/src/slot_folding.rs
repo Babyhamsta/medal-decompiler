@@ -59,6 +59,22 @@
 //! A computed-key *read* is not covered by any of this: an unknown key could
 //! name the folded slot and make the read counts wrong. Those still mark the
 //! table opaque.
+//!
+//! # Two coupled guards
+//!
+//! Both of these look independent and are not.
+//!
+//! [`writes_slot`] must keep answering `false` for a computed-key target. It
+//! is what stops the third case above from folding. Its own doc comment says
+//! so; this is the second place, because the coupling is easy to miss.
+//!
+//! The rule that a folded value may read a *sibling* slot depends on the
+//! table never escaping, which in turn depends on a closure capture marking
+//! the table opaque ([`scan_rvalue`]'s `RValue::Closure` arm). Without it a
+//! captured table would still be foldable, and a closure could observe the
+//! sibling slot between the write and the read. Relaxing the value rule while
+//! dropping the capture check would be unsound; they were introduced one
+//! commit apart and have to stay together.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -125,7 +141,25 @@ fn slot_write(statement: &Statement) -> Option<(RcLocal, SlotKey, &RValue)> {
     Some((table.clone(), slot_key(&index.right)?, &assign.right[0]))
 }
 
-/// Whether the statement writes `table[key]`, redefining the slot.
+/// Whether the statement provably writes `table[key]`, redefining the slot.
+///
+/// **Do not broaden this to accept a computed key.** It looks like an
+/// improvement — `T[i]` may well write `T[K]` — and it is not one. Removing
+/// precondition 5 left this function carrying the soundness of the case where
+/// the read is taken from a statement that also writes the table through a
+/// computed key:
+///
+/// ```lua
+/// T[1] = source
+/// T[i] = T[1]     -- carries the read; may or may not write slot 1
+/// sink = T[1]     -- reads `source` today, `nil` after a wrong fold
+/// ```
+///
+/// Answering `true` for `T[i]` here lets [`slot_dead_after`] take its first
+/// arm, which folds the write away and breaks the third statement. Answering
+/// `false` forces the second arm, which demands the slot have no other read
+/// and so rejects this program. `keeps_the_write_when_a_computed_key_carries_the_read`
+/// fails if this is broadened.
 fn writes_slot(statement: &Statement, table: &RcLocal, key: &SlotKey) -> bool {
     let Some(assign) = statement.as_assign() else {
         return false;
@@ -576,6 +610,21 @@ fn find_fold(block: &Block, start: usize, foldable: &FxHashSet<RcLocal>, uses: &
     }
 
     let read = read_at?;
+    // The value is evaluated at the read instead of here, so every local it
+    // reads has to still hold the same thing there. `blocks_window` lets a
+    // plain local assignment through, and one of those can overwrite exactly
+    // such a local.
+    let sources = value.values_read();
+    if !sources.is_empty()
+        && block.0[start + 1..=read].iter().any(|statement| {
+            statement
+                .values_written()
+                .into_iter()
+                .any(|written| sources.contains(&written))
+        })
+    {
+        return None;
+    }
     if !slot_dead_after(&block.0[read], &table, &key, uses) {
         return None;
     }
@@ -589,20 +638,181 @@ fn find_fold(block: &Block, start: usize, foldable: &FxHashSet<RcLocal>, uses: &
     })
 }
 
-fn apply_fold(block: &mut Block, fold: &Fold) -> bool {
-    let mut replaced = false;
-    block.0[fold.read].traverse_rvalues(&mut |rvalue| {
-        if replaced {
-            return;
+/// Whether evaluating this expression is something the program can observe.
+///
+/// Two shapes are exempt. A compiler-import global is a constant lookup the
+/// compiler proved safe. And a constant-key read of a *foldable* table is a
+/// plain memory read: such a table provably has no metatable and never
+/// escapes, so indexing it cannot run `__index` and nothing else can be
+/// holding a reference that would notice the order. `Index::has_side_effects`
+/// answers `true` for every index because in general it can invoke a
+/// metamethod; here we know better, and treating these as effects would stop
+/// the register-array chains this pass exists to fold.
+fn has_observable_effect(value: &RValue, foldable: &FxHashSet<RcLocal>) -> bool {
+    if let RValue::Index(index) = value
+        && matches!(index.left.as_ref(), RValue::Local(table) if foldable.contains(table))
+        && slot_key(&index.right).is_some()
+    {
+        return false;
+    }
+    value.has_side_effects()
+        && !matches!(
+            value,
+            RValue::Global(global) if global.origin() == crate::GlobalOrigin::CompilerImport
+        )
+}
+
+/// Whether moving this value later in the evaluation order can be observed.
+///
+/// A value that neither causes an effect nor reads a local evaluates to the
+/// same thing wherever it lands. Anything else has to keep its position
+/// relative to the effects around it.
+fn is_order_sensitive(value: &RValue) -> bool {
+    value.has_side_effects() || !value.values_read().is_empty()
+}
+
+/// Replaces the slot read with the folded value, walking in evaluation order.
+///
+/// Returns `false` when the value would have to cross an observable effect to
+/// reach its read. The fold moves the value from its own statement into the
+/// middle of a later one, so anything the read statement evaluates first
+/// would end up running before it — reordering the two.
+fn place_value(
+    target: &mut RValue,
+    fold: &Fold,
+    foldable: &FxHashSet<RcLocal>,
+    guarded: bool,
+    crossed: &mut bool,
+) -> Option<bool> {
+    if let RValue::Index(index) = target
+        && is_slot(index, &fold.table, &fold.key)
+    {
+        if guarded && *crossed {
+            return Some(false);
         }
-        if let RValue::Index(index) = rvalue
-            && is_slot(index, &fold.table, &fold.key)
+        *target = fold.value.clone();
+        return Some(true);
+    }
+
+    match target {
+        // The right operand of a short circuit, and both arms of a
+        // conditional, may not be evaluated at all. A value that landed there
+        // could have its effect skipped entirely.
+        RValue::Binary(binary)
+            if matches!(
+                binary.operation,
+                crate::BinaryOperation::And | crate::BinaryOperation::Or
+            ) =>
         {
-            *rvalue = fold.value.clone();
-            replaced = true;
+            if let Some(placed) = place_value(&mut binary.left, fold, foldable, guarded, crossed) {
+                return Some(placed);
+            }
+            *crossed = true;
+            return place_value(&mut binary.right, fold, foldable, guarded, crossed);
         }
-    });
-    if !replaced {
+        RValue::Conditional(conditional) => {
+            if let Some(placed) = place_value(&mut conditional.condition, fold, foldable, guarded, crossed) {
+                return Some(placed);
+            }
+            *crossed = true;
+            if let Some(placed) = place_value(&mut conditional.then_value, fold, foldable, guarded, crossed) {
+                return Some(placed);
+            }
+            return place_value(&mut conditional.else_value, fold, foldable, guarded, crossed);
+        }
+        // The method lookup runs between the object and the arguments, and it
+        // can invoke `__index`.
+        RValue::MethodCall(method_call) | RValue::Select(Select::MethodCall(method_call)) => {
+            if let Some(placed) = place_value(&mut method_call.value, fold, foldable, guarded, crossed) {
+                return Some(placed);
+            }
+            *crossed = true;
+            for argument in &mut method_call.arguments {
+                if let Some(placed) = place_value(argument, fold, foldable, guarded, crossed) {
+                    return Some(placed);
+                }
+            }
+            return None;
+        }
+        _ => {}
+    }
+
+    for child in target.rvalues_mut() {
+        if let Some(placed) = place_value(child, fold, foldable, guarded, crossed) {
+            return Some(placed);
+        }
+    }
+    // The node's own effect happens after its children are evaluated.
+    if has_observable_effect(target, foldable) {
+        *crossed = true;
+    }
+    None
+}
+
+fn apply_fold(block: &mut Block, fold: &Fold, foldable: &FxHashSet<RcLocal>) -> bool {
+    let guarded = is_order_sensitive(&fold.value);
+    let mut crossed = false;
+    let statement = &mut block.0[fold.read];
+
+    let placed = if let Statement::Assign(assign) = statement {
+        // Luau does not specify whether an assignment evaluates its targets'
+        // subexpressions before or after its values. Refuse to place a value
+        // whose position matters into a target, and treat any effect in a
+        // target as already crossed when placing into a value.
+        let in_target = assign.left.iter().any(|lvalue| match lvalue {
+            LValue::Index(index) => {
+                !is_slot(index, &fold.table, &fold.key)
+                    && (count_slot_reads_rvalue(&index.left, &fold.table, &fold.key) > 0
+                        || count_slot_reads_rvalue(&index.right, &fold.table, &fold.key) > 0)
+            }
+            _ => false,
+        });
+        if in_target && guarded {
+            return false;
+        }
+        for lvalue in &assign.left {
+            if let LValue::Index(index) = lvalue
+                && (has_observable_effect(&index.left, foldable)
+                    || has_observable_effect(&index.right, foldable))
+            {
+                crossed = true;
+            }
+        }
+        let mut placed = None;
+        if in_target {
+            for lvalue in &mut assign.left {
+                if let LValue::Index(index) = lvalue {
+                    if let Some(result) = place_value(&mut index.left, fold, foldable, guarded, &mut crossed)
+                        .or_else(|| {
+                            place_value(&mut index.right, fold, foldable, guarded, &mut crossed)
+                        })
+                    {
+                        placed = Some(result);
+                        break;
+                    }
+                }
+            }
+        } else {
+            for value in &mut assign.right {
+                if let Some(result) = place_value(value, fold, foldable, guarded, &mut crossed) {
+                    placed = Some(result);
+                    break;
+                }
+            }
+        }
+        placed
+    } else {
+        let mut placed = None;
+        for value in statement.rvalues_mut() {
+            if let Some(result) = place_value(value, fold, foldable, guarded, &mut crossed) {
+                placed = Some(result);
+                break;
+            }
+        }
+        placed
+    };
+
+    if placed != Some(true) {
         return false;
     }
     block.0.remove(fold.write);
@@ -620,7 +830,7 @@ fn fold_block(block: &mut Block, foldable: &FxHashSet<RcLocal>, uses: &mut SlotU
         while index < block.0.len()
             && let Some(fold) = find_fold(block, index, foldable, uses)
         {
-            if !apply_fold(block, &fold) {
+            if !apply_fold(block, &fold, foldable) {
                 break;
             }
             if let Some(count) = uses.reads.get_mut(&(fold.table.clone(), fold.key.clone())) {
@@ -896,6 +1106,93 @@ mod tests {
         assert_eq!(block.0.len(), 2);
         let merged = block.0[1].as_assign().unwrap();
         assert_eq!(merged.right, vec![RValue::Local(source)]);
+    }
+
+    /// Pins the constant-key restriction in `writes_slot`. Broadening it to
+    /// treat `T[i]` as a redefinition makes this fold, and the third
+    /// statement then reads `nil`.
+    #[test]
+    fn keeps_the_write_when_a_computed_key_carries_the_read() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let sink = local(Some("sink"));
+        let key = local(Some("index"));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.into()]).into(),
+            Assign::new(
+                vec![LValue::Index(Index::new(
+                    registers.clone().into(),
+                    key.into(),
+                ))],
+                vec![slot_read(&registers, 1.0)],
+            )
+            .into(),
+            Assign::new(vec![sink.into()], vec![slot_read(&registers, 1.0)]).into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
+    }
+
+    /// Finding 3: the folded value must not be reordered past an effect that
+    /// the read statement evaluates before it.
+    #[test]
+    fn keeps_an_effectful_value_out_of_a_later_position() {
+        let registers = local(Some("registers"));
+        let sink = local(Some("sink"));
+        let produce = Call::new(Global::new(b"produce".to_vec()).into(), Vec::new());
+        let observe = Call::new(Global::new(b"observe".to_vec()).into(), Vec::new());
+        let consumer = crate::Binary::new(
+            observe.into(),
+            slot_read(&registers, 1.0),
+            crate::BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![produce.into()]).into(),
+            Assign::new(vec![sink.into()], vec![consumer.into()]).into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
+    }
+
+    /// The mirror image: the read comes first in evaluation order, so the
+    /// value keeps its position relative to the call and folds.
+    #[test]
+    fn folds_an_effectful_value_that_still_runs_first() {
+        let registers = local(Some("registers"));
+        let sink = local(Some("sink"));
+        let produce = Call::new(Global::new(b"produce".to_vec()).into(), Vec::new());
+        let observe = Call::new(Global::new(b"observe".to_vec()).into(), Vec::new());
+        let consumer = crate::Binary::new(
+            slot_read(&registers, 1.0),
+            observe.into(),
+            crate::BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![produce.into()]).into(),
+            Assign::new(vec![sink.into()], vec![consumer.into()]).into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 1);
+    }
+
+    /// A local the value reads is overwritten before the read. The window
+    /// admits a plain local assignment, so nothing else catches this.
+    #[test]
+    fn keeps_the_write_when_the_values_source_is_overwritten() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let sink = local(Some("sink"));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.clone().into()]).into(),
+            Assign::new(vec![source.into()], vec![Literal::Number(5.0).into()]).into(),
+            Assign::new(vec![sink.into()], vec![slot_read(&registers, 1.0)]).into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
     }
 
     /// A value may read a sibling slot: nothing that can sit between the
