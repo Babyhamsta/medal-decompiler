@@ -87,10 +87,10 @@ pub use r#while::*;
 /// Inline capacity for the per-node value and traversal lists below.
 ///
 /// Every `LocalRw` and `Traverse` method returns one of these, once per node
-/// per visit, across dozens of passes. Returning `Vec` made each of those a
-/// heap allocation: on the stage-27 fixture 75% of all allocations were 32
-/// bytes or smaller, and 37% were a single pointer. Four inline slots absorb
-/// that without making the returned value unwieldy.
+/// per visit, across dozens of passes. A `Vec` would make each of those a heap
+/// allocation, and the overwhelming majority of these lists are a handful of
+/// pointers at most. Four inline slots keep the common case on the stack
+/// without making the returned value unwieldy.
 pub type LocalRefs<'a> = SmallVec<[&'a RcLocal; 4]>;
 pub type LocalRefsMut<'a> = SmallVec<[&'a mut RcLocal; 4]>;
 pub type RValueRefs<'a> = SmallVec<[&'a RValue; 4]>;
