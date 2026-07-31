@@ -618,6 +618,8 @@ fn decompile_chunk(
     catch_phase(DecompilePhase::Format, None, None, || {
         ast::recover_function_syntax(&mut body);
         profiling::checkpoint("function-syntax-recovered");
+        ast::propagate_parameter_names(&mut body);
+        profiling::checkpoint("parameter-names-propagated");
         name_locals(&mut body, false);
         profiling::checkpoint("locals-named");
         let source = body.to_string();
