@@ -1571,4 +1571,26 @@ mod tests {
 
         assert_eq!(block.to_string(), "f(a, b)");
     }
+
+    #[test]
+    fn a_single_huge_string_argument_is_never_wrapped_and_stays_intact() {
+        // A single argument can never gain a sibling to strip off its line
+        // (`format_arg_list` requires `list.len() > 1` to even consider
+        // wrapping), so this holds by construction. Pinned anyway: a Lua
+        // string cannot be split without inserting `..`, which would change
+        // the AST, so this call staying on one line — with the string
+        // untouched — is the property that makes this whole feature
+        // formatter-only. This must never regress silently.
+        let huge = "x".repeat(300);
+        let call = Call::new(
+            local("f").into(),
+            vec![RValue::Literal(Literal::String(huge.clone().into_bytes()))],
+        );
+        let block = Block(vec![call.into()]);
+
+        let formatted = block.to_string();
+
+        assert!(!formatted.contains(",\n"));
+        assert!(formatted.contains(&huge));
+    }
 }
