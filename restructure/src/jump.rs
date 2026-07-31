@@ -80,7 +80,9 @@ impl super::GraphStructurer {
                     self.function.remove_block(node);
                     true
                 } else if self.function.predecessor_blocks(target).count() == 1
-                    && !self.function.edges_to_block(node).any(|(t, _)| t == target)
+                    && (!self.function.edges_to_block(node).any(|(t, _)| t == target)
+                        || (self.is_loop_header(node)
+                            && self.function.successor_blocks(target).count() == 2))
                     && !self
                         .function
                         .edges_to_block(target)

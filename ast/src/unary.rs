@@ -1,5 +1,5 @@
-use smallvec::{smallvec};
-use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
+use crate::{LocalRefs, LocalRefsMut, RValueRefs, RValueRefsMut};
+use smallvec::smallvec;
 use std::fmt;
 
 use crate::{Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse};
@@ -104,58 +104,10 @@ impl Reduce for Unary {
                 // TODO: is this accurate w/ unicode in Luau?
                 RValue::Literal(Literal::Number(value.len() as f64))
             }
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::GreaterThan,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::LessThanOrEqual,
-            }
-            .reduce(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::LessThanOrEqual,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::GreaterThan,
-            }
-            .reduce(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::GreaterThanOrEqual,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::LessThan,
-            }
-            .reduce(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::LessThan,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::GreaterThanOrEqual,
-            }
-            .reduce(),
+            // `not (a < b)` is not `a >= b`: every ordering comparison against
+            // NaN is false, so negating one is true where the flipped operator
+            // is false. Equality below flips safely because `==` and `~=` stay
+            // exact complements for every operand, NaN included.
             (
                 RValue::Binary(Binary {
                     left,
@@ -257,58 +209,7 @@ impl Reduce for Unary {
             }
             // __len has to return number, numbers are always truthy
             (_, UnaryOperation::Length) => RValue::Literal(Literal::Boolean(true)),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::GreaterThan,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::LessThanOrEqual,
-            }
-            .reduce_condition(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::LessThanOrEqual,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::GreaterThan,
-            }
-            .reduce_condition(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::GreaterThanOrEqual,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::LessThan,
-            }
-            .reduce_condition(),
-            (
-                RValue::Binary(Binary {
-                    left,
-                    right,
-                    operation: BinaryOperation::LessThan,
-                }),
-                UnaryOperation::Not,
-            ) => Binary {
-                left,
-                right,
-                operation: BinaryOperation::GreaterThanOrEqual,
-            }
-            .reduce_condition(),
+            // See `reduce`: ordering comparisons do not survive negation.
             (
                 RValue::Binary(Binary {
                     left,

@@ -1,5 +1,6 @@
 use crate::{
-    Block, Continue, Literal, RValue, SideEffects, Statement, Traverse, Unary, UnaryOperation,
+    BinaryOperation, Block, Continue, Literal, RValue, Reduce, Return, SideEffects, Statement,
+    Traverse, Unary, UnaryOperation,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -17,11 +18,14 @@ fn invert_condition(condition: RValue) -> RValue {
             value,
             operation: UnaryOperation::Not,
         }) => *value,
+        // Reducing folds the negation into the operator wherever that is
+        // exact, so an inverted equality reads as `~=` rather than `not (…)`.
+        // Ordering comparisons have no such form and stay negated.
         condition => Unary {
             value: Box::new(condition),
             operation: UnaryOperation::Not,
         }
-        .into(),
+        .reduce_condition(),
     }
 }
 
@@ -74,6 +78,46 @@ fn clean_statement(statement: &mut Statement, stats: &mut ControlFlowCleanupStat
             clean_block(&mut generic_for.block.lock(), true, stats)
         }
         _ => {}
+    }
+}
+
+/// Resolves a conditional whose condition is already a constant.
+///
+/// Structuring can leave a branch guarded by a literal, such as the
+/// `if not true then continue end` a refined virtual edge produces. The
+/// condition decides nothing, so the branch it selects belongs in the
+/// surrounding block and the other is unreachable. Only a side-effect-free
+/// condition qualifies, since dropping it must not drop work with it.
+fn resolve_constant_conditions(block: &mut Block, stats: &mut ControlFlowCleanupStats) {
+    let mut index = 0;
+    while index < block.len() {
+        let Some(r#if) = block[index].as_if() else {
+            index += 1;
+            continue;
+        };
+        let taken = match r#if.condition.clone().reduce_condition() {
+            RValue::Literal(Literal::Boolean(taken)) => taken,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if r#if.condition.has_side_effects() {
+            index += 1;
+            continue;
+        }
+
+        let selected = if taken {
+            std::mem::take(&mut *r#if.then_block.lock()).0
+        } else {
+            std::mem::take(&mut *r#if.else_block.lock()).0
+        };
+        let taken_count = selected.len();
+        block.0.splice(index..index + 1, selected);
+        stats.removed_empty += 1;
+        // Re-examine from here: the spliced statements have not been seen yet,
+        // and an empty branch leaves the following statement at this index.
+        index += taken_count;
     }
 }
 
@@ -172,11 +216,64 @@ fn recover_loop_tail_guard(block: &mut Block, stats: &mut ControlFlowCleanupStat
     true
 }
 
+/// Rewrites a trailing negated comparison back into an early return.
+///
+/// Branch inversion can leave a function ending in `if not (a < b) then body
+/// end`. Authors spell that as a guard, and it is equivalent here: taking the
+/// early return and falling off the end both leave the function with no
+/// results. Only the last statement of a function body qualifies, since a
+/// `return` inserted anywhere else would leave more than its own block.
+///
+/// The condition must be a negated ordering comparison. Those come from
+/// inversion rather than from source, so undoing them cannot reshape an `if`
+/// the author actually wrote.
+fn recover_trailing_comparison_guard(
+    block: &mut Block,
+    stats: &mut ControlFlowCleanupStats,
+) -> bool {
+    let Some(r#if) = block.last_mut().and_then(Statement::as_if_mut) else {
+        return false;
+    };
+    if !r#if.else_block.lock().is_empty() {
+        return false;
+    }
+    let RValue::Unary(unary) = &r#if.condition else {
+        return false;
+    };
+    if unary.operation != UnaryOperation::Not
+        || !matches!(
+            unary.value.as_ref(),
+            RValue::Binary(binary) if matches!(
+                binary.operation,
+                BinaryOperation::LessThan
+                    | BinaryOperation::LessThanOrEqual
+                    | BinaryOperation::GreaterThan
+                    | BinaryOperation::GreaterThanOrEqual
+            )
+        )
+    {
+        return false;
+    }
+    let then_block = r#if.then_block.lock();
+    if then_block.is_empty() || block_terminates(&then_block) {
+        return false;
+    }
+    drop(then_block);
+
+    invert_condition_in_place(&mut r#if.condition);
+    let body = std::mem::take(&mut *r#if.then_block.lock()).0;
+    r#if.then_block.lock().push(Return::new(Vec::new()).into());
+    block.0.extend(body);
+    stats.flattened_guards += 1;
+    true
+}
+
 fn clean_block(block: &mut Block, loop_body: bool, stats: &mut ControlFlowCleanupStats) {
     loop {
         for statement in &mut block.0 {
             clean_statement(statement, stats);
         }
+        resolve_constant_conditions(block, stats);
         normalize_empty_branches(block, stats);
         flatten_terminal_branches(block, stats);
         if !loop_body || !recover_loop_tail_guard(block, stats) {
@@ -188,6 +285,7 @@ fn clean_block(block: &mut Block, loop_body: bool, stats: &mut ControlFlowCleanu
 pub fn cleanup_control_flow(block: &mut Block) -> ControlFlowCleanupStats {
     let mut stats = ControlFlowCleanupStats::default();
     clean_block(block, false, &mut stats);
+    while recover_trailing_comparison_guard(block, &mut stats) {}
     stats
 }
 
@@ -195,7 +293,7 @@ pub fn cleanup_control_flow(block: &mut Block) -> ControlFlowCleanupStats {
 mod tests {
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Global, If, Index, LValue, Literal, Local,
-        RValue, RcLocal, Return, Statement, UnaryOperation, While,
+        RValue, RcLocal, Return, Statement, Unary, UnaryOperation, While,
     };
 
     use super::cleanup_control_flow;
@@ -234,6 +332,70 @@ mod tests {
         assert!(matches!(&r#if.condition, RValue::Unary(unary)
                 if unary.operation == UnaryOperation::Not
                     && matches!(unary.value.as_ref(), RValue::Local(local) if local == &condition)));
+    }
+
+    #[test]
+    fn trailing_negated_comparison_becomes_early_return() {
+        let count = local("count");
+        let value = local("value");
+        let mut block = Block(vec![
+            If::new(
+                Unary::new(
+                    Binary::new(
+                        count.clone().into(),
+                        Literal::Number(3.0).into(),
+                        BinaryOperation::LessThan,
+                    )
+                    .into(),
+                    UnaryOperation::Not,
+                )
+                .into(),
+                Block(vec![assign(&value, 1.0)]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+
+        cleanup_control_flow(&mut block);
+
+        assert_eq!(block.len(), 2);
+        let guard = block[0].as_if().unwrap();
+        assert!(matches!(
+            &guard.condition,
+            RValue::Binary(binary) if binary.operation == BinaryOperation::LessThan
+        ));
+        assert!(guard.then_block.lock()[0].as_return().is_some());
+        assert!(block[1].as_assign().is_some());
+    }
+
+    #[test]
+    fn trailing_negated_equality_keeps_its_shape() {
+        // `not (a == b)` reduces to `a ~= b` on its own, so a surviving
+        // negated equality came from the source and must not be reshaped.
+        let left = local("left");
+        let value = local("value");
+        let mut block = Block(vec![
+            If::new(
+                Unary::new(
+                    Binary::new(
+                        left.clone().into(),
+                        Literal::Number(3.0).into(),
+                        BinaryOperation::Equal,
+                    )
+                    .into(),
+                    UnaryOperation::Not,
+                )
+                .into(),
+                Block(vec![assign(&value, 1.0)]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+
+        cleanup_control_flow(&mut block);
+
+        assert_eq!(block.len(), 1);
+        assert!(block[0].as_if().is_some());
     }
 
     #[test]

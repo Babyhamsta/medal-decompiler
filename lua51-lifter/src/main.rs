@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
             |(ast_function, mut function, upvalues_in)| -> anyhow::Result<_> {
                 let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
                     cfg::ssa::construct(&mut function, &upvalues_in)?;
-                let upvalue_to_group = upvalue_in_groups
+                let mut upvalue_to_group = upvalue_in_groups
                     .into_iter()
                     .chain(
                         upvalue_passed_groups
@@ -111,6 +111,12 @@ fn main() -> anyhow::Result<()> {
                     if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map) {
                         changed = true;
                     }
+                    // Capture groups name the SSA values that alias one box, so
+                    // they have to follow the same renames as the function.
+                    ssa::construct::apply_local_map_to_upvalue_groups(
+                        &mut upvalue_to_group,
+                        &local_map,
+                    );
                     ssa::construct::apply_local_map(&mut function, local_map);
                 }
                 let recovery_facts = cfg::recovery::RecoveryFacts::derive(&function)

@@ -341,6 +341,220 @@ fn inline_block_once(block: &mut Block, protected: &FxHashSet<RcLocal>) -> usize
     removed
 }
 
+/// The operands of a statement that consumes a run of temporaries, split into
+/// the part that runs before every argument and the arguments themselves.
+///
+/// A call's callee, and a method call's object, occupy the register the
+/// arguments are laid out after, so the compiler emits them first and the
+/// source evaluates them first. The prefix is therefore already ahead of every
+/// temporary, whatever it does, while the arguments share their position with
+/// the temporaries and have to be checked.
+fn consumer_operands(statement: &Statement) -> Option<(Option<&RValue>, &[RValue])> {
+    match statement {
+        Statement::Call(call) => Some((Some(call.value.as_ref()), &call.arguments)),
+        Statement::MethodCall(method_call) => {
+            Some((Some(method_call.value.as_ref()), &method_call.arguments))
+        }
+        Statement::Return(r#return) => Some((None, &r#return.values)),
+        _ => None,
+    }
+}
+
+struct GroupOrder<'a> {
+    targets: &'a [RcLocal],
+    matched: usize,
+    ordered: bool,
+}
+
+impl<'a> GroupOrder<'a> {
+    fn new(targets: &'a [RcLocal]) -> Self {
+        Self {
+            targets,
+            matched: 0,
+            ordered: true,
+        }
+    }
+
+    fn mentions_target(&self, value: &RValue) -> bool {
+        value
+            .values_read()
+            .into_iter()
+            .any(|local| self.targets.contains(local))
+    }
+
+    /// Walks one operand in evaluation order, recording where the temporaries
+    /// appear and rejecting anything that would move observable work across
+    /// them.
+    fn walk(&mut self, value: &RValue, prefix: bool) {
+        if !self.ordered {
+            return;
+        }
+        if let RValue::Local(local) = value
+            && let Some(position) = self.targets.iter().position(|target| target == local)
+        {
+            self.ordered = position == self.matched;
+            self.matched += 1;
+            return;
+        }
+
+        if !self.mentions_target(value) {
+            // Operands after the last temporary keep their relative order with
+            // every folded definition, so only earlier ones are constrained.
+            if !prefix && self.matched < self.targets.len() && value.has_side_effects() {
+                self.ordered = false;
+            }
+            return;
+        }
+
+        // A temporary was evaluated unconditionally before the consumer ran.
+        // Folding it into a branch that may be skipped, or into a body this
+        // pass cannot see, would not preserve that.
+        match value {
+            RValue::Binary(binary)
+                if matches!(binary.operation, BinaryOperation::And | BinaryOperation::Or) =>
+            {
+                self.ordered = false;
+                return;
+            }
+            RValue::Conditional(_) | RValue::Closure(_) => {
+                self.ordered = false;
+                return;
+            }
+            _ => {}
+        }
+
+        for child in value.rvalues() {
+            self.walk(child, prefix);
+            if !self.ordered {
+                return;
+            }
+        }
+    }
+}
+
+fn replace_single_read(value: &mut RValue, target: &RcLocal, replacement: &RValue) -> bool {
+    if matches!(value, RValue::Local(local) if local == target) {
+        *value = replacement.clone();
+        return true;
+    }
+    for child in value.rvalues_mut() {
+        if replace_single_read(child, target, replacement) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Folds the run of temporary definitions that ends at `consumer` into the
+/// consumer itself, returning how many definitions were removed.
+///
+/// Only a whole run is folded. `local a = E1; local b = E2; f(a, b)` evaluates
+/// `E1`, `E2`, `f`; the source it came from, `f(E1, E2)`, evaluates `f`, `E1`,
+/// `E2`. Folding every temporary of the run restores that order, while folding
+/// part of it would leave the remaining definitions ahead of the callee and
+/// invent an order neither form has.
+fn fold_group_at(
+    block: &mut Block,
+    consumer: usize,
+    protected: &FxHashSet<RcLocal>,
+) -> Option<usize> {
+    consumer_operands(&block[consumer])?;
+
+    let mut start = consumer;
+    let mut definitions = Vec::new();
+    while start > 0 {
+        let Some((target, value)) = inline_candidate(&block[start - 1]) else {
+            break;
+        };
+        if protected.contains(&target) {
+            break;
+        }
+        start -= 1;
+        definitions.push((target, value));
+    }
+    definitions.reverse();
+    if definitions.len() < 2 {
+        return None;
+    }
+
+    // Trailing definitions whose only read is the consumer are foldable; the
+    // rest of the run stays where it is.
+    let mut first = definitions.len();
+    while first > 0
+        && single_read_statement(block, start + first, &definitions[first - 1].0) == Some(consumer)
+    {
+        first -= 1;
+    }
+    let folded = &definitions[first..];
+    if folded.len() < 2 {
+        return None;
+    }
+
+    // A definition left behind whose temporary the consumer also reads would
+    // make this a partial fold.
+    let consumer_reads = block[consumer]
+        .values_read()
+        .into_iter()
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    if definitions[..first]
+        .iter()
+        .any(|(target, _)| consumer_reads.contains(target))
+    {
+        return None;
+    }
+
+    let targets = folded
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<Vec<_>>();
+    let mut order = GroupOrder::new(&targets);
+    let (prefix, arguments) = consumer_operands(&block[consumer]).unwrap();
+    if let Some(prefix) = prefix {
+        order.walk(prefix, true);
+    }
+    for argument in arguments {
+        order.walk(argument, false);
+    }
+    if !order.ordered || order.matched != targets.len() {
+        return None;
+    }
+
+    let replacements = folded.to_vec();
+    for (target, value) in &replacements {
+        let replaced = block[consumer]
+            .rvalues_mut()
+            .into_iter()
+            .any(|operand| replace_single_read(operand, target, value));
+        debug_assert!(replaced);
+    }
+    let removed = replacements.len();
+    block.0.drain(start + first..start + first + removed);
+    Some(removed)
+}
+
+fn fold_groups_once(block: &mut Block, protected: &FxHashSet<RcLocal>) -> usize {
+    // `do` blocks hide reads from the single-read scan below. None exist while
+    // expression recovery runs, but folding across one would drop a live
+    // definition, so the pass steps aside instead of assuming.
+    if block.iter().any(|statement| statement.as_do().is_some()) {
+        return 0;
+    }
+
+    let mut removed = 0;
+    let mut consumer = 1;
+    while consumer < block.len() {
+        match fold_group_at(block, consumer, protected) {
+            Some(folded) => {
+                removed += folded;
+                consumer = consumer - folded + 1;
+            }
+            None => consumer += 1,
+        }
+    }
+    removed
+}
+
 fn try_extend_short_circuit(
     first: &mut Statement,
     second: &Statement,
@@ -407,7 +621,7 @@ fn recover_block(block: &mut Block, protected: &FxHashSet<RcLocal>) -> Expressio
     }
 
     loop {
-        let inlined = inline_block_once(block, protected);
+        let inlined = inline_block_once(block, protected) + fold_groups_once(block, protected);
         stats.inlined_temporaries += inlined;
         if inlined == 0 {
             break;
@@ -889,6 +1103,169 @@ mod tests {
 
         assert_eq!(stats.inlined_temporaries, 0);
         assert_eq!(block.len(), 3);
+    }
+
+    fn field(value: RValue, name: &str) -> RValue {
+        crate::Index::new(value, Literal::String(name.as_bytes().to_vec()).into()).into()
+    }
+
+    #[test]
+    fn folds_argument_run_into_call() {
+        let key = local("key");
+        let first = local("first");
+        let second = local("second");
+        let element = field(
+            crate::Index::new(Global::from("Players").into(), key.into()).into(),
+            "Name",
+        );
+        let mut block = Block(vec![
+            assign(&first, Global::from("bringT").into()),
+            assign(&second, element),
+            Call::new(
+                field(Global::from("table").into(), "insert"),
+                vec![first.into(), second.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 2);
+        assert_eq!(block.to_string(), "table.insert(bringT, Players[key].Name)");
+    }
+
+    #[test]
+    fn folds_argument_run_into_method_call() {
+        let object = local("object");
+        let first = local("first");
+        let second = local("second");
+        let mut block = Block(vec![
+            assign(&first, Global::from("width").into()),
+            assign(&second, Global::from("height").into()),
+            MethodCall::new(
+                object.into(),
+                "resize".to_owned(),
+                vec![first.into(), second.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 2);
+        assert_eq!(block.to_string(), "object:resize(width, height)");
+    }
+
+    #[test]
+    fn keeps_argument_run_read_out_of_definition_order() {
+        let first = local("first");
+        let second = local("second");
+        let mut block = Block(vec![
+            assign(&first, Global::from("left").into()),
+            assign(&second, Global::from("right").into()),
+            Call::new(
+                Global::from("consume").into(),
+                vec![second.into(), first.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn keeps_argument_run_split_by_effectful_operand() {
+        let first = local("first");
+        let second = local("second");
+        let observe = Call::new(Global::from("observe").into(), Vec::new());
+        let mut block = Block(vec![
+            assign(&first, Global::from("left").into()),
+            assign(&second, Global::from("right").into()),
+            Call::new(
+                Global::from("consume").into(),
+                vec![first.into(), observe.into(), second.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn keeps_argument_run_with_a_twice_read_temporary() {
+        let first = local("first");
+        let second = local("second");
+        let mut block = Block(vec![
+            assign(&first, Global::from("left").into()),
+            assign(&second, Global::from("right").into()),
+            Call::new(
+                Global::from("consume").into(),
+                vec![first.into(), second.clone().into(), second.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn keeps_argument_run_reached_through_a_short_circuit() {
+        let first = local("first");
+        let second = local("second");
+        let guarded = Binary::new(
+            Global::from("enabled").into(),
+            second.clone().into(),
+            BinaryOperation::And,
+        );
+        let mut block = Block(vec![
+            assign(&first, Global::from("left").into()),
+            assign(&second, Global::from("right").into()),
+            Call::new(
+                Global::from("consume").into(),
+                vec![first.into(), guarded.into()],
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 0);
+        assert_eq!(block.len(), 3);
+    }
+
+    #[test]
+    fn folds_only_the_consumed_suffix_of_a_run() {
+        let kept = local("kept");
+        let first = local("first");
+        let second = local("second");
+        let mut block = Block(vec![
+            assign(&kept, Global::from("kept_source").into()),
+            assign(&first, Global::from("left").into()),
+            assign(&second, Global::from("right").into()),
+            Call::new(
+                Global::from("consume").into(),
+                vec![first.into(), second.into()],
+            )
+            .into(),
+            Call::new(Global::from("observe").into(), vec![kept.into()]).into(),
+        ]);
+
+        let stats = recover_expressions_with_protected(&mut block, &[]);
+
+        assert_eq!(stats.inlined_temporaries, 2);
+        assert_eq!(
+            block.to_string(),
+            "kept = kept_source\nconsume(left, right)\nobserve(kept)"
+        );
     }
 
     #[test]

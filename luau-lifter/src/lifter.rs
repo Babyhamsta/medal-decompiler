@@ -1577,10 +1577,18 @@ impl<'a> Lifter<'a> {
                                         Some(BytecodeConstant::Nil)
                                     ) =>
                                 {
-                                    continue;
+                                    // A template slot with no constant value is
+                                    // filled by a later store. Keeping the slot
+                                    // holds the key's position, so the store
+                                    // lands where the author wrote it instead of
+                                    // after every constant field. Any slot still
+                                    // unfilled at the end is dropped, and a field
+                                    // explicitly set to nil is absent from the
+                                    // table either way.
+                                    ast::Literal::Nil
                                 }
                                 Some(value_index) => self.constant(value_index, block_start + index)?,
-                                None => ast::Literal::Number(0.0),
+                                None => ast::Literal::Nil,
                             };
                             values.push((Some(key.into()), value.into()));
                         }

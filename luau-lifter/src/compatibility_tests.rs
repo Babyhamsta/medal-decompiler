@@ -138,10 +138,11 @@ fn wonky_v12_output_has_no_trivial_local_aliases() {
         aliases.is_empty(),
         "trivial aliases remained: {aliases:#?}\n{decompiled}"
     );
+    // A constructor short enough to fit on one line is written there, so the
+    // argument is looked for wherever it lands rather than on a line of its
+    // own.
     assert!(
-        setmetatable_body
-            .lines()
-            .any(|line| line.trim() == direct_module_argument),
+        setmetatable_body.contains(&direct_module_argument),
         "setmetatable did not receive module local {module_local} directly\n{decompiled}"
     );
 }
@@ -303,13 +304,21 @@ fn adversarial_dataflow_preserves_capture_and_multireturn_boundaries() {
                 && window[1].contains(".status = ")
         })
         .expect("open call-tail table must stay separate from its later field");
+    // Adjacent declarations are written as one declaration list, so the table
+    // is bound by the last name on the left rather than by the only one.
     let seeded_name = seeded[0]
         .strip_prefix("local ")
         .unwrap()
         .split_once(" = ")
         .unwrap()
-        .0;
-    assert!(seeded[1].starts_with(&format!("{seeded_name}.status = ")));
+        .0
+        .rsplit(", ")
+        .next()
+        .unwrap();
+    assert!(
+        seeded[1].starts_with(&format!("{seeded_name}.status = ")),
+        "{decompiled}"
+    );
 
     let registry = lines
         .windows(2)

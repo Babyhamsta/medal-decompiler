@@ -1,5 +1,5 @@
-use smallvec::{smallvec};
-use crate::{LocalRefs,LocalRefsMut,RValueRefs,RValueRefsMut};
+use crate::{LocalRefs, LocalRefsMut, RValueRefs, RValueRefsMut};
+use smallvec::smallvec;
 use std::fmt;
 
 use crate::{Literal, LocalRw, RValue, RcLocal, Reduce, SideEffects, Traverse};
@@ -304,14 +304,40 @@ impl Binary {
         )
     }
 
+    /// Whether re-parsing this node's right child as part of a left-leaning
+    /// chain would still produce the same program.
+    ///
+    /// Only `and` and `or` qualify. Both are fully associative: `a or (b or
+    /// c)` and `(a or b) or c` pick the same operand, evaluate the same
+    /// operands in the same order, and short-circuit at the same point, so
+    /// dropping the parentheses is a purely textual change.
+    ///
+    /// No arithmetic operator qualifies, associative in exact arithmetic or
+    /// not. Lua numbers are IEEE-754 doubles, where addition and
+    /// multiplication are not associative: with `a, b, c = 1e16, -1e16, 1`,
+    /// `a + (b + c)` is `0` while `a + b + c` is `1`. Reassociating those
+    /// would silently change what the output computes.
+    ///
+    /// `..` is right-associative and so never reaches the equal-precedence
+    /// case, and the comparisons cannot chain at all in Lua.
+    fn right_child_reassociates(&self) -> bool {
+        // And and Or hold distinct precedences, so an equal-precedence right
+        // child of one is always the same operator.
+        matches!(self.operation, BinaryOperation::And | BinaryOperation::Or)
+    }
+
     pub fn left_group(&self) -> bool {
         self.precedence() > self.left.precedence()
             || (self.precedence() == self.left.precedence() && self.right_associative())
     }
 
     pub fn right_group(&self) -> bool {
-        self.precedence() > self.right.precedence()
-            || (self.precedence() == self.right.precedence() && !self.right_associative())
+        if self.precedence() > self.right.precedence() {
+            return true;
+        }
+        self.precedence() == self.right.precedence()
+            && !self.right_associative()
+            && !self.right_child_reassociates()
     }
 }
 
@@ -330,6 +356,124 @@ impl LocalRw for Binary {
             .into_iter()
             .chain(self.right.values_read_mut().into_iter())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Binary, BinaryOperation};
+    use crate::{Global, RValue};
+
+    fn value(name: &str) -> RValue {
+        Global::from(name).into()
+    }
+
+    /// `a <op> (b <op> c)`, the shape short-circuit recovery builds for a
+    /// chain of the same operator.
+    fn right_leaning(operation: BinaryOperation) -> String {
+        Binary::new(
+            value("a"),
+            Binary::new(value("b"), value("c"), operation).into(),
+            operation,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn a_right_leaning_and_chain_prints_flat() {
+        assert_eq!(right_leaning(BinaryOperation::And), "a and b and c");
+    }
+
+    #[test]
+    fn a_right_leaning_or_chain_prints_flat() {
+        assert_eq!(right_leaning(BinaryOperation::Or), "a or b or c");
+    }
+
+    #[test]
+    fn a_four_term_and_chain_prints_flat() {
+        let inner = Binary::new(
+            value("b"),
+            Binary::new(value("c"), value("d"), BinaryOperation::And).into(),
+            BinaryOperation::And,
+        );
+        let chain = Binary::new(value("a"), inner.into(), BinaryOperation::And);
+
+        assert_eq!(chain.to_string(), "a and b and c and d");
+    }
+
+    /// Reassociating arithmetic is not a formatting change.
+    ///
+    /// Lua numbers are IEEE-754 doubles, so `+` and `*` are not associative:
+    /// with `a, b, c = 1e16, -1e16, 1`, Luau prints `0` for `a + (b + c)` and
+    /// `1` for `a + b + c`. Dropping these parentheses would silently change
+    /// what the recompiled program computes, so every arithmetic operator
+    /// keeps them.
+    #[test]
+    fn a_right_leaning_arithmetic_chain_keeps_its_parentheses() {
+        for operation in [
+            BinaryOperation::Add,
+            BinaryOperation::Sub,
+            BinaryOperation::Mul,
+            BinaryOperation::Div,
+            BinaryOperation::Mod,
+            BinaryOperation::IDiv,
+        ] {
+            assert_eq!(
+                right_leaning(operation),
+                format!("a {operation} (b {operation} c)"),
+                "{operation} reassociated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_right_leaning_comparison_keeps_its_parentheses() {
+        for operation in [
+            BinaryOperation::Equal,
+            BinaryOperation::NotEqual,
+            BinaryOperation::LessThan,
+            BinaryOperation::GreaterThan,
+            BinaryOperation::LessThanOrEqual,
+            BinaryOperation::GreaterThanOrEqual,
+        ] {
+            assert_eq!(
+                right_leaning(operation),
+                format!("a {operation} (b {operation} c)"),
+                "{operation} reassociated"
+            );
+        }
+    }
+
+    /// `..` and `^` are right-associative, so a right-leaning chain is what
+    /// the flat text already parses as and never needed parentheses.
+    #[test]
+    fn a_right_associative_chain_prints_flat_and_a_left_leaning_one_does_not() {
+        for operation in [BinaryOperation::Concat, BinaryOperation::Pow] {
+            assert_eq!(
+                right_leaning(operation),
+                format!("a {operation} b {operation} c")
+            );
+            let left_leaning = Binary::new(
+                Binary::new(value("a"), value("b"), operation).into(),
+                value("c"),
+                operation,
+            );
+            assert_eq!(
+                left_leaning.to_string(),
+                format!("(a {operation} b) {operation} c")
+            );
+        }
+    }
+
+    #[test]
+    fn a_lower_precedence_right_child_still_gets_parentheses() {
+        let chain = Binary::new(
+            value("a"),
+            Binary::new(value("b"), value("c"), BinaryOperation::Or).into(),
+            BinaryOperation::And,
+        );
+
+        assert_eq!(chain.to_string(), "a and (b or c)");
     }
 }
 

@@ -88,10 +88,21 @@ impl GraphStructurer {
                 }
 
                 let else_successors = self.function.successor_blocks(else_node).collect_vec();
-                if !(!then_successors.is_empty() && then_successors[0] == else_node)
-                    && !(else_successors.len() == 1 && then_successors[0] == else_successors[0])
-                    && !(then_successors[0] == header && else_node == init_block)
-                {
+                if let Some(&then_successor) = then_successors.first() {
+                    if then_successor != else_node
+                        && !(else_successors.len() == 1 && then_successor == else_successors[0])
+                        && !(then_successor == header && else_node == init_block)
+                    {
+                        return false;
+                    }
+                } else if !matches!(
+                    self.function.block(then_node).and_then(|block| block.last()),
+                    Some(ast::Statement::Return(_))
+                ) {
+                    // A body with no successors leaves the loop for good. Only a
+                    // block that ends in a return does so at the source level; any
+                    // other dead end came from an unstructured jump, which the for
+                    // patterns below cannot express.
                     return false;
                 }
 

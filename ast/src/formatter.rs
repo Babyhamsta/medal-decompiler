@@ -7,9 +7,9 @@ use std::{
 use itertools::Itertools;
 
 use crate::{
-    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Conditional, GenericFor, If,
+    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Conditional, Do, GenericFor, If,
     Index, LValue, Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement,
-    Do, Table, Unary, While,
+    Table, Traverse, Unary, While,
 };
 
 #[derive(Clone, Copy)]
@@ -49,6 +49,16 @@ impl Default for IndentationMode {
 /// short on its own past a readable width; this is the only place that
 /// budget is enforced.
 const COLUMN_BUDGET: usize = 120;
+
+/// Line width at which a table constructor is broken up into one field per
+/// line even though its contents would all fit on one.
+///
+/// A safety valve, not a layout rule. Hand-written descriptor tables really
+/// are one long element per line — several hundred columns is normal for them
+/// — so the width a constructor reaches is not what decides its layout. This
+/// only catches a constructor no reader could follow on one line whatever it
+/// holds.
+const TABLE_COLUMN_BUDGET: usize = 500;
 
 pub(crate) fn format_arg_list(list: &[RValue]) -> String {
     let mut s = String::new();
@@ -120,25 +130,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
 
-    fn value_renders_multiline(value: &RValue) -> bool {
+    fn value_renders_multiline(value: &RValue, indentation_width: usize) -> bool {
         match value {
             RValue::Closure(closure) => !closure.function.lock().body.is_empty(),
-            RValue::Table(table) => Self::table_renders_multiline(table),
-            _ => false,
-        }
-    }
-
-    pub(crate) fn statement_renders_multiline(statement: &Statement) -> bool {
-        match statement {
-            Statement::If(_)
-            | Statement::Do(_)
-            | Statement::While(_)
-            | Statement::Repeat(_)
-            | Statement::NumericFor(_)
-            | Statement::GenericFor(_) => true,
-            Statement::Assign(assign) => {
-                assign.right.iter().any(Self::value_renders_multiline)
-            }
+            RValue::Table(table) => Self::table_renders_multiline(table, indentation_width),
             _ => false,
         }
     }
@@ -147,38 +142,49 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         matches!(statement, Statement::Assign(assign) if assign.prefix)
     }
 
+    /// Whether a statement is a function definition with a body, i.e. renders
+    /// as a `function ... end` block rather than as an expression.
+    fn defines_function(statement: &Statement) -> bool {
+        match statement {
+            Statement::Assign(assign) if assign.right.len() == 1 => {
+                matches!(&assign.right[0], RValue::Closure(closure)
+                    if !closure.function.lock().body.is_empty())
+            }
+            Statement::Class(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Number of consecutive declarations that have to precede a statement
+    /// before the run is set off from it.
+    ///
+    /// Hand-written Lua keeps its declarations next to the code that uses
+    /// them; a blank line reads as a deliberate break, so it takes a run long
+    /// enough to be a preamble in its own right to earn one.
+    const DECLARATION_RUN_BREAK: usize = 3;
+
     /// Whether a blank line belongs between two adjacent statements.
     ///
-    /// `declaration_run` is the number of declarations immediately preceding
-    /// `next`, so a block of locals can be separated from the work that uses
-    /// them without splitting the block itself.
+    /// Blocks and loops are *not* set off on their own. They are the most
+    /// common multi-line constructs, and separating each one from its
+    /// neighbours pushes blank lines to several times the density hand-written
+    /// Lua uses, which reads as padding rather than as structure. A function
+    /// definition is the exception: it is a top-level unit of its own
+    /// wherever it appears, and source does reliably give it room.
     ///
-    /// `preceding_count` is `next`'s index within its block, i.e. how many
-    /// statements come before it. A lone simple statement followed by
-    /// `return` (`preceding_count == 1`) reads as one thought and stays
-    /// tight; that carve-out only applies here because it is reached solely
-    /// when `previous` isn't itself multi-line — the multi-line check above
-    /// already returned `true` otherwise.
-    fn needs_blank_between(
-        previous: &Statement,
-        next: &Statement,
-        declaration_run: usize,
-        preceding_count: usize,
-    ) -> bool {
+    /// `declaration_run` is the number of declarations immediately preceding
+    /// `next`, so a preamble of locals can be separated from the work that
+    /// uses them without splitting the preamble itself.
+    fn needs_blank_between(previous: &Statement, next: &Statement, declaration_run: usize) -> bool {
         if matches!(previous, Statement::Comment(_) | Statement::Empty(_))
             || matches!(next, Statement::Comment(_) | Statement::Empty(_))
         {
             return false;
         }
-        if Self::statement_renders_multiline(previous)
-            || Self::statement_renders_multiline(next)
-        {
+        if Self::defines_function(previous) || Self::defines_function(next) {
             return true;
         }
-        if matches!(next, Statement::Return(_)) {
-            return preceding_count != 1;
-        }
-        declaration_run >= 2 && !Self::is_declaration(next)
+        declaration_run >= Self::DECLARATION_RUN_BREAK && !Self::is_declaration(next)
     }
 
     fn format_block_no_indent(&mut self, block: &Block) -> fmt::Result {
@@ -186,12 +192,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         for (i, statement) in block.iter().enumerate() {
             if i != 0 {
                 writeln!(self.output)?;
-                if Self::needs_blank_between(
-                    &block[i - 1],
-                    statement,
-                    declaration_run,
-                    i,
-                ) {
+                if Self::needs_blank_between(&block[i - 1], statement, declaration_run) {
                     writeln!(self.output)?;
                 }
             }
@@ -287,8 +288,22 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         })
     }
 
-    fn contains_table(table: &Table) -> bool {
-        table.0.iter().any(|(_, v)| matches!(v, RValue::Table(_x)))
+    /// Whether a value can share a line with the table field holding it.
+    ///
+    /// A closure with a body is a block of statements and brings a layout of
+    /// its own; nothing else in this tree does. In particular neither depth
+    /// nor width disqualifies a value: source writes a whole GUI descriptor
+    /// record — a nested constructor several hundred columns wide — as one
+    /// array element on one line, and breaking those up is most of the
+    /// difference between the decompiler's line count and the original's.
+    fn value_stays_inline(rvalue: &RValue) -> bool {
+        match rvalue {
+            RValue::Closure(closure) => closure.function.lock().body.is_empty(),
+            _ => rvalue
+                .rvalues()
+                .iter()
+                .all(|child| Self::value_stays_inline(child)),
+        }
     }
 
     fn stable_compound_index_component(value: &RValue) -> bool {
@@ -340,73 +355,132 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     /// funnel through this one definition rather than each deciding for
     /// themselves. Callers that haven't compacted their table yet should use
     /// `table_renders_multiline` instead.
-    fn compacted_table_renders_multiline(compacted: &Table) -> bool {
-        let sequential_keys = Self::are_table_keys_sequential(compacted);
-        !compacted.0.is_empty() && (!sequential_keys || compacted.0.len() > 3)
-            || Self::contains_table(compacted)
+    ///
+    /// A table earns its own lines by holding something that cannot share a
+    /// line — not by having named keys, more than a handful of fields, or a
+    /// nested constructor. Source writes record and descriptor literals as
+    /// one element per line however wide and however deeply nested they are,
+    /// and breaking them up is most of the difference between decompiled
+    /// output's line count and the original's.
+    ///
+    /// What is left is decided by rendering the inline form, which is the
+    /// only way this predicate and the writer can be guaranteed to agree
+    /// about what that form costs. The scratch formatter is given the same
+    /// starting column as the real one so the argument lists inside it make
+    /// the same wrapping decisions.
+    fn compacted_table_renders_multiline(compacted: &Table, indentation_width: usize) -> bool {
+        if compacted.0.is_empty() {
+            return false;
+        }
+        let inlineable = compacted.0.iter().all(|(key, value)| {
+            Self::value_stays_inline(value) && key.as_ref().is_none_or(Self::value_stays_inline)
+        });
+        if !inlineable {
+            return true;
+        }
+        let mut scratch = String::new();
+        let rendered = Formatter {
+            indentation_level: indentation_width,
+            indentation_mode: IndentationMode::Tab,
+            output: &mut scratch,
+        }
+        .write_table_inline(compacted);
+        // An argument list inside the table may still have wrapped itself
+        // over the column budget, which no field of a one-line table can do.
+        rendered.is_err()
+            || scratch.contains('\n')
+            || indentation_width + scratch.len() > TABLE_COLUMN_BUDGET
     }
 
     /// Whether `format_table` will place this table's fields on their own
-    /// lines.
-    pub(crate) fn table_renders_multiline(table: &Table) -> bool {
-        Self::compacted_table_renders_multiline(&table.without_shadowed_literal_fields())
+    /// lines when it starts at `indentation_width` columns.
+    pub(crate) fn table_renders_multiline(table: &Table, indentation_width: usize) -> bool {
+        Self::compacted_table_renders_multiline(
+            &table.without_shadowed_literal_fields(),
+            indentation_width,
+        )
     }
 
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
         let compacted = table.without_shadowed_literal_fields();
-        let table = &compacted;
-        let sequential_keys = Self::are_table_keys_sequential(table);
-        let should_space = !table.0.is_empty();
-        let should_format = Self::compacted_table_renders_multiline(table);
-        write!(self.output, "{{")?;
-        if should_format {
-            writeln!(self.output)?;
-        } else if should_space {
-            write!(self.output, " ")?;
+        if Self::compacted_table_renders_multiline(&compacted, self.indentation_width()) {
+            self.write_table_multiline(&compacted)
+        } else {
+            self.write_table_inline(&compacted)
         }
+    }
+
+    /// Writes the key of a field, if it needs one written.
+    ///
+    /// A table whose keys are exactly `1..n` is written as an array, so its
+    /// keys are left implicit.
+    fn write_table_key(&mut self, key: Option<&RValue>, sequential_keys: bool) -> fmt::Result {
+        if sequential_keys {
+            return Ok(());
+        }
+        let Some(key) = key else {
+            return Ok(());
+        };
+        if let RValue::Literal(Literal::String(field)) = key
+            && Self::is_valid_name_in(field, crate::IdentifierContext::TableField)
+        {
+            return write!(self.output, "{} = ", std::str::from_utf8(field).unwrap());
+        }
+        write!(self.output, "[")?;
+        self.format_rvalue(key)?;
+        write!(self.output, "] = ")
+    }
+
+    /// Writes a field's value, parenthesizing a trailing multiple-result
+    /// expression so it contributes one element rather than filling the table.
+    ///
+    /// Only an array element can fill the table, so a keyed field is left as
+    /// it is.
+    fn write_table_value(&mut self, value: &RValue, fills_table: bool) -> fmt::Result {
+        let wrap = fills_table && matches!(value, RValue::Select(_));
+        if wrap {
+            write!(self.output, "(")?;
+        }
+        self.format_rvalue(value)?;
+        if wrap {
+            write!(self.output, ")")?;
+        }
+        Ok(())
+    }
+
+    fn write_table_inline(&mut self, compacted: &Table) -> fmt::Result {
+        if compacted.0.is_empty() {
+            return write!(self.output, "{{}}");
+        }
+        let sequential_keys = Self::are_table_keys_sequential(compacted);
+        write!(self.output, "{{ ")?;
+        for (index, (key, value)) in compacted.0.iter().enumerate() {
+            if index != 0 {
+                write!(self.output, ", ")?;
+            }
+            let is_last = index + 1 == compacted.0.len();
+            self.write_table_key(key.as_ref(), sequential_keys)?;
+            self.write_table_value(value, is_last && (key.is_none() || sequential_keys))?;
+        }
+        write!(self.output, " }}")
+    }
+
+    fn write_table_multiline(&mut self, compacted: &Table) -> fmt::Result {
+        let sequential_keys = Self::are_table_keys_sequential(compacted);
+        writeln!(self.output, "{{")?;
         self.indentation_level += 1;
-        for (index, (key, value)) in table.0.iter().enumerate() {
-            if should_format {
-                self.indent()?;
+        for (index, (key, value)) in compacted.0.iter().enumerate() {
+            let is_last = index + 1 == compacted.0.len();
+            self.indent()?;
+            self.write_table_key(key.as_ref(), sequential_keys)?;
+            self.write_table_value(value, is_last && (key.is_none() || sequential_keys))?;
+            if !is_last {
+                write!(self.output, ",")?;
             }
-            let is_last = index + 1 == table.0.len();
-            if is_last && (key.is_none() || sequential_keys) {
-                let wrap = matches!(value, RValue::Select(_));
-                if wrap {
-                    write!(self.output, "(")?;
-                }
-                self.format_rvalue(value)?;
-                if wrap {
-                    write!(self.output, ")")?;
-                }
-            } else {
-                if !sequential_keys {
-                    if let Some(key) = key {
-                        if let RValue::Literal(Literal::String(field)) = key
-                            && Self::is_valid_name_in(field, crate::IdentifierContext::TableField)
-                        {
-                            write!(self.output, "{} = ", std::str::from_utf8(field).unwrap())?;
-                        } else {
-                            write!(self.output, "[")?;
-                            self.format_rvalue(key)?;
-                            write!(self.output, "] = ")?;
-                        }
-                    }
-                }
-                self.format_rvalue(value)?;
-                if !is_last {
-                    write!(self.output, ",")?;
-                    write!(self.output, "{}", if should_format { "\n" } else { " " })?;
-                }
-            }
+            writeln!(self.output)?;
         }
         self.indentation_level -= 1;
-        if should_format {
-            writeln!(self.output)?;
-            self.indent()?;
-        } else if should_space {
-            write!(self.output, " ")?;
-        }
+        self.indent()?;
         write!(self.output, "}}")
     }
 
@@ -638,9 +712,17 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         // separators, no wrap parentheses) is enough to rule out the
         // common case of a short list without paying for a scratch
         // render.
-        if list.len() > 1 && !list.iter().any(Self::value_renders_multiline) {
+        let indentation_width = self.indentation_width();
+        if list.len() > 1
+            && !list
+                .iter()
+                .any(|rvalue| Self::value_renders_multiline(rvalue, indentation_width))
+        {
             let cheap_estimate = self.indentation_width()
-                + list.iter().map(|rvalue| rvalue.to_string().len()).sum::<usize>()
+                + list
+                    .iter()
+                    .map(|rvalue| rvalue.to_string().len())
+                    .sum::<usize>()
                 + (list.len() - 1) * ", ".len();
             if cheap_estimate > COLUMN_BUDGET {
                 let mut scratch = String::new();
@@ -706,11 +788,16 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     // TODO: PERF: Cow like from_utf8_lossy
+    /// Escapes a byte string for the double-quoted literal every caller emits.
+    ///
+    /// Only the quote character the literal is actually delimited with has to
+    /// be escaped. An apostrophe is written through as itself: escaping it is
+    /// legal Lua but does not read like the source it came from.
     pub(crate) fn escape_string(string: &[u8]) -> Cow<str> {
         let mut owned: Option<String> = None;
         let mut iter = string.iter().enumerate().peekable();
         while let Some((i, &c)) = iter.next() {
-            if c == b' ' || (c.is_ascii_graphic() && c != b'\\' && c != b'\'' && c != b'\"') {
+            if c == b' ' || (c.is_ascii_graphic() && c != b'\\' && c != b'\"') {
                 if let Some(owned) = &mut owned {
                     owned.push(c as char);
                 }
@@ -728,7 +815,6 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     b'\r' => owned.push_str(r"\r"),
                     b'\t' => owned.push_str(r"\t"),
                     b'\"' => owned.push_str(r#"\""#),
-                    b'\'' => owned.push_str(r"\'"),
                     b'\\' => owned.push_str(r"\\"),
                     12 => owned.push_str(r"\f"),
                     _ => {
@@ -1068,7 +1154,7 @@ mod tests {
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Closure, Comment, Conditional, Empty,
         Function, Global, Index, LValue, Literal, Local, MethodCall, NumericFor, RValue, RcLocal,
-        ResultDemand, Return, Select, Table, Upvalue, VarArg,
+        ResultDemand, Return, Select, Statement, Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1341,10 +1427,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(
-            table.to_string(),
-            "{\n\t\"first\",\n\t[1] = \"replacement\"\n}"
-        );
+        assert_eq!(table.to_string(), "{ \"first\", [1] = \"replacement\" }");
     }
 
     #[test]
@@ -1354,7 +1437,147 @@ mod tests {
             Literal::String(b"value".to_vec()).into(),
         )]);
 
-        assert_eq!(table.to_string(), "{\n\t[1.5] = \"value\"\n}");
+        assert_eq!(table.to_string(), "{ [1.5] = \"value\" }");
+    }
+
+    /// The shape a Roblox GUI descriptor array is written in: one element per
+    /// line, each a nested record hundreds of columns wide. Neither the
+    /// nesting nor the width breaks the element up.
+    #[test]
+    fn a_wide_nested_descriptor_element_stays_on_one_line() {
+        let properties = Table(
+            [
+                ("BackgroundTransparency", 1.0),
+                ("BorderSizePixel", 0.0),
+                ("ZIndex", 10.0),
+            ]
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    Some(Literal::String(name.as_bytes().to_vec()).into()),
+                    RValue::from(Literal::Number(value)),
+                )
+            })
+            .chain([(
+                Some(Literal::String(b"Name".to_vec()).into()),
+                RValue::from(Literal::String(b"Main".to_vec())),
+            )])
+            .chain([(
+                Some(Literal::String(b"Size".to_vec()).into()),
+                Call::new(
+                    Index::new(
+                        Global::from("UDim2").into(),
+                        Literal::String(b"new".to_vec()).into(),
+                    )
+                    .into(),
+                    vec![
+                        Literal::Number(0.0).into(),
+                        Literal::Number(500.0).into(),
+                        Literal::Number(0.0).into(),
+                        Literal::Number(20.0).into(),
+                    ],
+                )
+                .into(),
+            )])
+            .collect::<Vec<_>>(),
+        );
+        let element = Table(vec![
+            (None, Literal::Number(1.0).into()),
+            (None, Literal::String(b"Frame".to_vec()).into()),
+            (None, properties.into()),
+        ]);
+
+        assert_eq!(
+            element.to_string(),
+            "{ 1, \"Frame\", { BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 10, \
+             Name = \"Main\", Size = UDim2.new(0, 500, 0, 20) } }"
+        );
+    }
+
+    #[test]
+    fn a_table_holding_a_closure_with_a_body_takes_one_field_per_line() {
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                body: Block(vec![Return::new(vec![Literal::Number(1.0).into()]).into()]),
+                ..Default::default()
+            }))),
+            upvalues: Vec::new(),
+        };
+        let table = Table(vec![
+            (
+                Some(Literal::String(b"handler".to_vec()).into()),
+                closure.into(),
+            ),
+            (
+                Some(Literal::String(b"name".to_vec()).into()),
+                Literal::String(b"x".to_vec()).into(),
+            ),
+        ]);
+
+        assert_eq!(
+            table.to_string(),
+            "{\n\thandler = function()\n\t\treturn 1\n\tend,\n\tname = \"x\"\n}"
+        );
+    }
+
+    /// A closure nested well below the table still breaks it up: the fields
+    /// have no single line to share once one of them holds statements.
+    #[test]
+    fn a_closure_nested_inside_a_field_still_breaks_the_table_up() {
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                body: Block(vec![Return::new(vec![Literal::Number(1.0).into()]).into()]),
+                ..Default::default()
+            }))),
+            upvalues: Vec::new(),
+        };
+        let table = Table(vec![(
+            None,
+            Table(vec![(
+                None,
+                Call::new(Global::from("wrap").into(), vec![closure.into()]).into(),
+            )])
+            .into(),
+        )]);
+
+        assert!(table.to_string().starts_with("{\n\t"), "{table}");
+    }
+
+    #[test]
+    fn a_short_record_table_stays_on_one_line() {
+        let table = Table(vec![
+            (
+                Some(Literal::String(b"name".to_vec()).into()),
+                Literal::String(b"value".to_vec()).into(),
+            ),
+            (
+                Some(Literal::String(b"count".to_vec()).into()),
+                Literal::Number(3.0).into(),
+            ),
+        ]);
+
+        assert_eq!(table.to_string(), "{ name = \"value\", count = 3 }");
+    }
+
+    #[test]
+    fn a_table_past_the_safety_valve_takes_one_field_per_line() {
+        let table = Table(
+            (0..20)
+                .map(|index| {
+                    (
+                        Some(Literal::String(format!("field{index}").into_bytes()).into()),
+                        RValue::from(Literal::String(
+                            format!("value number {index} of this very long record").into_bytes(),
+                        )),
+                    )
+                })
+                .collect(),
+        );
+
+        let formatted = table.to_string();
+
+        assert!(formatted.starts_with("{\n\tfield0 = "), "{formatted}");
+        assert_eq!(formatted.matches('\n').count(), 21);
     }
 
     #[test]
@@ -1372,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_line_separates_a_multiline_statement_from_its_neighbours() {
+    fn a_loop_is_not_set_off_from_its_neighbours() {
         let counter = local("i");
         let block = Block(vec![
             Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
@@ -1382,8 +1605,7 @@ mod tests {
                 Literal::Number(1.0).into(),
                 counter,
                 Block(vec![
-                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
-                        .into(),
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
                 ]),
             )
             .into(),
@@ -1392,10 +1614,7 @@ mod tests {
 
         let formatted = block.to_string();
 
-        assert_eq!(
-            formatted,
-            "a = 1\n\nfor i = 1, 2 do\n\tb = 2\nend\n\nc = 3"
-        );
+        assert_eq!(formatted, "a = 1\nfor i = 1, 2 do\n\tb = 2\nend\nc = 3");
     }
 
     #[test]
@@ -1411,10 +1630,6 @@ mod tests {
 
     #[test]
     fn two_statement_body_return_stays_tight() {
-        // A single simple statement immediately followed by `return` reads
-        // as one thought (e.g. `self.middleware[...] = p1` then
-        // `return self`), so no blank line is inserted here even though
-        // `return` follows other work in general.
         let block = Block(vec![
             Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
             Return::new(vec![local("a").into()]).into(),
@@ -1424,18 +1639,18 @@ mod tests {
     }
 
     #[test]
-    fn three_statement_body_keeps_blank_before_return() {
+    fn a_return_is_not_set_off_from_the_work_before_it() {
         let block = Block(vec![
             Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
             Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
             Return::new(vec![local("a").into()]).into(),
         ]);
 
-        assert_eq!(block.to_string(), "a = 1\nb = 2\n\nreturn a");
+        assert_eq!(block.to_string(), "a = 1\nb = 2\nreturn a");
     }
 
     #[test]
-    fn multiline_first_statement_then_return_keeps_blank() {
+    fn a_loop_before_a_return_is_not_set_off_from_it() {
         let counter = local("i");
         let block = Block(vec![
             NumericFor::new(
@@ -1444,18 +1659,75 @@ mod tests {
                 Literal::Number(1.0).into(),
                 counter,
                 Block(vec![
-                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
-                        .into(),
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
                 ]),
             )
             .into(),
             Return::new(vec![local("a").into()]).into(),
         ]);
 
+        assert_eq!(block.to_string(), "for i = 1, 2 do\n\tb = 2\nend\nreturn a");
+    }
+
+    #[test]
+    fn a_function_definition_is_set_off_from_its_neighbours() {
+        let body = Block(vec![Return::new(vec![Literal::Number(1.0).into()]).into()]);
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                body,
+                ..Default::default()
+            }))),
+            upvalues: Vec::new(),
+        };
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Assign::new(vec![Global::from("work").into()], vec![closure.into()]).into(),
+            Assign::new(vec![local("c").into()], vec![Literal::Number(3.0).into()]).into(),
+        ]);
+
         assert_eq!(
             block.to_string(),
-            "for i = 1, 2 do\n\tb = 2\nend\n\nreturn a"
+            "a = 1\n\nwork = function()\n\treturn 1\nend\n\nc = 3"
         );
+    }
+
+    #[test]
+    fn a_long_run_of_declarations_is_set_off_from_the_work_using_them() {
+        let mut statements = (0..3)
+            .map(|index| {
+                let mut declaration = Assign::new(
+                    vec![local(&format!("v{index}")).into()],
+                    vec![Literal::Number(index as f64).into()],
+                );
+                declaration.prefix = true;
+                Statement::from(declaration)
+            })
+            .collect::<Vec<_>>();
+        statements.push(Call::new(Global::from("use").into(), vec![local("v0").into()]).into());
+        let block = Block(statements);
+
+        assert_eq!(
+            block.to_string(),
+            "local v0 = 0\nlocal v1 = 1\nlocal v2 = 2\n\nuse(v0)"
+        );
+    }
+
+    #[test]
+    fn a_short_run_of_declarations_stays_with_the_work_using_them() {
+        let mut statements = (0..2)
+            .map(|index| {
+                let mut declaration = Assign::new(
+                    vec![local(&format!("v{index}")).into()],
+                    vec![Literal::Number(index as f64).into()],
+                );
+                declaration.prefix = true;
+                Statement::from(declaration)
+            })
+            .collect::<Vec<_>>();
+        statements.push(Call::new(Global::from("use").into(), vec![local("v0").into()]).into());
+        let block = Block(statements);
+
+        assert_eq!(block.to_string(), "local v0 = 0\nlocal v1 = 1\nuse(v0)");
     }
 
     #[test]
@@ -1490,17 +1762,13 @@ mod tests {
                 Literal::Number(1.0).into(),
                 counter,
                 Block(vec![
-                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
-                        .into(),
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
                 ]),
             )
             .into(),
         ]);
 
-        assert_eq!(
-            block.to_string(),
-            "-- note\nfor i = 1, 2 do\n\tb = 2\nend"
-        );
+        assert_eq!(block.to_string(), "-- note\nfor i = 1, 2 do\n\tb = 2\nend");
     }
 
     #[test]
@@ -1513,18 +1781,14 @@ mod tests {
                 Literal::Number(1.0).into(),
                 counter,
                 Block(vec![
-                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
-                        .into(),
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
                 ]),
             )
             .into(),
             Comment::new("note".to_owned()).into(),
         ]);
 
-        assert_eq!(
-            block.to_string(),
-            "for i = 1, 2 do\n\tb = 2\nend\n-- note"
-        );
+        assert_eq!(block.to_string(), "for i = 1, 2 do\n\tb = 2\nend\n-- note");
     }
 
     #[test]
@@ -1541,8 +1805,7 @@ mod tests {
                 Literal::Number(1.0).into(),
                 counter,
                 Block(vec![
-                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
-                        .into(),
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
                 ]),
             )
             .into(),
@@ -1550,10 +1813,7 @@ mod tests {
             Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
         ]);
 
-        assert_eq!(
-            block.to_string(),
-            "for i = 1, 2 do\n\tb = 2\nend\n\na = 1"
-        );
+        assert_eq!(block.to_string(), "for i = 1, 2 do\n\tb = 2\nend\n\na = 1");
     }
 
     #[test]
@@ -1561,9 +1821,7 @@ mod tests {
         let call = Call::new(
             local("someFunctionWithAVeryLongName").into(),
             (0..8)
-                .map(|index| {
-                    RValue::Local(local(&format!("argumentNumber{index}WithALongName")))
-                })
+                .map(|index| RValue::Local(local(&format!("argumentNumber{index}WithALongName"))))
                 .collect(),
         );
         let block = Block(vec![call.into()]);
@@ -1576,10 +1834,27 @@ mod tests {
 
     #[test]
     fn a_short_argument_list_stays_on_one_line() {
-        let call = Call::new(local("f").into(), vec![local("a").into(), local("b").into()]);
+        let call = Call::new(
+            local("f").into(),
+            vec![local("a").into(), local("b").into()],
+        );
         let block = Block(vec![call.into()]);
 
         assert_eq!(block.to_string(), "f(a, b)");
+    }
+
+    #[test]
+    fn an_apostrophe_is_not_escaped_in_a_double_quoted_string() {
+        let literal = Literal::String(b"Couldn't find a server.".to_vec());
+
+        assert_eq!(literal.to_string(), "\"Couldn't find a server.\"");
+    }
+
+    #[test]
+    fn the_delimiting_quote_and_backslash_are_still_escaped() {
+        let literal = Literal::String(br#"a "b" \ c"#.to_vec());
+
+        assert_eq!(literal.to_string(), r#""a \"b\" \\ c""#);
     }
 
     #[test]

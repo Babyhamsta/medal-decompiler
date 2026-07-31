@@ -38,6 +38,7 @@ mod literal;
 mod local;
 //mod name_gen;
 pub mod local_declarations;
+mod local_grouping;
 mod name_flow;
 pub mod name_locals;
 mod repeat;
@@ -46,6 +47,7 @@ mod result_group;
 mod r#return;
 mod scope_narrowing;
 mod set_list;
+mod set_list_lowering;
 mod side_effects;
 mod slot_folding;
 mod table;
@@ -77,12 +79,14 @@ pub use r#if::*;
 pub use index::*;
 pub use literal::*;
 pub use local::*;
+pub use local_grouping::*;
 pub use name_flow::*;
 pub use repeat::*;
 pub use result_group::*;
 pub use r#return::*;
 pub use scope_narrowing::*;
 pub use set_list::*;
+pub use set_list_lowering::*;
 pub use side_effects::*;
 pub use slot_folding::*;
 pub use table::*;
@@ -209,6 +213,16 @@ impl RValue {
             Self::Index(index) => Some(LValue::Index(index)),
             _ => None,
         }
+    }
+
+    /// Whether this expression yields every result it produces when it appears
+    /// last in a return, call argument list, or table constructor.
+    ///
+    /// Such an expression loses all but its first result once it is nested
+    /// inside another expression, so a pass that rewraps it must decline.
+    /// `Select` is excluded: it already narrows its source to one result.
+    pub fn is_open_multi_value(&self) -> bool {
+        matches!(self, Self::Call(_) | Self::MethodCall(_) | Self::VarArg(_))
     }
 }
 
