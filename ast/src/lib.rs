@@ -25,6 +25,7 @@ mod closure;
 mod conditional;
 mod r#continue;
 mod control_flow_cleanup;
+mod do_block;
 mod expression_recovery;
 mod r#for;
 pub mod formatter;
@@ -43,6 +44,7 @@ mod repeat;
 pub mod replace_locals;
 mod result_group;
 mod r#return;
+mod scope_narrowing;
 mod set_list;
 mod side_effects;
 mod slot_folding;
@@ -65,6 +67,7 @@ pub use closure::*;
 pub use conditional::*;
 pub use r#continue::*;
 pub use control_flow_cleanup::*;
+pub use do_block::*;
 pub use expression_recovery::*;
 pub use r#for::*;
 pub use function_recovery::*;
@@ -78,6 +81,7 @@ pub use name_flow::*;
 pub use repeat::*;
 pub use result_group::*;
 pub use r#return::*;
+pub use scope_narrowing::*;
 pub use set_list::*;
 pub use side_effects::*;
 pub use slot_folding::*;
@@ -306,6 +310,7 @@ pub enum Statement {
     Assign(Assign),
     Class(Class),
     If(If),
+    Do(Do),
     Goto(Goto),
     Label(Label),
     While(While),
@@ -355,6 +360,7 @@ impl fmt::Display for Statement {
             Statement::Class(class) => write!(f, "{}", class),
             // TODO: STYLE: replace all `if_` with `r#if`, etc
             Statement::If(if_) => write!(f, "{}", if_),
+            Statement::Do(do_) => write!(f, "{}", do_),
             Statement::Goto(goto) => write!(f, "{}", goto),
             Statement::Label(label) => write!(f, "{}", label),
             Statement::While(while_) => write!(f, "{}", while_),

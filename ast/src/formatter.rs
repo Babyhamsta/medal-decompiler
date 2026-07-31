@@ -9,7 +9,7 @@ use itertools::Itertools;
 use crate::{
     Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Conditional, GenericFor, If,
     Index, LValue, Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement,
-    Table, Unary, While,
+    Do, Table, Unary, While,
 };
 
 #[derive(Clone, Copy)]
@@ -131,6 +131,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     pub(crate) fn statement_renders_multiline(statement: &Statement) -> bool {
         match statement {
             Statement::If(_)
+            | Statement::Do(_)
             | Statement::While(_)
             | Statement::Repeat(_)
             | Statement::NumericFor(_)
@@ -934,6 +935,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
 
+    pub(crate) fn format_do(&mut self, r#do: &Do) -> fmt::Result {
+        writeln!(self.output, "do")?;
+        self.format_block(&r#do.block.lock())?;
+        writeln!(self.output)?;
+        self.indent()?;
+        write!(self.output, "end")
+    }
+
     pub(crate) fn format_while(&mut self, r#while: &While) -> fmt::Result {
         write!(self.output, "while ")?;
 
@@ -1037,6 +1046,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             Statement::Assign(assign) => self.format_assign(assign),
             Statement::Class(class) => self.format_class(class),
             Statement::If(r#if) => self.format_if(r#if),
+            Statement::Do(r#do) => self.format_do(r#do),
             Statement::While(r#while) => self.format_while(r#while),
             Statement::Repeat(repeat) => self.format_repeat(repeat),
             Statement::NumericFor(numeric_for) => self.format_numeric_for(numeric_for),

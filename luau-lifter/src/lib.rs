@@ -624,6 +624,8 @@ fn decompile_chunk(
         profiling::checkpoint("parameter-names-propagated");
         name_locals(&mut body, false);
         profiling::checkpoint("locals-named");
+        ast::narrow_local_scopes(&mut body);
+        profiling::checkpoint("scopes-narrowed");
         let source = body.to_string();
         profiling::checkpoint("formatted");
         source

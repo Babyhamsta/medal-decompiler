@@ -137,6 +137,9 @@ impl BindingValidator {
                     Self::validate_block(&if_.then_block.lock(), &mut visible.clone())?;
                     Self::validate_block(&if_.else_block.lock(), &mut visible.clone())?;
                 }
+                Statement::Do(do_) => {
+                    Self::validate_block(&do_.block.lock(), &mut visible.clone())?;
+                }
                 Statement::While(while_) => {
                     Self::require_visible(
                         while_.condition.values_read(),
