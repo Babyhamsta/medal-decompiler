@@ -1,4 +1,5 @@
 mod deserializer;
+mod disasm;
 mod error;
 mod instruction;
 mod lifter;
@@ -53,6 +54,7 @@ static ALLOC: profiling::TrackingAllocator = profiling::TrackingAllocator;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub use disasm::{ProtoSelection, audit_calls, disassemble, list_prototypes};
 pub use profiling::report_to_stderr as report_profile;
 
 #[derive(Parser, Debug)]
