@@ -55,6 +55,10 @@ _PROBE_NAMES = (
     "30_aliased_slot_write",
     "31_nonconstant_slot_key",
     "32_slot_across_control_flow",
+    "33_slot_window_call",
+    "34_slot_live_after_read",
+    "35_slot_table_escapes",
+    "36_slot_effect_order",
 )
 
 TRUSTED_SEMANTIC_PROBES: Mapping[str, SemanticProbe] = MappingProxyType(
