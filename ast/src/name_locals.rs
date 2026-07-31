@@ -20,9 +20,20 @@ struct Evidence {
     /// The name suggested by the initializer's form, used only when no
     /// stronger evidence names this local.
     shape: Option<&'static str>,
-    /// Written through a computed index, which distinguishes an array used as
-    /// storage from a record with fixed fields.
+    /// Written through a computed index anywhere in the enclosing scope. Any
+    /// such write disqualifies the generic `result` role: a table mutated
+    /// through a computed key is doing more than being handed back verbatim.
     computed_index_writes: usize,
+    /// Written through a computed index specifically inside a loop. Only
+    /// this — not a single write anywhere — justifies promoting an empty
+    /// table's shape to `registers` (array/register-file semantics). A lone
+    /// `t[hash(key)] = v` outside a loop is a cache or hash table, not an
+    /// array being filled, and asserting `registers` for it would be a wrong
+    /// name, not just a generic one.
+    computed_index_writes_in_loop: usize,
+    /// Written through a string-literal key (`t.field = x`), the signal that
+    /// an initially empty table is a record with fixed fields rather than
+    /// array storage.
     constant_index_writes: usize,
 }
 
@@ -82,15 +93,65 @@ fn library_return_name(value: &RValue) -> Option<&'static str> {
     }
 }
 
+/// Arithmetic operators plain enough that, on their own with no length
+/// operand, they carry no more information than the counter they'd
+/// otherwise be named with — see `initializer_shape`'s `Binary` arm.
+fn is_plain_arithmetic(operation: crate::BinaryOperation) -> bool {
+    matches!(
+        operation,
+        crate::BinaryOperation::Add
+            | crate::BinaryOperation::Sub
+            | crate::BinaryOperation::Mul
+            | crate::BinaryOperation::Div
+            | crate::BinaryOperation::Mod
+            | crate::BinaryOperation::Pow
+            | crate::BinaryOperation::IDiv
+    )
+}
+
+/// True for a bare `#x`, or arithmetic combining one, such as `#offsets - 1`.
+/// False for arithmetic that never touches a length, such as `last - first`:
+/// that expression is not "nothing inferable" (it is visibly a difference of
+/// two named values) but it is not a count either, and guessing wrong here
+/// would assert something false about the code.
+fn is_count_expression(value: &RValue) -> bool {
+    match value {
+        RValue::Unary(unary) => matches!(unary.operation, crate::UnaryOperation::Length),
+        RValue::Binary(binary) if is_plain_arithmetic(binary.operation) => {
+            is_count_expression(&binary.left) || is_count_expression(&binary.right)
+        }
+        _ => false,
+    }
+}
+
 fn initializer_shape(value: &RValue) -> Option<&'static str> {
     match value {
         RValue::Closure(_) => Some("handler"),
         RValue::Literal(crate::Literal::String(_)) => Some("text"),
-        RValue::Binary(binary) if matches!(binary.operation, crate::BinaryOperation::Concat) => {
-            Some("text")
-        }
+        // A bare number/boolean/nil literal is already visible at the
+        // declaration site (`local value = 0` says no more than `local v2 =
+        // 0`), so it is deliberately left unclassified rather than forced
+        // into the catch-all below.
+        RValue::Literal(_) => None,
         RValue::Unary(unary) if matches!(unary.operation, crate::UnaryOperation::Length) => {
             Some("count")
+        }
+        RValue::Binary(binary) => {
+            if matches!(binary.operation, crate::BinaryOperation::Concat) {
+                Some("text")
+            } else if is_count_expression(value) {
+                Some("count")
+            } else if is_plain_arithmetic(binary.operation) {
+                // Outside both taxonomy rows: not a count (no length
+                // operand) and not "nothing inferable" either (it is
+                // visibly arithmetic on named operands). Left unclassified
+                // rather than mislabeled `value`.
+                None
+            } else {
+                // Comparisons and `and`/`or` short-circuits: genuinely
+                // nothing more specific is inferable.
+                Some("value")
+            }
         }
         RValue::Table(table) if table.0.is_empty() => Some("slots"),
         RValue::Table(table) => {
@@ -103,8 +164,10 @@ fn initializer_shape(value: &RValue) -> Option<&'static str> {
             Some(library_return_name(value).unwrap_or("result"))
         }
         RValue::MethodCall(_) => Some("result"),
-        RValue::Index(_) | RValue::Global(_) => Some("value"),
-        _ => None,
+        // Genuine catch-all: an index/global read, a bare local alias, a
+        // conditional, a vararg, or anything else with no more specific
+        // shape is still visibly a value, and naming it that is honest.
+        _ => Some("value"),
     }
 }
 
@@ -235,6 +298,7 @@ impl Namer {
         parameters: &FxHashSet<RcLocal>,
         evidence: &mut FxHashMap<RcLocal, Evidence>,
         structural_names: &mut FxHashMap<RcLocal, String>,
+        in_loop: bool,
     ) {
         for statement in &block.0 {
             for local in statement.values_read() {
@@ -272,10 +336,22 @@ impl Namer {
                         && let RValue::Local(container) = index.left.as_ref()
                     {
                         let container_evidence = evidence.entry(container.clone()).or_default();
-                        if matches!(index.right.as_ref(), RValue::Literal(_)) {
-                            container_evidence.constant_index_writes += 1;
-                        } else {
-                            container_evidence.computed_index_writes += 1;
+                        match index.right.as_ref() {
+                            // `t.field = x`: names a fixed field, the
+                            // record signal.
+                            RValue::Literal(crate::Literal::String(_)) => {
+                                container_evidence.constant_index_writes += 1;
+                            }
+                            // `t[1] = x`: a positional literal key asserts
+                            // neither array-building nor fixed-field intent
+                            // on its own, so it moves neither counter.
+                            RValue::Literal(_) => {}
+                            _ => {
+                                container_evidence.computed_index_writes += 1;
+                                if in_loop {
+                                    container_evidence.computed_index_writes_in_loop += 1;
+                                }
+                            }
                         }
                     }
 
@@ -318,6 +394,7 @@ impl Namer {
                         parameters,
                         evidence,
                         structural_names,
+                        true,
                     );
                 }
                 Statement::GenericFor(generic_for) => {
@@ -352,6 +429,7 @@ impl Namer {
                         parameters,
                         evidence,
                         structural_names,
+                        true,
                     );
                 }
                 Statement::If(r#if) => {
@@ -360,12 +438,14 @@ impl Namer {
                         parameters,
                         evidence,
                         structural_names,
+                        in_loop,
                     );
                     Self::collect_evidence(
                         &r#if.else_block.lock(),
                         parameters,
                         evidence,
                         structural_names,
+                        in_loop,
                     );
                 }
                 Statement::While(r#while) => Self::collect_evidence(
@@ -373,12 +453,14 @@ impl Namer {
                     parameters,
                     evidence,
                     structural_names,
+                    true,
                 ),
                 Statement::Repeat(repeat) => Self::collect_evidence(
                     &repeat.block.lock(),
                     parameters,
                     evidence,
                     structural_names,
+                    true,
                 ),
                 _ => {}
             }
@@ -460,9 +542,18 @@ impl Namer {
         let parameter_set = parameters.iter().cloned().collect::<FxHashSet<_>>();
         let mut evidence = FxHashMap::default();
         let mut structural_names = FxHashMap::default();
-        Self::collect_evidence(block, &parameter_set, &mut evidence, &mut structural_names);
+        Self::collect_evidence(
+            block,
+            &parameter_set,
+            &mut evidence,
+            &mut structural_names,
+            false,
+        );
         for evidence in evidence.values_mut() {
-            if evidence.table_initializer && evidence.returned && evidence.computed_index_writes == 0
+            if evidence.table_initializer
+                && evidence.returned
+                && evidence.computed_index_writes == 0
+                && evidence.constant_index_writes == 0
             {
                 evidence.roles.insert("result");
             }
@@ -476,7 +567,14 @@ impl Namer {
                 evidence.roles.clear();
                 evidence.roles.insert("callback");
             }
-            if evidence.shape == Some("slots") && evidence.computed_index_writes > 0 {
+            if evidence.shape == Some("slots") && evidence.constant_index_writes > 0 {
+                evidence.shape = Some("record");
+            }
+            // Loop-scoped, not just "anywhere": a single computed-index
+            // write outside a loop is a cache or hash table, and asserting
+            // array/register-file semantics for it would be a wrong name,
+            // not just a generic one.
+            if evidence.shape == Some("slots") && evidence.computed_index_writes_in_loop > 0 {
                 evidence.shape = Some("registers");
             }
         }
@@ -1041,12 +1139,35 @@ mod tests {
 
     #[test]
     fn a_local_with_no_inferable_shape_is_named_value_not_v1() {
+        // A bare local-to-local alias: none of the specific patterns
+        // (`Index`, `Global`, `Call`, ...) match it, so this only passes if
+        // `value` is a genuine catch-all rather than a couple of hardcoded
+        // cases.
         let unknown = local(None);
         let source = local(Some("source"));
         let mut block = Block(vec![
+            declaration(&unknown, source.clone().into()).into(),
+            Return::new(vec![unknown.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&unknown), "value");
+    }
+
+    #[test]
+    fn or_default_initializer_with_no_other_evidence_is_named_value() {
+        let unknown = local(None);
+        let parameter = local(None);
+        let mut block = Block(vec![
             declaration(
                 &unknown,
-                crate::Index::new(source.clone().into(), Literal::Number(1.0).into()).into(),
+                crate::Binary::new(
+                    parameter.clone().into(),
+                    Table::default().into(),
+                    crate::BinaryOperation::Or,
+                )
+                .into(),
             )
             .into(),
             Return::new(vec![unknown.clone().into()]).into(),
@@ -1055,5 +1176,120 @@ mod tests {
         name_locals(&mut block, false);
 
         assert_eq!(local_name(&unknown), "value");
+    }
+
+    #[test]
+    fn arithmetic_wrapping_a_length_is_named_count() {
+        let offsets = local(Some("offsets"));
+        let span = local(None);
+        let mut block = Block(vec![
+            declaration(
+                &span,
+                crate::Binary::new(
+                    crate::Unary::new(offsets.into(), crate::UnaryOperation::Length).into(),
+                    Literal::Number(1.0).into(),
+                    crate::BinaryOperation::Sub,
+                )
+                .into(),
+            )
+            .into(),
+            Return::new(vec![span.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&span), "count");
+    }
+
+    #[test]
+    fn plain_arithmetic_with_no_length_operand_is_left_unclassified() {
+        // `last - first`: visibly a computed difference, so it is not
+        // "nothing inferable" either — naming it `value` or `count` would
+        // both assert something the classifier cannot actually justify.
+        let first = local(Some("first"));
+        let last = local(Some("last"));
+        let span = local(None);
+        let mut block = Block(vec![
+            declaration(
+                &span,
+                crate::Binary::new(
+                    last.into(),
+                    first.into(),
+                    crate::BinaryOperation::Sub,
+                )
+                .into(),
+            )
+            .into(),
+            Return::new(vec![span.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_ne!(local_name(&span), "count");
+        assert_ne!(local_name(&span), "value");
+    }
+
+    #[test]
+    fn single_computed_index_write_outside_a_loop_does_not_claim_registers() {
+        // `t[hash(key)] = v; return t` — a cache or hash table, not an array
+        // being filled. Promoting this to `registers` would assert
+        // array/register-file semantics the code does not show.
+        let cache = local(None);
+        let key = local(None);
+        let mut block = Block(vec![
+            declaration(&cache, Table::default().into()).into(),
+            Assign::new(
+                vec![crate::Index::new(cache.clone().into(), key.into()).into()],
+                vec![Literal::Number(1.0).into()],
+            )
+            .into(),
+            Return::new(vec![cache.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_ne!(local_name(&cache), "registers");
+    }
+
+    #[test]
+    fn empty_table_filled_with_named_fields_is_named_record() {
+        let record = local(None);
+        let mut block = Block(vec![
+            declaration(&record, Table::default().into()).into(),
+            Assign::new(
+                vec![
+                    crate::Index::new(
+                        record.clone().into(),
+                        Literal::String(b"name".to_vec()).into(),
+                    )
+                    .into(),
+                ],
+                vec![Literal::String(b"value".to_vec()).into()],
+            )
+            .into(),
+            Return::new(vec![record.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&record), "record");
+    }
+
+    #[test]
+    fn positional_literal_index_write_does_not_claim_record() {
+        let list = local(None);
+        let mut block = Block(vec![
+            declaration(&list, Table::default().into()).into(),
+            Assign::new(
+                vec![crate::Index::new(list.clone().into(), Literal::Number(1.0).into()).into()],
+                vec![Literal::Number(2.0).into()],
+            )
+            .into(),
+            Return::new(vec![list.clone().into()]).into(),
+        ]);
+
+        name_locals(&mut block, false);
+
+        assert_ne!(local_name(&list), "record");
     }
 }
