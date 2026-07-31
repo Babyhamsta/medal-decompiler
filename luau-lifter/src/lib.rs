@@ -1,4 +1,5 @@
 mod deserializer;
+mod disasm;
 mod error;
 mod instruction;
 mod lifter;
@@ -53,6 +54,7 @@ static ALLOC: profiling::TrackingAllocator = profiling::TrackingAllocator;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub use disasm::{ProtoSelection, audit_calls, disassemble, list_prototypes};
 pub use profiling::report_to_stderr as report_profile;
 
 #[derive(Parser, Debug)]
@@ -510,7 +512,7 @@ fn decompile_chunk(
         let (function, upvalues_in, child_functions) =
             catch_phase(DecompilePhase::Lift, Some(func_id), None, || {
                 Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
-            })?;
+            })??;
         *remaining -= 1;
         if *remaining == 0 {
             release_lifted_prototype(&mut chunk.functions[func_id]);
@@ -1076,8 +1078,29 @@ fn decompile_function(
         })?;
 
     catch_phase(DecompilePhase::AstRecovery, Some(function_id), None, || {
-        ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
-        ast::recover_expressions_with_protected(&mut block, &upvalues_in);
+        // Slot folding exposes new single-use locals for expression
+        // recovery, and recovery exposes new adjacent slot writes. Iterating
+        // lets each feed the other; the cap bounds the work.
+        const RECOVERY_ROUNDS: usize = 4;
+        // A parameter can be reassigned a table literal, but the slots it
+        // held before that point belong to the caller's table. Folding never
+        // touches one.
+        let unfoldable = upvalues_in
+            .iter()
+            .chain(params.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for _ in 0..RECOVERY_ROUNDS {
+            let mut changes = 0;
+            changes += ast::eliminate_aliases_with_protected(&mut block, &upvalues_in);
+            changes += ast::fold_table_slots(&mut block, &unfoldable);
+            let recovered = ast::recover_expressions_with_protected(&mut block, &upvalues_in);
+            changes +=
+                recovered.conditionals + recovered.short_circuits + recovered.inlined_temporaries;
+            if changes == 0 {
+                break;
+            }
+        }
         ast::cleanup_control_flow(&mut block);
     })?;
 

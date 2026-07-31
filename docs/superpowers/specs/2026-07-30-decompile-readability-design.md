@@ -220,28 +220,126 @@ partial or best-effort path.
    target is an index expression counts as side-effecting, so a write
    through an alias of `T` blocks the fold without needing to prove the
    alias exists.
-5. No write to `T` anywhere in the function uses a computed key.
+5. **Removed after measurement.** Originally: no write to `T` anywhere in the
+   function uses a computed key. See below.
 6. `setmetatable` is never applied to `T` in this function.
 7. The write is removed only if that slot has no other read before it is
-   overwritten.
+   overwritten. `T` must additionally never escape — no use of `T` other
+   than as the base of a constant-key index — or this cannot be decided.
 
-### Why precondition 4 removes the need for escape analysis
+Precondition 1 also settles what counts as a constant key: an integral,
+finite `Number` literal, or a `String` literal. A non-integral or
+`i`-suffixed literal is treated as non-constant, since folding under a key
+whose runtime identity is uncertain is worse than not folding.
 
-`T` may have leaked to a closure before the fold window. Only a call can run
-that closure. Precondition 4 forbids any call between the write and the read,
-so no leaked reference can observe the slot in that window. This buys
-soundness without a whole-function escape analysis, and without the cost such
-an analysis would add to a phase that currently runs in 60 ms.
+### Why precondition 5 was removed
+
+Precondition 5 was recorded as subsumed when this design was written — see
+the subsection below, which still holds — and kept as "a cheap guard that
+costs nothing". Measured, it was not cheap: it rejected **386 of 720**
+candidate tables on the stage-27 capture, because every function there opens
+by copying varargs into its register table through a loop index. With it in
+place the pass folded nothing at all on real input.
+
+It is removed. A computed-key *write* no longer disqualifies a table. The
+soundness argument is the subsumption argument, restated against the four
+positions such a write can occupy relative to a fold of `T[K] = E` at `w`
+into a read at `r`:
+
+- **Before `w`.** Overwritten by `w` before anything in the window reads the
+  slot, on the back edge of a loop as well as on first entry.
+- **Between `w` and `r`, not carrying the read.** An assignment through an
+  index, so precondition 4 ends the window. This is the case precondition 5
+  was protecting, and precondition 4 already covers it.
+- **Carrying the read**, as in `T[i] = T[K]`. The read is taken from the
+  blocking statement before the scan stops. That statement may clobber
+  `T[K]` when `i == K`, so it does not count as redefining the slot, which
+  forces precondition 7 onto its stricter arm: `T[K]` must have no other
+  read in the function. The divergence is then unobservable.
+- **After `r`.** It cannot change a value already read, and any later read
+  is what precondition 7 is already checking.
+
+A computed-key *read* is not covered by this and still disqualifies the
+table: an unknown key could name the folded slot and make the read counts
+wrong.
+
+### What the folded value may read
+
+The value `E` must not read `T[K]`, the slot it is written to — after the
+write is removed, that read would see whatever the slot held before. It may
+read *other* slots of `T`. Nothing admitted between the write and the read
+can modify a table, and Luau evaluates every expression of an assignment
+before performing any store, so a sibling slot holds the same value at the
+read as it did at the write.
+
+This distinction is what makes `27_register_array_vm` fold. Forbidding `E`
+from reading `T` at all — the stricter reading — leaves that case, and most
+of the capture, untouched.
+
+### Escape analysis, and why this reasoning did not survive
+
+This document originally argued that precondition 4 removed the need for
+escape analysis: `T` may have leaked to a closure before the fold window, only
+a call can run that closure, and precondition 4 forbids any call between the
+write and the read — so no leaked reference could observe the slot in that
+window.
+
+That argument was insufficient. Implementation found two holes it does not
+cover. A table captured by `Upvalue::Copy` was never marked opaque at all,
+because `impl Traverse for Closure` is empty and captures live in
+`LocalRw::values_read` — so the closure body was never walked and its slot
+reads went uncounted. And precondition 7's liveness condition says nothing
+about reads that do not go through `T[K]`, so a table passed whole to a callee
+after the fold could observe a slot the fold had already removed.
+
+The pass therefore performs whole-function escape analysis. `foldable_tables`
+marks a table opaque on any bare-value use of `T` anywhere in the function,
+before or after the window, and the check is order-insensitive by design.
+
+Two further rules were added for hazards this list did not anticipate, both
+found during implementation and both load-bearing:
+
+**Evaluation order.** A folded value must not be reordered relative to side
+effects inside the read statement. `v[1] = produce(); sink = observe() + v[1]`
+must not fold to `sink = observe() + produce()`, which runs `produce()` after
+`observe()`. Guarded by `is_order_sensitive`, pinned by corpus case
+`36_slot_effect_order`.
+
+A blunt refusal on `has_side_effects()` is wrong here: `Index::has_side_effects`
+is `true` for every index, so a constant-key read of a table already proven
+non-escaping and metatable-free would count as an effect. That costs 404 folds
+and stops case 27 folding. Constant-key reads of foldable tables are exempt,
+which is sound on exactly the two properties the escape check and the
+table-literal binding already establish: no metatable, and no external
+reference.
+
+**Source overwrite.** `blocks_window` admits assignments to plain locals with
+pure values, and such a statement can overwrite a local the folded value
+*reads*. `v[1] = source; source = 5; sink = v[1]` must not fold to
+`sink = source`, which reads 5. Pinned by
+`keeps_the_write_when_the_values_source_is_overwritten`.
 
 ### The precondition least likely to survive contact
 
-Precondition 6 is the weak one. Verifying that `setmetatable` is never
-applied to `T` requires tracking every alias of `T`, and aliasing through a
-call argument is not tractable under the cheap analysis this phase can
-afford. The corpus case `29_slot_metatable` exists to determine empirically
-whether the conservative check is strict enough. If it is not, precondition 2
-tightens to require that `T` never appears as a bare argument to any call —
-losing some folds, keeping soundness.
+Precondition 6 was expected to be the weak one: verifying that `setmetatable`
+is never applied to `T` requires tracking every alias of `T`, and aliasing
+through a call argument is not tractable under the cheap analysis this phase
+can afford. The corpus case `29_slot_metatable` existed to determine
+empirically whether the conservative check is strict enough.
+
+**It survived, and the fallback was not needed.** The escape check that
+precondition 7 requires — `T` is never used other than as the base of a
+constant-key index — is strictly stronger than the proposed fallback, and it
+was already necessary for a different reason. `setmetatable(T, …)` has to
+name `T` as a bare value, so it cannot reach a table that passes the escape
+check. Precondition 6 remains in the implementation as an explicit guard,
+but it is subsumed exactly as precondition 5 was.
+
+The precondition that actually proved insufficient was **7**. As originally
+worded it says nothing about reads that do not go through `T[K]`, so a table
+handed to a call after the read satisfies every word of preconditions 1-7 and
+still folds to wrong code. The escape check closes it and is now part of the
+precondition's statement above.
 
 ### Constructor folding
 
@@ -459,7 +557,43 @@ rather than only shape:
 | `28_escaping_slot_table` | Table passed to a call mid-sequence — precondition 4 |
 | `29_slot_metatable` | `__index`/`__newindex` on the slot table — precondition 6 |
 | `30_aliased_slot_write` | Two locals bound to the same table — preconditions 2 and 4 |
-| `31_nonconstant_slot_key` | `t[i]` where `i` is computed — preconditions 1 and 5 |
+| `31_nonconstant_slot_key` | `t[i]` where `i` is computed — preconditions 1 and 4 |
+
+### Precondition 5 is subsumed, cannot be isolated, and was removed
+
+**Outcome: removed.** The reasoning below is what justified keeping it; it is
+also what justified dropping it once its cost was measured. It rejected 386
+of 720 candidate tables on the stage-27 capture and was the sole reason the
+pass folded nothing there. The removal is recorded under "Why precondition 5
+was removed" above; this subsection is kept because the argument is the
+argument.
+
+Precondition 5 (no write to `T` anywhere in the function uses a computed key)
+has no case of its own because no such case exists.
+
+Precondition 4 already treats *any* assignment whose target is an index
+expression as side-effecting, with no carve-out for computed versus constant
+keys. That covers every computed-key write inside a fold window. Outside the
+window, a computed-key write before the target write is overwritten by it, so
+folding stays safe; one after the read cannot retroactively change a value
+already read, and any later read of the same slot is blocked independently by
+preconditions 3 and 4.
+
+Two independent attempts to construct a program where precondition 5 is the
+only thing preventing a wrong fold failed, one of them checked against the
+concrete algorithm rather than this document. Precondition 5 is therefore
+redundant given preconditions 3 and 4.
+
+It was kept in the first implementation as a cheap explicit guard — a
+redundant check that costs nothing is worth keeping when the cost of being
+wrong is silently incorrect output — and it must not be counted as
+independently verified coverage, since no case can test it.
+
+"Costs nothing" was the part that did not survive measurement. A redundant
+check is free only if it rejects nothing that a sound pass would accept, and
+this one rejected more than half the candidates. The lesson worth carrying
+forward is that a guard argued redundant on paper should be *measured* before
+being called cheap.
 | `32_slot_across_control_flow` | Write in one branch, read after the join — precondition 3 |
 
 ### Real-file regression fixture
