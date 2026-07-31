@@ -525,10 +525,22 @@ fn find_fold(block: &Block, start: usize, foldable: &FxHashSet<RcLocal>, uses: &
     if !foldable.contains(&table) {
         return None;
     }
-    // Moving a value that reads the same table past the statements between
-    // the write and the read would re-read it at a different point in the
-    // sequence.
-    if value.values_read().into_iter().any(|local| *local == table) {
+    // A value that reads the slot it is being written to cannot move: after
+    // the write is removed, that read would see whatever the slot held
+    // before, not the value the fold is carrying.
+    //
+    // Reading a *different* slot of the same table is fine. Only an `Empty`,
+    // a `Comment`, or an assignment to plain locals with a side-effect-free
+    // value may sit between the write and the read, and none of those can
+    // write a table, so every other slot holds the same value at the read as
+    // it did at the write. When the read statement is itself an assignment,
+    // Luau evaluates all of its expressions before performing any store, so
+    // the moved value still observes pre-statement slots.
+    //
+    // The table is never opaque and never indexed by a computed key when
+    // read, so every read of it inside the value names one constant slot and
+    // this check sees all of them.
+    if count_slot_reads_rvalue(value, &table, &key) > 0 {
         return None;
     }
 
@@ -884,6 +896,57 @@ mod tests {
         assert_eq!(block.0.len(), 2);
         let merged = block.0[1].as_assign().unwrap();
         assert_eq!(merged.right, vec![RValue::Local(source)]);
+    }
+
+    /// A value may read a sibling slot: nothing that can sit between the
+    /// write and the read is able to modify one. This is the shape corpus
+    /// case `27_register_array_vm` is built from.
+    #[test]
+    fn folds_a_value_that_reads_another_slot() {
+        let registers = local(Some("registers"));
+        let source = local(Some("source"));
+        let halved = crate::Binary::new(
+            slot_read(&registers, 1.0),
+            Literal::Number(2.0).into(),
+            crate::BinaryOperation::Div,
+        );
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![source.clone().into()]).into(),
+            Assign::new(vec![slot(&registers, 3.0)], vec![halved.into()]).into(),
+            Assign::new(vec![slot(&registers, 3.0)], vec![slot_read(&registers, 3.0)]).into(),
+        ]);
+
+        // Two folds chain: `registers[3] = registers[1] / 2` moves into the
+        // statement below it, which overwrites the same slot, and then
+        // `registers[1] = source` moves into what is left.
+        assert_eq!(fold_table_slots(&mut block, &[]), 2);
+        assert_eq!(block.0.len(), 2);
+        let merged = block.0[1].as_assign().unwrap();
+        let RValue::Binary(binary) = &merged.right[0] else {
+            panic!("expected the folded value in a binary operation");
+        };
+        assert_eq!(*binary.left, RValue::Local(source));
+    }
+
+    /// But not its own slot: after the write is removed that read would see
+    /// whatever the slot held beforehand.
+    #[test]
+    fn keeps_the_write_when_the_value_reads_its_own_slot() {
+        let registers = local(Some("registers"));
+        let sink = local(Some("sink"));
+        let increment = crate::Binary::new(
+            slot_read(&registers, 1.0),
+            Literal::Number(1.0).into(),
+            crate::BinaryOperation::Add,
+        );
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![increment.into()]).into(),
+            Assign::new(vec![sink.into()], vec![slot_read(&registers, 1.0)]).into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 0);
     }
 
     /// A closure captures the table by copy. The binding is copied but the
