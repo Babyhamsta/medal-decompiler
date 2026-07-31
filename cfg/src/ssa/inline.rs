@@ -690,9 +690,9 @@ impl<'a> Inliner<'a> {
 
 /// Returns whether inlining rewrote anything.
 ///
-/// The scheduler previously answered that question by fingerprinting the whole
-/// function before and after this call. Reporting it directly removes two of
-/// the three full-AST fingerprints per reconstruction round.
+/// The scheduler needs this to decide whether another round is worthwhile.
+/// Reporting it directly lets it skip fingerprinting the whole function before
+/// and after the call, which costs two full-AST hashes per round.
 pub fn inline(
     function: &mut Function,
     local_to_group: &FxHashMap<ast::RcLocal, usize>,

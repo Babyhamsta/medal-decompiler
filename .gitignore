@@ -9,3 +9,5 @@ result.lua
 __pycache__/
 *.pyc
 .worktrees/
+docs/superpowers/
+.superpowers/

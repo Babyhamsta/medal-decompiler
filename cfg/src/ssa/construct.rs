@@ -715,8 +715,8 @@ pub fn construct(
     ),
     SsaError,
 > {
-    // if entry has predecessors, this might risk it never being incomplete
-    // resulting in broken params
+    // An entry block with predecessors may never be marked complete, which
+    // would leave its block parameters unresolved.
     // TODO: verify ^ and insert temporary entry that's removed if there is no block params (if its an issue)
     assert!(
         function
