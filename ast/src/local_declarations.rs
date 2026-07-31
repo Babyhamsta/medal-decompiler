@@ -69,6 +69,10 @@ impl LocalDeclarer {
                     let else_node = self.visit(r#if.else_block.clone(), stat_index);
                     self.graph.add_edge(if_node, else_node, ());
                 }
+                Statement::Do(r#do) => {
+                    let child = self.visit(r#do.block.clone(), stat_index);
+                    self.graph.add_edge(node, child, ());
+                }
                 Statement::While(r#while) => {
                     let child = self.visit(r#while.block.clone(), stat_index);
                     self.graph.add_edge(node, child, ());

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-from .model import CaseResult, CompileProfile, RunResult, RuntimeResult
+from .model import (
+    CaseResult,
+    CompileProfile,
+    ReadabilityMetrics,
+    RunResult,
+    RuntimeResult,
+)
 from .semantic import (
     TRUSTED_SEMANTIC_PROBES,
     run_semantic_probe,
@@ -74,6 +81,49 @@ def _output_metrics(output: str) -> tuple[int, int, int]:
     local_count = sum(line.lstrip().startswith("local ") for line in nonblank)
     goto_count = sum(line.lstrip().startswith("goto ") for line in nonblank)
     return len(nonblank), local_count, goto_count
+
+
+COLUMN_BUDGET = 120
+
+_PLACEHOLDER_LOCAL = re.compile(r"^[vp]\d+$")
+_SLOT_ASSIGNMENT = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\[(?:\d+|\"[^\"]*\")\]\s*="
+)
+
+
+def readability_metrics(output: str) -> ReadabilityMetrics:
+    """Count the output properties this work is trying to move.
+
+    These are diagnostics, not gates. A run is never failed for them; they
+    exist so "more readable" can be answered with a number.
+    """
+    blank_lines = 0
+    placeholder_locals = 0
+    slot_assignments = 0
+    long_lines = 0
+
+    for line in output.splitlines():
+        if not line.strip():
+            blank_lines += 1
+            continue
+        if len(line) > COLUMN_BUDGET:
+            long_lines += 1
+        stripped = line.strip()
+        if stripped.startswith("local "):
+            declared = stripped.removeprefix("local ").split("=", maxsplit=1)[0]
+            placeholder_locals += sum(
+                bool(_PLACEHOLDER_LOCAL.fullmatch(name.strip()))
+                for name in declared.split(",")
+            )
+        if _SLOT_ASSIGNMENT.match(stripped):
+            slot_assignments += 1
+
+    return ReadabilityMetrics(
+        blank_lines=blank_lines,
+        generated_placeholder_locals=placeholder_locals,
+        slot_assignments=slot_assignments,
+        long_lines=long_lines,
+    )
 
 
 def _is_identifier(value: str) -> bool:
@@ -264,6 +314,7 @@ def run_corpus(
             )
             statements, locals_count, gotos = _output_metrics(output_text)
             aliases = count_trivial_aliases(output_text)
+            readability = readability_metrics(output_text)
             results.append(
                 CaseResult(
                     case_name=source.stem,
@@ -282,6 +333,12 @@ def run_corpus(
                     source_runtime=source_runtime,
                     generated_runtime=generated_runtime,
                     semantic_match=semantic_match,
+                    blank_lines=readability.blank_lines,
+                    generated_placeholder_locals=(
+                        readability.generated_placeholder_locals
+                    ),
+                    slot_assignments=readability.slot_assignments,
+                    long_lines=readability.long_lines,
                 )
             )
 

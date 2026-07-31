@@ -4,6 +4,7 @@ from .model import (
     SECONDARY_PROFILES,
     CaseResult,
     CompileProfile,
+    ReadabilityMetrics,
     RuntimeResult,
     RunResult,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "SECONDARY_PROFILES",
     "CaseResult",
     "CompileProfile",
+    "ReadabilityMetrics",
     "RuntimeResult",
     "RunResult",
 ]

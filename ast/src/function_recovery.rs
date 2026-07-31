@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(block.len(), 2);
         assert_eq!(
             block.to_string(),
-            "local callback = nil\ncallback = function()\n\treturn callback\nend"
+            "local callback = nil\n\ncallback = function()\n\treturn callback\nend"
         );
     }
 
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(stats.local_functions, 1);
         assert_eq!(
             block.to_string(),
-            "local function run(value)\n\treturn value\nend\nreturn run"
+            "local function run(value)\n\treturn value\nend\n\nreturn run"
         );
     }
 

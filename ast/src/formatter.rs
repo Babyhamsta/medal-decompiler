@@ -9,9 +9,10 @@ use itertools::Itertools;
 use crate::{
     Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Conditional, GenericFor, If,
     Index, LValue, Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement,
-    Table, Unary, While,
+    Do, Table, Unary, While,
 };
 
+#[derive(Clone, Copy)]
 pub enum IndentationMode {
     Spaces(u8),
     Tab,
@@ -41,6 +42,13 @@ impl Default for IndentationMode {
         Self::Tab
     }
 }
+
+/// Line width at which an argument list is wrapped to one argument per
+/// line instead of staying on a single line. Folding (see `fold.rs`)
+/// merges statements together, which can push an argument list that was
+/// short on its own past a readable width; this is the only place that
+/// budget is enforced.
+const COLUMN_BUDGET: usize = 120;
 
 pub(crate) fn format_arg_list(list: &[RValue]) -> String {
     let mut s = String::new();
@@ -112,11 +120,86 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
 
+    fn value_renders_multiline(value: &RValue) -> bool {
+        match value {
+            RValue::Closure(closure) => !closure.function.lock().body.is_empty(),
+            RValue::Table(table) => Self::table_renders_multiline(table),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn statement_renders_multiline(statement: &Statement) -> bool {
+        match statement {
+            Statement::If(_)
+            | Statement::Do(_)
+            | Statement::While(_)
+            | Statement::Repeat(_)
+            | Statement::NumericFor(_)
+            | Statement::GenericFor(_) => true,
+            Statement::Assign(assign) => {
+                assign.right.iter().any(Self::value_renders_multiline)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_declaration(statement: &Statement) -> bool {
+        matches!(statement, Statement::Assign(assign) if assign.prefix)
+    }
+
+    /// Whether a blank line belongs between two adjacent statements.
+    ///
+    /// `declaration_run` is the number of declarations immediately preceding
+    /// `next`, so a block of locals can be separated from the work that uses
+    /// them without splitting the block itself.
+    ///
+    /// `preceding_count` is `next`'s index within its block, i.e. how many
+    /// statements come before it. A lone simple statement followed by
+    /// `return` (`preceding_count == 1`) reads as one thought and stays
+    /// tight; that carve-out only applies here because it is reached solely
+    /// when `previous` isn't itself multi-line — the multi-line check above
+    /// already returned `true` otherwise.
+    fn needs_blank_between(
+        previous: &Statement,
+        next: &Statement,
+        declaration_run: usize,
+        preceding_count: usize,
+    ) -> bool {
+        if matches!(previous, Statement::Comment(_) | Statement::Empty(_))
+            || matches!(next, Statement::Comment(_) | Statement::Empty(_))
+        {
+            return false;
+        }
+        if Self::statement_renders_multiline(previous)
+            || Self::statement_renders_multiline(next)
+        {
+            return true;
+        }
+        if matches!(next, Statement::Return(_)) {
+            return preceding_count != 1;
+        }
+        declaration_run >= 2 && !Self::is_declaration(next)
+    }
+
     fn format_block_no_indent(&mut self, block: &Block) -> fmt::Result {
+        let mut declaration_run = 0usize;
         for (i, statement) in block.iter().enumerate() {
             if i != 0 {
                 writeln!(self.output)?;
+                if Self::needs_blank_between(
+                    &block[i - 1],
+                    statement,
+                    declaration_run,
+                    i,
+                ) {
+                    writeln!(self.output)?;
+                }
             }
+            declaration_run = if Self::is_declaration(statement) {
+                declaration_run + 1
+            } else {
+                0
+            };
             self.format_statement(statement)?;
             if let Some(next_statement) =
                 block.iter().skip(i + 1).find(|s| s.as_comment().is_none())
@@ -249,13 +332,32 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         same_target.then_some((target, binary.operation, binary.right.as_ref()))
     }
 
+    /// Whether an already-compacted table (see
+    /// `Table::without_shadowed_literal_fields`) will have its fields placed
+    /// on their own lines.
+    ///
+    /// The blank-line predicate and the table writer must agree, so both
+    /// funnel through this one definition rather than each deciding for
+    /// themselves. Callers that haven't compacted their table yet should use
+    /// `table_renders_multiline` instead.
+    fn compacted_table_renders_multiline(compacted: &Table) -> bool {
+        let sequential_keys = Self::are_table_keys_sequential(compacted);
+        !compacted.0.is_empty() && (!sequential_keys || compacted.0.len() > 3)
+            || Self::contains_table(compacted)
+    }
+
+    /// Whether `format_table` will place this table's fields on their own
+    /// lines.
+    pub(crate) fn table_renders_multiline(table: &Table) -> bool {
+        Self::compacted_table_renders_multiline(&table.without_shadowed_literal_fields())
+    }
+
     pub(crate) fn format_table(&mut self, table: &Table) -> fmt::Result {
         let compacted = table.without_shadowed_literal_fields();
         let table = &compacted;
         let sequential_keys = Self::are_table_keys_sequential(table);
         let should_space = !table.0.is_empty();
-        let should_format = !table.0.is_empty() && (!sequential_keys || table.0.len() > 3)
-            || Self::contains_table(table);
+        let should_format = Self::compacted_table_renders_multiline(table);
         write!(self.output, "{{")?;
         if should_format {
             writeln!(self.output)?;
@@ -510,7 +612,54 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
     }
 
+    /// Number of columns `indent()` currently emits.
+    fn indentation_width(&self) -> usize {
+        let per_level = match self.indentation_mode {
+            IndentationMode::Spaces(spaces) => spaces as usize,
+            IndentationMode::Tab => 1,
+        };
+        per_level * self.indentation_level
+    }
+
     fn format_arg_list(&mut self, list: &[RValue]) -> fmt::Result {
+        // A single argument has no sibling to move off its line, so
+        // wrapping it can only add an indentation level without removing
+        // anything — never a net improvement under this column-only model
+        // (it has no notion of the call prefix sharing that line). Likewise
+        // an argument that already renders multiline (a table or closure
+        // with a body) contributes only its own short opening token to the
+        // shared line, so if the list is over budget with one of those
+        // present, the excess belongs to that argument's own content or to
+        // the call's prefix, not to the argument list — wrapping the list
+        // wouldn't fix it. Only multi-argument lists of otherwise
+        // single-line values are candidates.
+        //
+        // A cheap sum of each argument's own display length (no
+        // separators, no wrap parentheses) is enough to rule out the
+        // common case of a short list without paying for a scratch
+        // render.
+        if list.len() > 1 && !list.iter().any(Self::value_renders_multiline) {
+            let cheap_estimate = self.indentation_width()
+                + list.iter().map(|rvalue| rvalue.to_string().len()).sum::<usize>()
+                + (list.len() - 1) * ", ".len();
+            if cheap_estimate > COLUMN_BUDGET {
+                let mut scratch = String::new();
+                Formatter {
+                    indentation_level: self.indentation_level,
+                    indentation_mode: self.indentation_mode,
+                    output: &mut scratch,
+                }
+                .format_arg_list_inline(list)?;
+                if self.indentation_width() + scratch.len() > COLUMN_BUDGET {
+                    return self.format_arg_list_wrapped(list);
+                }
+                return write!(self.output, "{scratch}");
+            }
+        }
+        self.format_arg_list_inline(list)
+    }
+
+    fn format_arg_list_inline(&mut self, list: &[RValue]) -> fmt::Result {
         for (index, rvalue) in list.iter().enumerate() {
             if index + 1 == list.len() {
                 let wrap = matches!(rvalue, RValue::Select(_));
@@ -528,6 +677,30 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         Ok(())
     }
+
+    /// One argument per line, at one indentation level deeper than the
+    /// call itself. Leaves the cursor positioned right after `indent()` at
+    /// the call's own level, ready for the caller to close with `)`.
+    fn format_arg_list_wrapped(&mut self, list: &[RValue]) -> fmt::Result {
+        writeln!(self.output)?;
+        self.indentation_level += 1;
+        for (index, rvalue) in list.iter().enumerate() {
+            self.indent()?;
+            let is_last = index + 1 == list.len();
+            let wrap = is_last && matches!(rvalue, RValue::Select(_));
+            if wrap {
+                write!(self.output, "(")?;
+            }
+            self.format_rvalue(rvalue)?;
+            if wrap {
+                write!(self.output, ")")?;
+            }
+            writeln!(self.output, "{}", if is_last { "" } else { "," })?;
+        }
+        self.indentation_level -= 1;
+        self.indent()
+    }
+
     pub(crate) fn is_valid_name_in(name: &[u8], context: crate::IdentifierContext) -> bool {
         crate::is_valid_identifier_in(name, context)
     }
@@ -762,6 +935,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
 
+    pub(crate) fn format_do(&mut self, r#do: &Do) -> fmt::Result {
+        writeln!(self.output, "do")?;
+        self.format_block(&r#do.block.lock())?;
+        writeln!(self.output)?;
+        self.indent()?;
+        write!(self.output, "end")
+    }
+
     pub(crate) fn format_while(&mut self, r#while: &While) -> fmt::Result {
         write!(self.output, "while ")?;
 
@@ -865,6 +1046,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             Statement::Assign(assign) => self.format_assign(assign),
             Statement::Class(class) => self.format_class(class),
             Statement::If(r#if) => self.format_if(r#if),
+            Statement::Do(r#do) => self.format_do(r#do),
             Statement::While(r#while) => self.format_while(r#while),
             Statement::Repeat(repeat) => self.format_repeat(repeat),
             Statement::NumericFor(numeric_for) => self.format_numeric_for(numeric_for),
@@ -884,9 +1066,9 @@ mod tests {
     use triomphe::Arc;
 
     use crate::{
-        Assign, Binary, BinaryOperation, Block, Call, Closure, Conditional, Function, Global,
-        Index, LValue, Literal, Local, MethodCall, RValue, RcLocal, ResultDemand, Return, Select,
-        Table, Upvalue, VarArg,
+        Assign, Binary, BinaryOperation, Block, Call, Closure, Comment, Conditional, Empty,
+        Function, Global, Index, LValue, Literal, Local, MethodCall, NumericFor, RValue, RcLocal,
+        ResultDemand, Return, Select, Table, Upvalue, VarArg,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -1187,5 +1369,238 @@ mod tests {
         assign.prefix = true;
 
         assert!(assign.to_string().starts_with("local function recurse()"));
+    }
+
+    #[test]
+    fn blank_line_separates_a_multiline_statement_from_its_neighbours() {
+        let counter = local("i");
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Assign::new(vec![local("c").into()], vec![Literal::Number(3.0).into()]).into(),
+        ]);
+
+        let formatted = block.to_string();
+
+        assert_eq!(
+            formatted,
+            "a = 1\n\nfor i = 1, 2 do\n\tb = 2\nend\n\nc = 3"
+        );
+    }
+
+    #[test]
+    fn consecutive_single_line_statements_stay_tight() {
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
+            Assign::new(vec![local("c").into()], vec![Literal::Number(3.0).into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\nb = 2\nc = 3");
+    }
+
+    #[test]
+    fn two_statement_body_return_stays_tight() {
+        // A single simple statement immediately followed by `return` reads
+        // as one thought (e.g. `self.middleware[...] = p1` then
+        // `return self`), so no blank line is inserted here even though
+        // `return` follows other work in general.
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\nreturn a");
+    }
+
+    #[test]
+    fn three_statement_body_keeps_blank_before_return() {
+        let block = Block(vec![
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+            Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()]).into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "a = 1\nb = 2\n\nreturn a");
+    }
+
+    #[test]
+    fn multiline_first_statement_then_return_keeps_blank() {
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Return::new(vec![local("a").into()]).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n\nreturn a"
+        );
+    }
+
+    #[test]
+    fn a_lone_return_gains_no_leading_blank_line() {
+        let block = Block(vec![Return::new(vec![local("a").into()]).into()]);
+
+        assert_eq!(block.to_string(), "return a");
+    }
+
+    #[test]
+    fn empty_closure_value_is_not_treated_as_multiline() {
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function::default()))),
+            upvalues: Vec::new(),
+        };
+        let block = Block(vec![
+            Assign::new(vec![local("f").into()], vec![closure.into()]).into(),
+            Assign::new(vec![local("g").into()], vec![Literal::Number(1.0).into()]).into(),
+        ]);
+
+        assert_eq!(block.to_string(), "f = function() end\ng = 1");
+    }
+
+    #[test]
+    fn comment_before_multiline_statement_suppresses_blank_line() {
+        let counter = local("i");
+        let block = Block(vec![
+            Comment::new("note".to_owned()).into(),
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "-- note\nfor i = 1, 2 do\n\tb = 2\nend"
+        );
+    }
+
+    #[test]
+    fn comment_after_multiline_statement_suppresses_blank_line() {
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Comment::new("note".to_owned()).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n-- note"
+        );
+    }
+
+    #[test]
+    fn empty_statement_neighbour_suppresses_blank_line_on_both_sides() {
+        // Without the comment/empty suppression, the transition out of the
+        // multi-line `for` loop would gain a second blank line on top of the
+        // one the `Empty` statement's own (content-free) line already reads
+        // as.
+        let counter = local("i");
+        let block = Block(vec![
+            NumericFor::new(
+                Literal::Number(1.0).into(),
+                Literal::Number(2.0).into(),
+                Literal::Number(1.0).into(),
+                counter,
+                Block(vec![
+                    Assign::new(vec![local("b").into()], vec![Literal::Number(2.0).into()])
+                        .into(),
+                ]),
+            )
+            .into(),
+            Empty {}.into(),
+            Assign::new(vec![local("a").into()], vec![Literal::Number(1.0).into()]).into(),
+        ]);
+
+        assert_eq!(
+            block.to_string(),
+            "for i = 1, 2 do\n\tb = 2\nend\n\na = 1"
+        );
+    }
+
+    #[test]
+    fn an_argument_list_past_the_column_budget_wraps_one_per_line() {
+        let call = Call::new(
+            local("someFunctionWithAVeryLongName").into(),
+            (0..8)
+                .map(|index| {
+                    RValue::Local(local(&format!("argumentNumber{index}WithALongName")))
+                })
+                .collect(),
+        );
+        let block = Block(vec![call.into()]);
+
+        let formatted = block.to_string();
+
+        assert!(formatted.contains(",\n"));
+        assert!(formatted.lines().all(|line| line.len() <= 120));
+    }
+
+    #[test]
+    fn a_short_argument_list_stays_on_one_line() {
+        let call = Call::new(local("f").into(), vec![local("a").into(), local("b").into()]);
+        let block = Block(vec![call.into()]);
+
+        assert_eq!(block.to_string(), "f(a, b)");
+    }
+
+    #[test]
+    fn a_single_huge_string_argument_is_never_wrapped_and_stays_intact() {
+        // A single argument can never gain a sibling to strip off its line
+        // (`format_arg_list` requires `list.len() > 1` to even consider
+        // wrapping), so this holds by construction. Pinned anyway: a Lua
+        // string cannot be split without inserting `..`, which would change
+        // the AST, so this call staying on one line — with the string
+        // untouched — is the property that makes this whole feature
+        // formatter-only. This must never regress silently.
+        let huge = "x".repeat(300);
+        let call = Call::new(
+            local("f").into(),
+            vec![RValue::Literal(Literal::String(huge.clone().into_bytes()))],
+        );
+        let block = Block(vec![call.into()]);
+
+        let formatted = block.to_string();
+
+        assert!(!formatted.contains(",\n"));
+        assert!(formatted.contains(&huge));
     }
 }
