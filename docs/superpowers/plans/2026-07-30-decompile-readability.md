@@ -2632,12 +2632,12 @@ Expected: `Cases: 96; compile failures: 0; decompile failures: 0; recompile fail
 
 ```bash
 ./target/release/luau-lifter.exe "$MEDAL_BIG_FIXTURE" > /tmp/folded.lua
-./.tools/luau-windows/luau-analyze.exe /tmp/folded.lua | tail -5
+./.tools/luau-windows/luau-compile.exe --binary /tmp/folded.lua > /dev/null; echo "exit=$?"
 wc -l /tmp/folded.lua
 python tools/measure_decompiler.py --runs 3
 ```
 
-Expected: `luau-analyze` parses the output. Line count drops well below 248,778 — the spec's estimate is roughly 40%. Wall clock under 16.0 s, `ast-recovery` under 1.0 s.
+Expected: `luau-compile --binary` exits 0. NOTE: `luau-analyze` does NOT finish within 300 s on a 5.5 MB file, so it is not a usable check at this size; the compiler validates the whole output in under a second. Line count drops well below 248,778 — the spec's estimate is roughly 40%. Wall clock under 16.0 s, `ast-recovery` under 1.0 s.
 
 If `ast-recovery` exceeds 1.0 s, the scan is doing more work than the cap allows. Check that `find_fold` aborts at the first blocking statement rather than scanning the full window every time.
 
@@ -2887,7 +2887,7 @@ Expected: PASS.
 ```bash
 python tools/measure_decompiler.py --runs 3
 ./target/release/luau-lifter.exe "$MEDAL_BIG_FIXTURE" > /tmp/final.lua
-./.tools/luau-windows/luau-analyze.exe /tmp/final.lua | tail -3
+./.tools/luau-windows/luau-compile.exe --binary /tmp/final.lua > /dev/null; echo "exit=$?"
 wc -l /tmp/final.lua
 grep -c '^$' /tmp/final.lua
 grep -cE '^\s*local v[0-9]+' /tmp/final.lua
