@@ -159,7 +159,7 @@ fn main() -> anyhow::Result<()> {
 
     // TODO: use BufWriter?
     let mut out = File::create(path.with_extension("dec.51.lua").file_name().unwrap())?;
-    writeln!(out, "-- decompiled by Sentinel (took {:?})", duration)?;
+    writeln!(out, "-- Decompiled by Devirt.me (took {:?})", duration)?;
     writeln!(out, "{}", res)?;
 
     Ok(())
