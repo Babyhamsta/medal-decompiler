@@ -80,6 +80,7 @@ impl fmt::Display for Assign {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_assign(self)
     }

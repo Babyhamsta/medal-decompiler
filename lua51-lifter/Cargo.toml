@@ -25,7 +25,11 @@ by_address = "1.1.0"
 rayon = "1.5.3"
 triomphe = "0.1.8"
 parking_lot = "0.12.1"
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
+default = ["mimalloc"]
 dhat-heap = []
 panic-handled = []
+mimalloc = ["dep:mimalloc"]
+verify-inline-change = []

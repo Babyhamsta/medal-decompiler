@@ -29,11 +29,20 @@ fn single_local_assignment(block: &Block) -> Option<(RcLocal, RValue)> {
 fn recover_nested(
     statement: &mut Statement,
     protected: &FxHashSet<RcLocal>,
+    allow_conditional_expressions: bool,
 ) -> ExpressionRecoveryStats {
     match statement {
         Statement::If(value) => {
-            let then_stats = recover_block(&mut value.then_block.lock(), protected);
-            let else_stats = recover_block(&mut value.else_block.lock(), protected);
+            let then_stats = recover_block(
+                &mut value.then_block.lock(),
+                protected,
+                allow_conditional_expressions,
+            );
+            let else_stats = recover_block(
+                &mut value.else_block.lock(),
+                protected,
+                allow_conditional_expressions,
+            );
             ExpressionRecoveryStats {
                 conditionals: then_stats.conditionals + else_stats.conditionals,
                 short_circuits: then_stats.short_circuits + else_stats.short_circuits,
@@ -41,10 +50,26 @@ fn recover_nested(
                     + else_stats.inlined_temporaries,
             }
         }
-        Statement::While(value) => recover_block(&mut value.block.lock(), protected),
-        Statement::Repeat(value) => recover_block(&mut value.block.lock(), protected),
-        Statement::NumericFor(value) => recover_block(&mut value.block.lock(), protected),
-        Statement::GenericFor(value) => recover_block(&mut value.block.lock(), protected),
+        Statement::While(value) => recover_block(
+            &mut value.block.lock(),
+            protected,
+            allow_conditional_expressions,
+        ),
+        Statement::Repeat(value) => recover_block(
+            &mut value.block.lock(),
+            protected,
+            allow_conditional_expressions,
+        ),
+        Statement::NumericFor(value) => recover_block(
+            &mut value.block.lock(),
+            protected,
+            allow_conditional_expressions,
+        ),
+        Statement::GenericFor(value) => recover_block(
+            &mut value.block.lock(),
+            protected,
+            allow_conditional_expressions,
+        ),
         _ => ExpressionRecoveryStats::default(),
     }
 }
@@ -597,14 +622,18 @@ fn try_extend_short_circuit(
     true
 }
 
-fn recover_block(block: &mut Block, protected: &FxHashSet<RcLocal>) -> ExpressionRecoveryStats {
+fn recover_block(
+    block: &mut Block,
+    protected: &FxHashSet<RcLocal>,
+    allow_conditional_expressions: bool,
+) -> ExpressionRecoveryStats {
     let mut stats = ExpressionRecoveryStats::default();
     for statement in &mut block.0 {
-        let nested = recover_nested(statement, protected);
+        let nested = recover_nested(statement, protected, allow_conditional_expressions);
         stats.conditionals += nested.conditionals;
         stats.short_circuits += nested.short_circuits;
         stats.inlined_temporaries += nested.inlined_temporaries;
-        if try_recover_conditional(statement) {
+        if allow_conditional_expressions && try_recover_conditional(statement) {
             stats.conditionals += 1;
         }
     }
@@ -636,7 +665,16 @@ pub fn recover_expressions_with_protected(
 ) -> ExpressionRecoveryStats {
     let mut protected = protected.iter().cloned().collect::<FxHashSet<_>>();
     crate::alias_elimination::collect_reference_captures(block, &mut protected);
-    recover_block(block, &protected)
+    recover_block(block, &protected, true)
+}
+
+pub fn recover_expressions_lua51(
+    block: &mut Block,
+    protected: &[RcLocal],
+) -> ExpressionRecoveryStats {
+    let mut protected = protected.iter().cloned().collect::<FxHashSet<_>>();
+    crate::alias_elimination::collect_reference_captures(block, &mut protected);
+    recover_block(block, &protected, false)
 }
 
 #[cfg(test)]
@@ -644,7 +682,7 @@ mod tests {
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Global, If, LValue, Literal, Local,
         MethodCall, RValue, RcLocal, Return, Select, Unary, UnaryOperation,
-        recover_expressions_with_protected,
+        recover_expressions_lua51, recover_expressions_with_protected,
     };
 
     fn local(name: &str) -> RcLocal {
@@ -676,6 +714,25 @@ mod tests {
             block.to_string(),
             "result = if condition then false else fallback()"
         );
+    }
+
+    #[test]
+    fn lua51_keeps_statement_conditional_syntax() {
+        let condition = local("condition");
+        let result = local("result");
+        let mut block = Block(vec![
+            If::new(
+                condition.into(),
+                Block(vec![assign(&result, Literal::Boolean(false).into())]),
+                Block(vec![assign(&result, Literal::Boolean(true).into())]),
+            )
+            .into(),
+        ]);
+
+        let stats = recover_expressions_lua51(&mut block, &[]);
+
+        assert_eq!(stats.conditionals, 0);
+        assert!(block[0].as_if().is_some());
     }
 
     #[test]

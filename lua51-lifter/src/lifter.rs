@@ -1,5 +1,8 @@
+use std::{cmp::Reverse, collections::BinaryHeap};
+
 use by_address::ByAddress;
 use cfg::block::{BlockEdge, BranchType};
+use cfg::provenance::{OriginSet, SourceOrigin};
 use either::Either;
 
 use itertools::Itertools;
@@ -18,23 +21,62 @@ use petgraph::{Direction, stable_graph::NodeIndex, visit::EdgeRef};
 
 use triomphe::Arc;
 
+const VARARG_ISVARARG: u8 = 2;
+const VARARG_NEEDSARG: u8 = 4;
+
 pub struct Lifter<'a, 'b> {
     bytecode: &'a BytecodeFunction<'a>,
     nodes: FxHashMap<usize, NodeIndex>,
-    insert_between: FxHashMap<NodeIndex, (NodeIndex, Statement)>,
+    insert_between: FxHashMap<NodeIndex, (NodeIndex, Statement, OriginSet)>,
+    statement_origins: FxHashMap<NodeIndex, Vec<OriginSet>>,
     locals: FxHashMap<Register, RcLocal>,
     constants: FxHashMap<usize, ast::Literal>,
     function: Function,
     upvalues: Vec<RcLocal>,
-    lifted_functions: &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>)>,
+    lifted_functions:
+        &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>, bool)>,
+    next_function_id: &'b mut usize,
 }
 
 impl<'a, 'b> Lifter<'a, 'b> {
+    fn debug_name(bytes: &[u8]) -> Option<String> {
+        ast::is_valid_identifier(bytes)
+            .then(|| std::str::from_utf8(bytes).ok().map(str::to_owned))
+            .flatten()
+    }
+
+    fn debug_lifetimes_by_register(&self) -> Vec<Vec<cfg::provenance::DebugLifetime>> {
+        let mut lifetimes = vec![Vec::new(); usize::from(self.bytecode.maximum_stack_size)];
+        let mut active_ends = BinaryHeap::new();
+        for local in &self.bytecode.locals {
+            while active_ends
+                .peek()
+                .is_some_and(|Reverse(end)| *end <= local.range.start)
+            {
+                active_ends.pop();
+            }
+            if local.range.start < local.range.end {
+                lifetimes[active_ends.len()].push(cfg::provenance::DebugLifetime::new(
+                    local.name.to_vec(),
+                    local.range.start as usize,
+                    local.range.end as usize,
+                ));
+                active_ends.push(Reverse(local.range.end));
+            }
+        }
+        lifetimes
+    }
+
     fn allocate_locals(&mut self) {
         self.upvalues
             .reserve(self.bytecode.number_of_upvalues as usize);
         for index in 0..self.bytecode.number_of_upvalues {
-            let local = RcLocal::default();
+            let local = RcLocal::new(ast::Local::new(
+                self.bytecode
+                    .upvalues
+                    .get(index as usize)
+                    .and_then(|name| Self::debug_name(name)),
+            ));
             self.function.set_binding(
                 local.clone(),
                 cfg::provenance::BindingIdentity::Upvalue {
@@ -47,8 +89,25 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
         self.locals
             .reserve(self.bytecode.maximum_stack_size as usize);
+        let mut debug_lifetimes = self.debug_lifetimes_by_register();
         for i in 0..self.bytecode.maximum_stack_size {
-            let local = RcLocal::default();
+            let register_lifetimes = std::mem::take(&mut debug_lifetimes[i as usize]);
+            let is_legacy_arg = self.bytecode.vararg_flag & VARARG_NEEDSARG != 0
+                && i == self.bytecode.number_of_parameters;
+            let name = if is_legacy_arg {
+                Some("arg".to_owned())
+            } else {
+                match register_lifetimes.as_slice() {
+                    [lifetime]
+                        if lifetime.start_instruction == 0
+                            && lifetime.end_instruction == self.bytecode.code.len() =>
+                    {
+                        Self::debug_name(&lifetime.name)
+                    }
+                    _ => None,
+                }
+            };
+            let local = RcLocal::new(ast::Local::new(name));
             let binding = if i < self.bytecode.number_of_parameters {
                 cfg::provenance::BindingIdentity::parameter(self.function.id, i as usize)
             } else {
@@ -60,10 +119,10 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     self.function.id,
                     i as usize,
                     binding,
-                    Vec::new(),
+                    register_lifetimes,
                 ),
             );
-            if i < self.bytecode.number_of_parameters {
+            if i < self.bytecode.number_of_parameters || is_legacy_arg {
                 self.function.parameters.push(local.clone());
             }
             self.locals.insert(Register(i), local);
@@ -77,12 +136,6 @@ impl<'a, 'b> Lifter<'a, 'b> {
         self.nodes.insert(0, self.function.new_block());
         for (insn_index, insn) in self.bytecode.code.iter().enumerate() {
             match *insn {
-                Instruction::SetList {
-                    block_number: 0, ..
-                } => {
-                    // TODO: skip next instruction
-                    todo!();
-                }
                 Instruction::LoadBoolean {
                     skip_next: true, ..
                 } => {
@@ -172,15 +225,48 @@ impl<'a, 'b> Lifter<'a, 'b> {
         }
     }
 
+    fn source_origin(&self, instruction: usize) -> OriginSet {
+        let source_line = self
+            .bytecode
+            .positions
+            .get(instruction)
+            .and_then(|position| usize::try_from(position.source).ok());
+        [SourceOrigin::new(
+            self.function.id,
+            instruction,
+            source_line,
+            "Lua51",
+        )]
+        .into()
+    }
+
+    fn synthetic_origin(&self, opcode: &'static str) -> OriginSet {
+        [SourceOrigin::new(
+            self.function.id,
+            self.bytecode.code.len(),
+            None,
+            opcode,
+        )]
+        .into()
+    }
+
     // TODO: rename to one of: lift_instructions, lift_range, lift_instruction_range, lift_block?
-    fn lift_instruction(&mut self, start: usize, end: usize, statements: &mut Vec<Statement>) {
+    fn lift_instruction(
+        &mut self,
+        start: usize,
+        end: usize,
+        statements: &mut Vec<Statement>,
+        origins: &mut Vec<OriginSet>,
+    ) {
         if end > start {
             statements.reserve(end - start + 1);
         }
         let mut top: Option<(ast::RValue, u8)> = None;
         // TODO: we should consume the instructions, reducing clones
-        let mut iter = self.bytecode.code[start..=end].iter();
-        while let Some(instruction) = iter.next() {
+        let mut iter = self.bytecode.code[start..=end].iter().enumerate();
+        while let Some((offset, instruction)) = iter.next() {
+            let instruction_index = start + offset;
+            let statement_start = statements.len();
             match instruction {
                 Instruction::Move {
                     destination,
@@ -504,10 +590,15 @@ impl<'a, 'b> Lifter<'a, 'b> {
                         vec![value.clone()],
                     );
 
-                    self.function
-                        .block_mut(self.nodes[&(end + 1)])
-                        .unwrap()
-                        .push(assign.into());
+                    let origin = self.source_origin(instruction_index);
+                    assert!(
+                        self.insert_between
+                            .insert(
+                                self.nodes[&start],
+                                (self.nodes[&(end + 1)], assign.into(), origin),
+                            )
+                            .is_none()
+                    );
                 }
                 &Instruction::PrepMethodCall {
                     destination,
@@ -535,11 +626,6 @@ impl<'a, 'b> Lifter<'a, 'b> {
                 &Instruction::TailCall {
                     function,
                     arguments,
-                }
-                | &Instruction::Call {
-                    function,
-                    arguments,
-                    ..
                 } => {
                     let arguments = if arguments != 0 {
                         (function.0 + 1..function.0 + arguments)
@@ -554,10 +640,27 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     };
 
                     let call = ast::Call::new(self.locals[&function].clone().into(), arguments);
+                    statements.push(ast::Return::new(vec![call.into()]).into());
+                }
+                &Instruction::Call {
+                    function,
+                    arguments,
+                    return_values,
+                } => {
+                    let arguments = if arguments != 0 {
+                        (function.0 + 1..function.0 + arguments)
+                            .map(|r| self.locals[&Register(r)].clone().into())
+                            .collect()
+                    } else {
+                        let top = top.take().unwrap();
+                        (function.0 + 1..top.1)
+                            .map(|r| self.locals[&Register(r)].clone().into())
+                            .chain(std::iter::once(top.0))
+                            .collect()
+                    };
 
-                    if let &Instruction::Call { return_values, .. } = instruction
-                        && return_values != 0
-                    {
+                    let call = ast::Call::new(self.locals[&function].clone().into(), arguments);
+                    if return_values != 0 {
                         if return_values == 1 {
                             statements.push(call.into());
                         } else {
@@ -624,7 +727,8 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
                     let mut upvalues_passed = Vec::with_capacity(closure.number_of_upvalues.into());
                     for _ in 0..closure.number_of_upvalues {
-                        let local = match iter.next().as_ref().unwrap() {
+                        let (_, capture) = iter.next().unwrap();
+                        let local = match capture {
                             Instruction::Move {
                                 destination: _,
                                 source,
@@ -640,9 +744,14 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
                     let ast_function = Arc::<Mutex<_>>::default();
 
-                    let (function, upvalues) = Lifter::lift(closure, self.lifted_functions);
-                    self.lifted_functions
-                        .push((ast_function.clone(), function, upvalues));
+                    let (function, upvalues, has_legacy_arg) =
+                        Lifter::lift(closure, self.lifted_functions, self.next_function_id);
+                    self.lifted_functions.push((
+                        ast_function.clone(),
+                        function,
+                        upvalues,
+                        has_legacy_arg,
+                    ));
 
                     statements.push(
                         ast::Assign::new(
@@ -749,6 +858,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
                             .checked_add_signed(skip.try_into().unwrap())
                             .unwrap()),
                     );
+                    let origin = self.source_origin(instruction_index);
                     assert!(
                         self.insert_between
                             .insert(
@@ -759,7 +869,8 @@ impl<'a, 'b> Lifter<'a, 'b> {
                                         vec![external_counter.into()],
                                         vec![internal_counter.into()],
                                     )
-                                    .into()
+                                    .into(),
+                                    origin,
                                 )
                             )
                             .is_none()
@@ -807,6 +918,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     );
 
                     let body_node = self.get_node(&(end + 1));
+                    let origin = self.source_origin(instruction_index);
                     assert!(
                         self.insert_between
                             .insert(
@@ -817,15 +929,25 @@ impl<'a, 'b> Lifter<'a, 'b> {
                                         vec![internal_control.clone().into()],
                                         vec![control.clone().into()],
                                     )
-                                    .into()
+                                    .into(),
+                                    origin,
                                 )
                             )
                             .is_none()
                     );
                 }
+                Instruction::ExtraWord(_) => {}
             }
 
-            if matches!(instruction, Instruction::Return { .. }) {
+            let origin = self.source_origin(instruction_index);
+            origins.extend(
+                std::iter::repeat_n(origin, statements.len().saturating_sub(statement_start)),
+            );
+
+            if matches!(
+                instruction,
+                Instruction::Return { .. } | Instruction::TailCall { .. }
+            ) {
                 break;
             }
         }
@@ -839,13 +961,20 @@ impl<'a, 'b> Lifter<'a, 'b> {
     fn lift_blocks(&mut self) {
         let ranges = self.code_ranges();
         for (start, end) in ranges {
+            if start == self.bytecode.code.len() {
+                self.statement_origins
+                    .insert(self.nodes[&start], Vec::new());
+                continue;
+            }
             // TODO: gotta be a better way
             // we need to do this in case that the body of a for loop is after the for loop instruction
             // see: IterateNumericForLoop
             let mut statements =
                 std::mem::take(self.function.block_mut(self.nodes[&start]).unwrap());
-            self.lift_instruction(start, end, &mut statements);
+            let mut origins = Vec::new();
+            self.lift_instruction(start, end, &mut statements, &mut origins);
             *self.function.block_mut(self.nodes[&start]).unwrap() = statements;
+            self.statement_origins.insert(self.nodes[&start], origins);
 
             match self.bytecode.code[end] {
                 Instruction::Equal { .. }
@@ -891,7 +1020,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
                         )],
                     );
                 }
-                Instruction::Return { .. } => {}
+                Instruction::Return { .. } | Instruction::TailCall { .. } => {}
                 Instruction::LoadBoolean { skip_next, .. } => {
                     let successor = self.get_node(&(end + 1 + skip_next as usize));
                     self.function.set_edges(
@@ -916,17 +1045,27 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
     pub fn lift(
         bytecode: &'a BytecodeFunction,
-        lifted_functions: &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>)>,
-    ) -> (Function, Vec<RcLocal>) {
+        lifted_functions:
+            &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>, bool)>,
+        next_function_id: &'b mut usize,
+    ) -> (Function, Vec<RcLocal>, bool) {
+        let function_id = *next_function_id;
+        *next_function_id = next_function_id
+            .checked_add(1)
+            .expect("function identifier overflow");
+        let mut function = Function::new(function_id);
+        function.is_variadic = bytecode.vararg_flag & VARARG_ISVARARG != 0;
         let mut context = Self {
             bytecode,
             nodes: FxHashMap::default(),
             insert_between: FxHashMap::default(),
+            statement_origins: FxHashMap::default(),
             locals: FxHashMap::default(),
             constants: FxHashMap::default(),
-            function: Function::new(0),
+            function,
             upvalues: Vec::new(),
             lifted_functions,
+            next_function_id,
         };
 
         context.create_block_map();
@@ -936,6 +1075,8 @@ impl<'a, 'b> Lifter<'a, 'b> {
         // TODO: STYLE: instead of naming NodeIndex vars `{}_node`, we should name them
         // `{}_index`, or if it's the corresponding var for `block`, `block_index`
         let stack_init_node = context.function.new_block();
+        let stack_init_origin = context.synthetic_origin("Lua51StackInit");
+        let mut stack_init_origins = Vec::new();
         let stack_init_block = context.function.block_mut(stack_init_node).unwrap();
         stack_init_block.reserve(context.locals.len());
         for (_, local) in context.locals {
@@ -943,25 +1084,37 @@ impl<'a, 'b> Lifter<'a, 'b> {
                 let stack_init_block = context.function.block_mut(stack_init_node).unwrap();
                 stack_init_block.push(
                     ast::Assign::new(vec![local.into()], vec![ast::Literal::Nil.into()]).into(),
-                )
+                );
+                stack_init_origins.push(stack_init_origin.clone());
             }
         }
+        context
+            .statement_origins
+            .insert(stack_init_node, stack_init_origins);
         context.function.set_edges(
             stack_init_node,
             vec![(context.nodes[&0], BlockEdge::new(BranchType::Unconditional))],
         );
         context.function.set_entry(stack_init_node);
 
-        for (node, (successor, stat)) in context.insert_between {
+        for (node, (successor, stat, origin)) in context.insert_between {
             if context.function.predecessor_blocks(successor).count() == 1 {
                 context
                     .function
                     .block_mut(successor)
                     .unwrap()
                     .insert(0, stat);
+                context
+                    .statement_origins
+                    .entry(successor)
+                    .or_default()
+                    .insert(0, origin);
             } else {
                 let between_node = context.function.new_block();
                 context.function.block_mut(between_node).unwrap().push(stat);
+                context
+                    .statement_origins
+                    .insert(between_node, vec![origin]);
                 context.function.set_edges(
                     between_node,
                     vec![(successor, BlockEdge::new(BranchType::Unconditional))],
@@ -983,29 +1136,15 @@ impl<'a, 'b> Lifter<'a, 'b> {
             }
         }
 
-        let instruction_stride = context.bytecode.code.len().max(1);
-        let block_lengths = context
-            .function
-            .blocks()
-            .map(|(node, block)| (node, block.len()))
-            .collect::<Vec<_>>();
-        for (node, statement_count) in block_lengths {
-            let origins = (0..statement_count)
-                .map(|statement| {
-                    std::collections::BTreeSet::from([cfg::provenance::SourceOrigin::new(
-                        context.function.id,
-                        node.index()
-                            .saturating_mul(instruction_stride)
-                            .saturating_add(statement),
-                        None,
-                        "Lua51",
-                    )])
-                })
-                .collect();
+        for (node, origins) in std::mem::take(&mut context.statement_origins) {
             context.function.set_statement_origins(node, origins);
         }
 
-        (context.function, context.upvalues)
+        (
+            context.function,
+            context.upvalues,
+            bytecode.vararg_flag & VARARG_NEEDSARG != 0,
+        )
     }
 }
 
@@ -1014,9 +1153,29 @@ mod tests {
     use lua51_deserializer::{
         Function as BytecodeFunction, Instruction, Value,
         argument::{Constant, Register},
+        instruction::position::Position,
+        local::Local as DebugLocal,
     };
 
     use super::Lifter;
+
+    fn vararg_function(flag: u8) -> BytecodeFunction<'static> {
+        BytecodeFunction {
+            name: b"vararg",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: flag,
+            maximum_stack_size: 1,
+            code: vec![Instruction::Return(Register(0), 2)],
+            constants: Vec::new(),
+            closures: Vec::new(),
+            positions: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            number_of_parameters: 0,
+        }
+    }
 
     #[test]
     fn lifted_function_supplies_binding_and_origin_metadata_to_ssa() {
@@ -1042,8 +1201,249 @@ mod tests {
             number_of_parameters: 0,
         };
         let mut lifted = Vec::new();
-        let (mut function, upvalues) = Lifter::lift(&bytecode, &mut lifted);
+        let mut next_function_id = 0;
+        let (mut function, upvalues, _) =
+            Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
 
         cfg::ssa::construct(&mut function, &upvalues).expect("SSA construction");
+    }
+
+    #[test]
+    fn legacy_vararg_arg_table_is_an_implicit_named_parameter() {
+        let bytecode = vararg_function(7);
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+
+        let (mut function, upvalues, has_legacy_arg) =
+            Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        assert!(has_legacy_arg);
+        assert!(function.is_variadic);
+        assert_eq!(function.parameters.len(), 1);
+        assert_eq!(function.parameters[0].to_string(), "arg");
+        assert!(function.block(function.entry().unwrap()).unwrap().is_empty());
+        cfg::ssa::construct(&mut function, &upvalues).expect("SSA construction");
+    }
+
+    #[test]
+    fn modern_vararg_mode_does_not_invent_an_arg_table() {
+        let bytecode = vararg_function(2);
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+
+        let (function, _, has_legacy_arg) =
+            Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        assert!(!has_legacy_arg);
+        assert!(function.is_variadic);
+        assert!(function.parameters.is_empty());
+        assert_eq!(function.block(function.entry().unwrap()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn statement_origins_use_bytecode_pcs_across_blocks() {
+        let bytecode = BytecodeFunction {
+            name: b"origins",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: 0,
+            maximum_stack_size: 1,
+            code: vec![
+                Instruction::Test {
+                    value: Register(0),
+                    invert: false,
+                },
+                Instruction::Jump(1),
+                Instruction::LoadConstant {
+                    destination: Register(0),
+                    source: Constant(0),
+                },
+                Instruction::Return(Register(0), 2),
+            ],
+            constants: vec![Value::Number(7.0)],
+            closures: Vec::new(),
+            positions: (0..4)
+                .map(|instruction| Position {
+                    instruction,
+                    source: 10 + instruction as u32,
+                })
+                .collect(),
+            locals: vec![DebugLocal {
+                name: b"x",
+                range: 2..4,
+            }],
+            upvalues: Vec::new(),
+            number_of_parameters: 0,
+        };
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+        let (mut function, upvalues, _) =
+            Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        let mut load_origin = None;
+        for (node, block) in function.blocks() {
+            for (statement, value) in block.iter().enumerate() {
+                if value.as_assign().is_some_and(|assign| {
+                    matches!(
+                        assign.right.as_slice(),
+                        [ast::RValue::Literal(ast::Literal::Number(7.0))]
+                    )
+                }) {
+                    load_origin = function.statement_origins(node, statement);
+                }
+            }
+        }
+        let load_origin = load_origin.expect("LOADK statement origin");
+        assert!(load_origin.iter().any(|origin| {
+            origin.instruction == 2 && origin.source_line == Some(12)
+        }));
+
+        cfg::ssa::construct(&mut function, &upvalues).expect("SSA construction");
+        assert!(function.blocks().any(|(_, block)| {
+            block.iter().any(|statement| {
+                ast::LocalRw::values_written(statement)
+                    .iter()
+                    .any(|local| local.to_string() == "x")
+            })
+        }));
+    }
+
+    #[test]
+    fn testset_assignment_is_confined_to_its_cfg_edge() {
+        let bytecode = BytecodeFunction {
+            name: b"testset",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: 0,
+            maximum_stack_size: 2,
+            code: vec![
+                Instruction::Test {
+                    value: Register(0),
+                    invert: false,
+                },
+                Instruction::Jump(1),
+                Instruction::TestSet {
+                    destination: Register(1),
+                    value: Register(0),
+                    invert: false,
+                },
+                Instruction::Jump(0),
+                Instruction::Return(Register(1), 2),
+            ],
+            constants: Vec::new(),
+            closures: Vec::new(),
+            positions: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            number_of_parameters: 0,
+        };
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+        let (function, _, _) = Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        let assignment_nodes = function
+            .blocks()
+            .filter_map(|(node, block)| {
+                block
+                    .iter()
+                    .any(|statement| {
+                        statement.as_assign().is_some_and(|assign| {
+                            matches!(assign.right.as_slice(), [ast::RValue::Local(_)])
+                        })
+                    })
+                    .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assignment_nodes.len(), 1);
+        let assignment_node = assignment_nodes[0];
+        assert_eq!(function.predecessor_blocks(assignment_node).count(), 1);
+
+        let return_node = function
+            .blocks()
+            .find_map(|(node, block)| {
+                block
+                    .iter()
+                    .any(|statement| statement.as_return().is_some())
+                    .then_some(node)
+            })
+            .expect("return block");
+        assert_ne!(assignment_node, return_node);
+        assert_eq!(function.predecessor_blocks(return_node).count(), 2);
+    }
+
+    #[test]
+    fn tailcall_lifts_as_a_terminal_return() {
+        let bytecode = BytecodeFunction {
+            name: b"tailcall",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: 0,
+            maximum_stack_size: 1,
+            code: vec![Instruction::TailCall {
+                function: Register(0),
+                arguments: 1,
+            }],
+            constants: Vec::new(),
+            closures: Vec::new(),
+            positions: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            number_of_parameters: 1,
+        };
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+
+        let (function, _, _) = Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        assert!(function.blocks().any(|(_, block)| {
+            block.iter().any(|statement| {
+                statement.as_return().is_some_and(|value| {
+                    matches!(value.values.as_slice(), [ast::RValue::Call(_)])
+                })
+            })
+        }));
+    }
+
+    #[test]
+    fn tailcall_ignores_the_compiler_return_epilogue() {
+        let bytecode = BytecodeFunction {
+            name: b"tailcall-epilogue",
+            line_defined: 0,
+            last_line_defined: 0,
+            number_of_upvalues: 0,
+            vararg_flag: 0,
+            maximum_stack_size: 1,
+            code: vec![
+                Instruction::TailCall {
+                    function: Register(0),
+                    arguments: 1,
+                },
+                Instruction::Return(Register(0), 0),
+            ],
+            constants: Vec::new(),
+            closures: Vec::new(),
+            positions: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            number_of_parameters: 1,
+        };
+        let mut lifted = Vec::new();
+        let mut next_function_id = 0;
+
+        let (function, _, _) = Lifter::lift(&bytecode, &mut lifted, &mut next_function_id);
+
+        let returns = function
+            .blocks()
+            .flat_map(|(_, block)| block.iter())
+            .filter_map(ast::Statement::as_return)
+            .collect::<Vec<_>>();
+        assert_eq!(returns.len(), 1);
+        assert!(matches!(
+            returns[0].values.as_slice(),
+            [ast::RValue::Call(_)]
+        ));
     }
 }

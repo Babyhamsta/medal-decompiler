@@ -103,7 +103,9 @@ fn narrow_nested(statement: &mut Statement, budget: usize, depth: usize) {
         if let RValue::Closure(closure) = rvalue {
             // A closure compiles into its own function, with its own registers.
             let mut function = closure.function.lock();
-            let budget = FUNCTION_BUDGET.saturating_sub(function.parameters.len());
+            let budget = FUNCTION_BUDGET.saturating_sub(
+                function.parameters.len() + function.implicit_parameters.len(),
+            );
             narrow(&mut function.body, budget, 0, &FxHashSet::default());
         }
     });

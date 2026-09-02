@@ -656,7 +656,12 @@ impl Namer {
     }
 
     fn name_function(&mut self, function: &mut Function) {
-        let parameters = function.parameters.clone();
+        let parameters = function
+            .implicit_parameters
+            .iter()
+            .chain(&function.parameters)
+            .cloned()
+            .collect::<Vec<_>>();
         self.name_scope(&mut function.body, &parameters);
     }
 
@@ -876,6 +881,35 @@ mod tests {
     }
 
     #[test]
+    fn implicit_arg_keeps_its_required_name_when_a_parameter_collides() {
+        let explicit = local(Some("arg"));
+        let implicit = local(Some("arg"));
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                parameters: vec![explicit.clone()],
+                implicit_parameters: vec![implicit.clone()],
+                is_variadic: true,
+                body: Block(vec![Return::new(vec![implicit.clone().into()]).into()]),
+                ..Function::default()
+            }))),
+            upvalues: Vec::new(),
+        };
+        let holder = local(None);
+        let mut block = Block(vec![declaration(&holder, closure.clone().into()).into()]);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&implicit), "arg");
+        assert_ne!(local_name(&explicit), "arg");
+        let rendered = closure.to_string();
+        assert!(
+            rendered.starts_with(&format!("function({}, ...)", local_name(&explicit))),
+            "{rendered}"
+        );
+        assert!(rendered.contains("return arg"), "{rendered}");
+    }
+
+    #[test]
     fn generated_fallback_does_not_expose_upvalue_marker() {
         let captured = local(None);
         let closure_local = local(None);
@@ -1059,6 +1093,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: Vec::new(),
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: std::mem::take(&mut inner_body),
@@ -1087,6 +1122,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: Vec::new(),
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: std::mem::take(body),

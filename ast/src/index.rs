@@ -57,6 +57,7 @@ impl fmt::Display for Index {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_index(self)
     }

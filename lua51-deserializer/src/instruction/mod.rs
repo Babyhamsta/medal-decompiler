@@ -72,8 +72,8 @@ pub enum Instruction {
     },
     NewTable {
         destination: Register,
-        array_size: u8,
-        hash_size: u8,
+        array_size: u16,
+        hash_size: u16,
     },
     PrepMethodCall {
         destination: Register,
@@ -190,8 +190,9 @@ pub enum Instruction {
     SetList {
         table: Register,
         number_of_elements: u8,
-        block_number: u8,
+        block_number: u32,
     },
+    ExtraWord(u32),
     Close(Register),
     Closure {
         destination: Register,
@@ -206,7 +207,7 @@ impl Instruction {
         let instruction = match instruction {
             RawInstruction(OperationCode::Move, Layout::BC { a, b, .. }) => Self::Move {
                 destination: Register(a),
-                source: Register(b as u8),
+                source: Register(narrow_u8(input, b)?),
             },
             RawInstruction(OperationCode::LoadConstant, Layout::BX { a, b_x }) => {
                 Self::LoadConstant {
@@ -217,17 +218,24 @@ impl Instruction {
             RawInstruction(OperationCode::LoadBoolean, Layout::BC { a, b, c }) => {
                 Self::LoadBoolean {
                     destination: Register(a),
-                    value: b == 1,
-                    skip_next: c == 1,
+                    value: boolean_flag(input, b)?,
+                    skip_next: boolean_flag(input, c)?,
                 }
             }
             RawInstruction(OperationCode::LoadNil, Layout::BC { a, b, .. }) => {
-                Self::LoadNil((a..=b as u8).map(Register).collect())
+                let end = narrow_u8(input, b)?;
+                if end < a {
+                    return Err(Err::Failure(Error::from_error_kind(
+                        input,
+                        ErrorKind::Verify,
+                    )));
+                }
+                Self::LoadNil((a..=end).map(Register).collect())
             }
             RawInstruction(OperationCode::GetUpvalue, Layout::BC { a, b, .. }) => {
                 Self::GetUpvalue {
                     destination: Register(a),
-                    upvalue: Upvalue(b as u8),
+                    upvalue: Upvalue(narrow_u8(input, b)?),
                 }
             }
             RawInstruction(OperationCode::GetGlobal, Layout::BX { a, b_x }) => Self::GetGlobal {
@@ -236,7 +244,7 @@ impl Instruction {
             },
             RawInstruction(OperationCode::GetIndex, Layout::BC { a, b, c }) => Self::GetIndex {
                 destination: Register(a),
-                object: Register(b as u8),
+                object: Register(narrow_u8(input, b)?),
                 key: RegisterOrConstant::from(c as u32),
             },
             RawInstruction(OperationCode::SetGlobal, Layout::BX { a, b_x }) => Self::SetGlobal {
@@ -245,7 +253,7 @@ impl Instruction {
             },
             RawInstruction(OperationCode::SetUpvalue, Layout::BC { a, b, .. }) => {
                 Self::SetUpvalue {
-                    destination: Upvalue(b as u8),
+                    destination: Upvalue(narrow_u8(input, b)?),
                     source: Register(a),
                 }
             }
@@ -256,14 +264,17 @@ impl Instruction {
             },
             RawInstruction(OperationCode::NewTable, Layout::BC { a, b, c }) => Self::NewTable {
                 destination: Register(a),
-                array_size: b as u8,
-                hash_size: c as u8,
+                array_size: b,
+                hash_size: c,
             },
             RawInstruction(OperationCode::PrepMethodCall, Layout::BC { a, b, c }) => {
+                let self_arg = a.checked_add(1).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
                 Self::PrepMethodCall {
                     destination: Register(a),
-                    self_arg: Register(a + 1),
-                    object: Register(b as u8),
+                    self_arg: Register(self_arg),
+                    object: Register(narrow_u8(input, b)?),
                     method: RegisterOrConstant::from(c as u32),
                 }
             }
@@ -299,91 +310,119 @@ impl Instruction {
             },
             RawInstruction(OperationCode::Minus, Layout::BC { a, b, .. }) => Self::Minus {
                 destination: Register(a),
-                operand: Register(b as u8),
+                operand: Register(narrow_u8(input, b)?),
             },
             RawInstruction(OperationCode::Not, Layout::BC { a, b, c: _ }) => Self::Not {
                 destination: Register(a),
-                operand: Register(b as u8),
+                operand: Register(narrow_u8(input, b)?),
             },
             RawInstruction(OperationCode::Length, Layout::BC { a, b, c: _ }) => Self::Length {
                 destination: Register(a),
-                operand: Register(b as u8),
+                operand: Register(narrow_u8(input, b)?),
             },
             RawInstruction(OperationCode::Concatenate, Layout::BC { a, b, c }) => {
+                let start = narrow_u8(input, b)?;
+                let end = narrow_u8(input, c)?;
+                if end < start {
+                    return Err(Err::Failure(Error::from_error_kind(
+                        input,
+                        ErrorKind::Verify,
+                    )));
+                }
                 Self::Concatenate {
                     destination: Register(a),
-                    operands: (b..=c).map(|r| Register(r as u8)).collect(),
+                    operands: (start..=end).map(Register).collect(),
                 }
             }
             RawInstruction(OperationCode::Jump, Layout::BSx { b_sx, .. }) => Self::Jump(b_sx),
             RawInstruction(OperationCode::Equal, Layout::BC { a, b, c }) => Self::Equal {
                 lhs: RegisterOrConstant::from(b as u32),
                 rhs: RegisterOrConstant::from(c as u32),
-                invert: a != 1,
+                invert: !boolean_flag(input, a.into())?,
             },
             RawInstruction(OperationCode::LessThan, Layout::BC { a, b, c }) => Self::LessThan {
                 lhs: RegisterOrConstant::from(b as u32),
                 rhs: RegisterOrConstant::from(c as u32),
-                invert: a != 1,
+                invert: !boolean_flag(input, a.into())?,
             },
             RawInstruction(OperationCode::LessThanOrEqual, Layout::BC { a, b, c }) => {
                 Self::LessThanOrEqual {
                     lhs: RegisterOrConstant::from(b as u32),
                     rhs: RegisterOrConstant::from(c as u32),
-                    invert: a != 1,
+                    invert: !boolean_flag(input, a.into())?,
                 }
             }
             RawInstruction(OperationCode::Test, Layout::BC { a, c, .. }) => Self::Test {
                 value: Register(a),
-                invert: c != 1,
+                invert: !boolean_flag(input, c)?,
             },
             RawInstruction(OperationCode::TestSet, Layout::BC { a, b, c }) => Self::TestSet {
                 destination: Register(a),
-                value: Register(b as u8),
-                invert: c != 1,
+                value: Register(narrow_u8(input, b)?),
+                invert: !boolean_flag(input, c)?,
             },
             RawInstruction(OperationCode::Call, Layout::BC { a, b, c }) => Self::Call {
                 function: Register(a),
-                arguments: b as u8,
-                return_values: c as u8,
+                arguments: narrow_u8(input, b)?,
+                return_values: narrow_u8(input, c)?,
             },
             RawInstruction(OperationCode::TailCall, Layout::BC { a, b, .. }) => Self::TailCall {
                 function: Register(a),
-                arguments: b as u8,
+                arguments: narrow_u8(input, b)?,
             },
             RawInstruction(OperationCode::Return, Layout::BC { a, b, .. }) => {
-                Self::Return(Register(a), b as u8)
+                Self::Return(Register(a), narrow_u8(input, b)?)
             }
             RawInstruction(OperationCode::IterateNumericForLoop, Layout::BSx { a, b_sx }) => {
+                let end = a.checked_add(3).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
                 Self::IterateNumericForLoop {
-                    control: (a..=a + 4).map(Register).collect(),
+                    control: (a..=end).map(Register).collect(),
                     skip: b_sx,
                 }
             }
             RawInstruction(OperationCode::InitNumericForLoop, Layout::BSx { a, b_sx }) => {
+                let end = a.checked_add(3).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
                 Self::InitNumericForLoop {
-                    control: (a..=a + 4).map(Register).collect(),
+                    control: (a..=end).map(Register).collect(),
                     skip: b_sx,
                 }
             }
             RawInstruction(OperationCode::IterateGenericForLoop, Layout::BC { a, c, .. }) => {
+                if c == 0 {
+                    return Err(Err::Failure(Error::from_error_kind(
+                        input,
+                        ErrorKind::Verify,
+                    )));
+                }
+                let state = a.checked_add(1).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
+                let internal_control = a.checked_add(2).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
+                let first = a.checked_add(3).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
+                let count = narrow_u8(input, c)?;
+                let end = first.checked_add(count).ok_or_else(|| {
+                    Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge))
+                })?;
                 let res = Self::IterateGenericForLoop {
                     generator: Register(a),
-                    state: Register(a + 1),
-                    internal_control: Register(a + 2),
-                    vars: (a + 3..a + 3 + c as u8).map(Register).collect(),
+                    state: Register(state),
+                    internal_control: Register(internal_control),
+                    vars: (first..end).map(Register).collect(),
                 };
-                // must have at least external control variable
-                assert!(match &res {
-                    Self::IterateGenericForLoop { vars, .. } => !vars.is_empty(),
-                    _ => unreachable!(),
-                });
                 res
             }
             RawInstruction(OperationCode::SetList, Layout::BC { a, b, c }) => Self::SetList {
                 table: Register(a),
-                number_of_elements: b as u8,
-                block_number: c as u8,
+                number_of_elements: narrow_u8(input, b)?,
+                block_number: c as u32,
             },
             RawInstruction(OperationCode::Close, Layout::BC { a, .. }) => Self::Close(Register(a)),
             RawInstruction(OperationCode::Closure, Layout::BX { a, b_x }) => Self::Closure {
@@ -391,7 +430,7 @@ impl Instruction {
                 function: Function(b_x),
             },
             RawInstruction(OperationCode::VarArg, Layout::BC { a, b, .. }) => {
-                Self::VarArg(Register(a), b as u8)
+                Self::VarArg(Register(a), narrow_u8(input, b)?)
             }
             _ => {
                 return Err(Err::Failure(Error::from_error_kind(
@@ -402,5 +441,21 @@ impl Instruction {
         };
 
         Ok((input, instruction))
+    }
+}
+
+fn narrow_u8(input: &[u8], value: u16) -> Result<u8, Err<Error<&[u8]>>> {
+    u8::try_from(value)
+        .map_err(|_| Err::Failure(Error::from_error_kind(input, ErrorKind::TooLarge)))
+}
+
+fn boolean_flag(input: &[u8], value: u16) -> Result<bool, Err<Error<&[u8]>>> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Err::Failure(Error::from_error_kind(
+            input,
+            ErrorKind::Verify,
+        ))),
     }
 }

@@ -18,6 +18,13 @@ pub enum IndentationMode {
     Tab,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputDialect {
+    Lua51,
+    #[default]
+    Luau,
+}
+
 impl IndentationMode {
     pub fn display(&self, out: &mut impl fmt::Write, indentation_level: usize) -> fmt::Result {
         let string = match self {
@@ -80,6 +87,19 @@ pub struct Formatter<'a, W: fmt::Write> {
     pub(crate) indentation_level: usize,
     pub(crate) indentation_mode: IndentationMode,
     pub(crate) output: &'a mut W,
+    pub(crate) dialect: OutputDialect,
+}
+
+pub fn format_lua51(main: &Block) -> String {
+    let mut output = String::new();
+    Formatter::format_dialect(
+        main,
+        &mut output,
+        IndentationMode::default(),
+        OutputDialect::Lua51,
+    )
+    .expect("formatting into a string cannot fail");
+    output
 }
 
 impl<'a, W: fmt::Write> Formatter<'a, W> {
@@ -88,10 +108,20 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         output: &'a mut W,
         indentation_mode: IndentationMode,
     ) -> fmt::Result {
+        Self::format_dialect(main, output, indentation_mode, OutputDialect::Luau)
+    }
+
+    pub fn format_dialect(
+        main: &Block,
+        output: &'a mut W,
+        indentation_mode: IndentationMode,
+        dialect: OutputDialect,
+    ) -> fmt::Result {
         let mut formatter = Self {
             indentation_level: 0,
             indentation_mode,
             output,
+            dialect,
         };
         formatter.format_block_no_indent(main)
     }
@@ -383,6 +413,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             indentation_level: indentation_width,
             indentation_mode: IndentationMode::Tab,
             output: &mut scratch,
+            dialect: OutputDialect::Luau,
         }
         .write_table_inline(compacted);
         // An argument list inside the table may still have wrapped itself
@@ -730,6 +761,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     indentation_level: self.indentation_level,
                     indentation_mode: self.indentation_mode,
                     output: &mut scratch,
+                    dialect: self.dialect,
                 }
                 .format_arg_list_inline(list)?;
                 if self.indentation_width() + scratch.len() > COLUMN_BUDGET {
@@ -977,7 +1009,9 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             }
         }
 
-        if let Some((target, operation, value)) = Self::compound_assignment(assign) {
+        if self.dialect != OutputDialect::Lua51
+            && let Some((target, operation, value)) = Self::compound_assignment(assign)
+        {
             self.format_lvalue(target)?;
             write!(self.output, " {}= ", operation)?;
             return self.format_rvalue(value);
@@ -1182,6 +1216,21 @@ mod tests {
         );
 
         assert_eq!(assign.to_string(), "value += increment");
+    }
+
+    #[test]
+    fn lua51_expands_compound_assignment_syntax() {
+        let value = local("value");
+        let increment = local("increment");
+        let block = Block(vec![
+            Assign::new(
+                vec![LValue::Local(value.clone())],
+                vec![Binary::new(value.into(), increment.into(), BinaryOperation::Add).into()],
+            )
+            .into(),
+        ]);
+
+        assert_eq!(super::format_lua51(&block), "value = value + increment");
     }
 
     #[test]
@@ -1841,6 +1890,24 @@ mod tests {
         let block = Block(vec![call.into()]);
 
         assert_eq!(block.to_string(), "f(a, b)");
+    }
+
+    #[test]
+    fn implicit_parameters_are_visible_but_not_printed_in_the_signature() {
+        let fixed = local("fixed");
+        let argument = local("arg");
+        let closure = Closure {
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                parameters: vec![fixed],
+                implicit_parameters: vec![argument.clone()],
+                is_variadic: true,
+                body: Block(vec![Return::new(vec![argument.into()]).into()]),
+                ..Function::default()
+            }))),
+            upvalues: Vec::new(),
+        };
+
+        assert_eq!(closure.to_string(), "function(fixed, ...)\n\treturn arg\nend");
     }
 
     #[test]

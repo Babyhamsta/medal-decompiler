@@ -68,6 +68,7 @@ impl fmt::Display for Call {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_call(self)
     }
@@ -132,6 +133,7 @@ impl fmt::Display for MethodCall {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_method_call(self)
     }
