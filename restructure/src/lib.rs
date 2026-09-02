@@ -4,12 +4,12 @@ use ast::{LocalRw, Reduce, Traverse};
 use cfg::{block::BranchType, function::Function};
 use itertools::Itertools;
 use parking_lot::Mutex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use triomphe::Arc;
 
 use petgraph::{
     algo::dominators::{Dominators, simple_fast},
-    stable_graph::{EdgeIndex, NodeIndex, StableDiGraph},
+    stable_graph::{NodeIndex, StableDiGraph},
     visit::*,
 };
 use tuple::Map;
@@ -17,6 +17,12 @@ use tuple::Map;
 mod conditional;
 mod jump;
 mod r#loop;
+
+/// `petgraph::simple_fast` is quadratic in the number of nodes. Structuring
+/// computes dominators and post-dominators repeatedly after graph mutations,
+/// so graphs above this single-pass work estimate use the bounded dispatcher
+/// directly instead of cloning the graph and entering unbounded analysis.
+const MAX_COLLAPSE_NODE_PAIRS: usize = 100_000_000;
 
 // TODO: REFACTOR: move
 pub fn post_dominators<N: Default, E: Default>(
@@ -40,10 +46,13 @@ struct GraphStructurer {
     loop_headers: FxHashSet<NodeIndex>,
     recovery_region_headers: FxHashSet<NodeIndex>,
     reachable_terminal_returns: Vec<ast::Return>,
-    label_to_node: FxHashMap<ast::Label, NodeIndex>,
 }
 
 impl GraphStructurer {
+    fn collapse_within_budget(node_count: usize) -> bool {
+        node_count.saturating_mul(node_count) <= MAX_COLLAPSE_NODE_PAIRS
+    }
+
     fn find_loop_headers(&mut self) {
         self.loop_headers.clear();
         depth_first_search(
@@ -67,7 +76,6 @@ impl GraphStructurer {
                 .map(|region| region.header)
                 .collect(),
             reachable_terminal_returns,
-            label_to_node: FxHashMap::default(),
         };
         this.find_loop_headers();
         this
@@ -176,64 +184,6 @@ impl GraphStructurer {
         changed
     }
 
-    fn insert_goto_for_edge(&mut self, edge: EdgeIndex) {
-        let (source, target) = self.function.graph().edge_endpoints(edge).unwrap();
-        if self.function.graph().edge_weight(edge).unwrap().branch_type == BranchType::Unconditional
-            && self.function.predecessor_blocks(target).count() == 1
-        {
-            assert!(self.function.successor_blocks(source).count() == 1);
-            // TODO: this code is repeated in match_jump, move to a new function
-            let edges = self.function.remove_edges(target);
-            let block = self.function.remove_block(target).unwrap();
-            self.function.block_mut(source).unwrap().extend(block.0);
-            self.function.set_edges(source, edges);
-        } else {
-            // TODO: make label an Rc and have a global counter for block name
-            let label = ast::Label(format!("l{}", target.index()));
-            let target_block = self.function.block_mut(target).unwrap();
-            if target_block.first().and_then(|s| s.as_label()).is_none() {
-                self.label_to_node.insert(label.clone(), target);
-                target_block.insert(0, label.clone().into());
-            }
-            let goto_block = self.function.new_block();
-            self.function
-                .block_mut(goto_block)
-                .unwrap()
-                .push(ast::Goto::new(label).into());
-
-            let edge = self.function.graph_mut().remove_edge(edge).unwrap();
-            self.function.graph_mut().add_edge(source, goto_block, edge);
-        }
-    }
-
-    fn split_edge_target(&mut self, edge: EdgeIndex) -> bool {
-        let Some((source, target)) = self.function.graph().edge_endpoints(edge) else {
-            return false;
-        };
-        if self.is_loop_header(target) || source == target {
-            return false;
-        }
-
-        let target_block = self.function.block(target).unwrap().clone();
-        let outgoing = self
-            .function
-            .graph()
-            .edges(target)
-            .map(|edge| (edge.target(), edge.weight().clone()))
-            .collect::<Vec<_>>();
-        let incoming = self.function.graph_mut().remove_edge(edge).unwrap();
-        let duplicate = self.function.graph_mut().add_node(target_block);
-        self.function
-            .graph_mut()
-            .add_edge(source, duplicate, incoming);
-        for (successor, edge) in outgoing {
-            self.function
-                .graph_mut()
-                .add_edge(duplicate, successor, edge);
-        }
-        true
-    }
-
     fn remove_last_return(block: ast::Block) -> ast::Block {
         if let Some(ast::Statement::Return(last_statement)) = block.last() {
             if last_statement.values.is_empty() {
@@ -244,169 +194,472 @@ impl GraphStructurer {
         block
     }
 
-    fn collapse(&mut self) {
-        loop {
-            while self.match_blocks() {}
-            if self.function.graph().node_count() == 1 {
-                break;
+    fn collapse(&mut self) -> bool {
+        while self.match_blocks() {}
+        self.function.graph().node_count() == 1
+    }
+
+    fn append_dispatch_transfer(
+        block: &mut ast::Block,
+        state: &ast::RcLocal,
+        target: NodeIndex,
+        edge: &cfg::block::BlockEdge,
+    ) {
+        if !edge.arguments.is_empty() {
+            let mut arguments = ast::Assign::new(
+                edge.arguments
+                    .iter()
+                    .map(|(parameter, _)| ast::LValue::Local(parameter.clone()))
+                    .collect(),
+                edge.arguments
+                    .iter()
+                    .map(|(_, argument)| argument.clone())
+                    .collect(),
+            );
+            arguments.parallel = true;
+            block.push(arguments.into());
+        }
+        block.push(
+            ast::Assign::new(
+                vec![ast::LValue::Local(state.clone())],
+                vec![ast::Literal::Number(target.index() as f64).into()],
+            )
+            .into(),
+        );
+    }
+
+    fn lower_dispatch_pseudo_statements(block: &mut ast::Block) {
+        let statements = std::mem::take(&mut block.0);
+        block.0 = statements
+            .into_iter()
+            .map(|statement| match statement {
+                ast::Statement::NumForInit(init) => {
+                    let mut assignment = ast::Assign::new(
+                        vec![init.counter.0, init.limit.0, init.step.0],
+                        vec![
+                            ast::Binary::new(
+                                init.counter.1,
+                                init.step.1.clone(),
+                                ast::BinaryOperation::Sub,
+                            )
+                            .into(),
+                            init.limit.1,
+                            init.step.1,
+                        ],
+                    );
+                    assignment.parallel = true;
+                    assignment.into()
+                }
+                ast::Statement::GenericForInit(init) => ast::Statement::Assign(init.0),
+                other => other,
+            })
+            .collect();
+    }
+
+    fn numeric_for_dispatch_condition(next: &ast::NumForNext) -> ast::RValue {
+        let counter = next
+            .counter
+            .0
+            .as_local()
+            .expect("numeric-for counter must be a local")
+            .clone();
+        let positive_step = ast::Binary::new(
+            next.step.clone(),
+            ast::Literal::Number(0.0).into(),
+            ast::BinaryOperation::GreaterThan,
+        );
+        let positive_limit = ast::Binary::new(
+            counter.clone().into(),
+            next.limit.clone(),
+            ast::BinaryOperation::LessThanOrEqual,
+        );
+        let nonpositive_step = ast::Binary::new(
+            next.step.clone(),
+            ast::Literal::Number(0.0).into(),
+            ast::BinaryOperation::LessThanOrEqual,
+        );
+        let nonpositive_limit = ast::Binary::new(
+            counter.into(),
+            next.limit.clone(),
+            ast::BinaryOperation::GreaterThanOrEqual,
+        );
+        ast::Binary::new(
+            ast::Binary::new(
+                positive_step.into(),
+                positive_limit.into(),
+                ast::BinaryOperation::And,
+            )
+            .into(),
+            ast::Binary::new(
+                nonpositive_step.into(),
+                nonpositive_limit.into(),
+                ast::BinaryOperation::And,
+            )
+            .into(),
+            ast::BinaryOperation::Or,
+        )
+        .into()
+    }
+
+    fn dispatch_block_terminates(block: &ast::Block) -> bool {
+        block
+            .iter()
+            .rev()
+            .find(|statement| {
+                !matches!(
+                    statement,
+                    ast::Statement::Comment(_) | ast::Statement::Empty(_)
+                )
+            })
+            .is_some_and(|statement| match statement {
+                ast::Statement::Return(_)
+                | ast::Statement::Break(_)
+                | ast::Statement::Continue(_)
+                | ast::Statement::Goto(_) => true,
+                ast::Statement::If(conditional) => {
+                    let then_block = conditional.then_block.lock();
+                    let else_block = conditional.else_block.lock();
+                    !else_block.is_empty()
+                        && Self::dispatch_block_terminates(&then_block)
+                        && Self::dispatch_block_terminates(&else_block)
+                }
+                _ => false,
+            })
+    }
+
+    fn append_dispatch_exit(block: &mut ast::Block) {
+        if !Self::dispatch_block_terminates(block) {
+            block.push(ast::Break {}.into());
+        }
+    }
+
+    fn take_dispatch_conditional(
+        block: &mut ast::Block,
+        function_id: usize,
+        node: NodeIndex,
+    ) -> ast::If {
+        match block.pop() {
+            Some(ast::Statement::If(conditional)) => conditional,
+            Some(ast::Statement::NumForNext(next)) => {
+                block.push(
+                    ast::Assign::new(
+                        vec![next.counter.0.clone()],
+                        vec![
+                            ast::Binary::new(
+                                next.counter.1.clone(),
+                                next.step.clone(),
+                                ast::BinaryOperation::Add,
+                            )
+                            .into(),
+                        ],
+                    )
+                    .into(),
+                );
+                ast::If::new(
+                    Self::numeric_for_dispatch_condition(&next),
+                    ast::Block::default(),
+                    ast::Block::default(),
+                )
             }
-            // last resort refinement
-            let edges = self.function.graph().edge_indices().collect::<Vec<_>>();
-            // https://edmcman.github.io/papers/usenix13.pdf
-            // we prefer to remove edges whose source does not dominate its target, nor whose target dominates its source
-            // TODO: try all possible paths and return the one with the least gotos, i don't think there's any other way
-            // to get best output
-            let mut changed = false;
-            for &edge in &edges {
-                // edge might have been invalidated by a previous iteration due to insert_goto_for_edge
-                // calling remove_block(target)
-                if self.function.graph().edge_weight(edge).is_none() {
-                    continue;
-                }
-
-                let (source, target) = self.function.graph().edge_endpoints(edge).unwrap();
-                let dominators = simple_fast(self.function.graph(), self.function.entry().unwrap());
-                let target_dominators = dominators.dominators(target);
-                let source_dominators = dominators.dominators(source);
-                // TODO: check if blocks in dfs instead
-                if target_dominators.is_none() || source_dominators.is_none() {
-                    continue;
-                }
-                let mut target_dominators = target_dominators.unwrap();
-                let mut source_dominators = source_dominators.unwrap();
-                if target_dominators.contains(&source) || source_dominators.contains(&target) {
-                    continue;
-                }
-
-                if self.split_edge_target(edge) {
-                    self.find_loop_headers();
-                    changed = self.match_blocks();
-                } else {
-                    self.insert_goto_for_edge(edge);
-                    self.find_loop_headers();
-                    changed = self.match_blocks();
-                }
-                if changed {
-                    break;
-                }
+            Some(ast::Statement::GenericForNext(next)) => {
+                let control = next
+                    .res_locals
+                    .first()
+                    .and_then(ast::LValue::as_local)
+                    .expect("generic-for control result must be a local")
+                    .clone();
+                let mut results = ast::Assign::new(
+                    next.res_locals,
+                    vec![
+                        ast::Call::new(next.generator, vec![next.state, next.internal_control.1])
+                            .into(),
+                    ],
+                );
+                results.parallel = true;
+                block.push(results.into());
+                block.push(
+                    ast::Assign::new(vec![next.internal_control.0], vec![control.clone().into()])
+                        .into(),
+                );
+                ast::If::new(
+                    ast::Binary::new(
+                        control.into(),
+                        ast::Literal::Nil.into(),
+                        ast::BinaryOperation::NotEqual,
+                    )
+                    .into(),
+                    ast::Block::default(),
+                    ast::Block::default(),
+                )
             }
-
-            if !changed {
-                for edge in edges {
-                    // edge might have been invalidated by a previous iteration due to insert_goto_for_edge
-                    // calling remove_block(target)
-                    if self.function.graph().edge_weight(edge).is_none() {
-                        continue;
-                    }
-                    self.insert_goto_for_edge(edge);
-                    self.find_loop_headers();
-                    changed = self.match_blocks();
-                    if changed {
-                        break;
-                    }
-                }
-                if !changed {
-                    break;
-                }
+            tail => {
+                panic!(
+                    "function {function_id} conditional dispatcher node {} has no branch condition; tail={:?}",
+                    node.index(),
+                    tail.map(|statement| std::mem::discriminant(&statement))
+                );
             }
         }
     }
 
-    fn structure(mut self) -> ast::Block {
-        self.collapse();
-        let mut result = if self.function.graph().node_count() != 1 {
-            let mut res_block = ast::Block::default();
-            let entry = self.function.entry().unwrap();
-            let mut stack = vec![entry];
-            let mut visited = FxHashSet::default();
-            while let Some(node) = stack.pop() {
-                if visited.contains(&node) {
+    fn detach_nested_blocks(block: &mut ast::Block) {
+        for statement in &mut block.0 {
+            let nested = match statement {
+                ast::Statement::If(conditional) => {
+                    let mut then_block = conditional.then_block.lock().clone();
+                    let mut else_block = conditional.else_block.lock().clone();
+                    Self::detach_nested_blocks(&mut then_block);
+                    Self::detach_nested_blocks(&mut else_block);
+                    conditional.then_block = Arc::new(Mutex::new(then_block));
+                    conditional.else_block = Arc::new(Mutex::new(else_block));
                     continue;
                 }
-                visited.insert(node);
+                ast::Statement::Do(scope) => &mut scope.block,
+                ast::Statement::While(r#while) => &mut r#while.block,
+                ast::Statement::Repeat(repeat) => &mut repeat.block,
+                ast::Statement::NumericFor(numeric_for) => &mut numeric_for.block,
+                ast::Statement::GenericFor(generic_for) => &mut generic_for.block,
+                _ => continue,
+            };
+            let mut nested_block = nested.lock().clone();
+            Self::detach_nested_blocks(&mut nested_block);
+            *nested = Arc::new(Mutex::new(nested_block));
+        }
+    }
 
-                fn collect_gotos(block: &ast::Block, gotos: &mut FxHashSet<ast::Label>) {
-                    for statement in &block.0 {
-                        match statement {
-                            ast::Statement::Goto(goto) => {
-                                gotos.insert(goto.0.clone());
-                            }
-                            ast::Statement::If(r#if) => {
-                                collect_gotos(&r#if.then_block.lock(), gotos);
-                                collect_gotos(&r#if.else_block.lock(), gotos);
-                            }
-                            ast::Statement::While(r#while) => {
-                                collect_gotos(&r#while.block.lock(), gotos);
-                            }
-                            ast::Statement::Repeat(repeat) => {
-                                collect_gotos(&repeat.block.lock(), gotos);
-                            }
-                            ast::Statement::NumericFor(numeric_for) => {
-                                collect_gotos(&numeric_for.block.lock(), gotos);
-                            }
-                            ast::Statement::GenericFor(generic_for) => {
-                                collect_gotos(&generic_for.block.lock(), gotos);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+    fn detached_function_clone(function: &Function) -> Function {
+        let mut detached = function.clone();
+        for block in detached.blocks_mut() {
+            Self::detach_nested_blocks(block);
+        }
+        detached
+    }
 
-                let block = self.function.remove_block(node).unwrap();
-                let mut goto_destinations = FxHashSet::default();
-                collect_gotos(&block, &mut goto_destinations);
-                for label in goto_destinations {
-                    // TODO: block might have been merged/structured into another, output that block instead
-                    // will require collecting label definitions in addition to references (gotos)
-                    let target_node = self.label_to_node[&label];
-                    if self.function.has_block(target_node) {
-                        stack.push(target_node);
-                    }
-                }
-                if let Some(ast::Statement::Goto(goto)) = res_block.last()
-                // TODO: keep label -> block map instead
-                    && goto.0.0[1..] == node.index().to_string()
-                {
-                    res_block.pop();
-                }
-                if !block
-                    .first()
-                    .is_some_and(|s| matches!(s, ast::Statement::Label(_)))
-                {
-                    res_block.push(ast::Comment::new(format!("block {}", node.index())).into());
-                }
-                res_block.extend(block.0)
+    fn contains_invalid_structure(block: &ast::Block, loop_depth: usize) -> bool {
+        let mut terminated = false;
+        for statement in &block.0 {
+            if matches!(
+                statement,
+                ast::Statement::Comment(_) | ast::Statement::Empty(_)
+            ) {
+                continue;
             }
-            // TODO: these nodes are never executed (i think), comment them out or dont include them
-            for node in self.function.graph().node_indices().collect::<Vec<_>>() {
-                let block = self.function.remove_block(node).unwrap();
-                if !block
-                    .first()
-                    .is_some_and(|s| matches!(s, ast::Statement::Label(_)))
-                {
-                    res_block.push(ast::Comment::new(format!("block {}", node.index())).into());
+            if terminated {
+                return true;
+            }
+            let invalid = match statement {
+                ast::Statement::Break(_) | ast::Statement::Continue(_) => loop_depth == 0,
+                ast::Statement::Goto(_)
+                | ast::Statement::Label(_)
+                | ast::Statement::NumForInit(_)
+                | ast::Statement::NumForNext(_)
+                | ast::Statement::GenericForInit(_)
+                | ast::Statement::GenericForNext(_) => true,
+                ast::Statement::If(conditional) => {
+                    Self::contains_invalid_structure(&conditional.then_block.lock(), loop_depth)
+                        || Self::contains_invalid_structure(
+                            &conditional.else_block.lock(),
+                            loop_depth,
+                        )
                 }
-                res_block.extend(block.0)
+                ast::Statement::Do(scope) => {
+                    Self::contains_invalid_structure(&scope.block.lock(), loop_depth)
+                }
+                ast::Statement::While(r#while) => {
+                    Self::contains_invalid_structure(&r#while.block.lock(), loop_depth + 1)
+                }
+                ast::Statement::Repeat(repeat) => {
+                    Self::contains_invalid_structure(&repeat.block.lock(), loop_depth + 1)
+                }
+                ast::Statement::NumericFor(numeric_for) => {
+                    Self::contains_invalid_structure(&numeric_for.block.lock(), loop_depth + 1)
+                }
+                ast::Statement::GenericFor(generic_for) => {
+                    Self::contains_invalid_structure(&generic_for.block.lock(), loop_depth + 1)
+                }
+                _ => false,
+            };
+            if invalid {
+                return true;
+            }
+            terminated = matches!(
+                statement,
+                ast::Statement::Return(_) | ast::Statement::Break(_) | ast::Statement::Continue(_)
+            );
+        }
+        false
+    }
+
+    fn dispatch_tree(state: &ast::RcLocal, mut cases: Vec<(NodeIndex, ast::Block)>) -> ast::Block {
+        match cases.len() {
+            0 => ast::Block(vec![ast::Break {}.into()]),
+            1 => {
+                let (node, block) = cases.pop().unwrap();
+                let condition = ast::Binary::new(
+                    state.clone().into(),
+                    ast::Literal::Number(node.index() as f64).into(),
+                    ast::BinaryOperation::Equal,
+                )
+                .into();
+                ast::Block(vec![
+                    ast::If::new(condition, block, ast::Block(vec![ast::Break {}.into()])).into(),
+                ])
+            }
+            _ => {
+                let right = cases.split_off(cases.len() / 2);
+                let pivot = cases.last().unwrap().0;
+                let condition = ast::Binary::new(
+                    state.clone().into(),
+                    ast::Literal::Number(pivot.index() as f64).into(),
+                    ast::BinaryOperation::LessThanOrEqual,
+                )
+                .into();
+                ast::Block(vec![
+                    ast::If::new(
+                        condition,
+                        Self::dispatch_tree(state, cases),
+                        Self::dispatch_tree(state, right),
+                    )
+                    .into(),
+                ])
+            }
+        }
+    }
+
+    /// Lowers any graph that cannot be expressed with Lua 5.1's structured
+    /// statements to a bounded state machine. A balanced decision tree keeps
+    /// later AST passes and runtime dispatch logarithmic in the block count.
+    /// Original edge assignments and branch conditions remain intact without
+    /// emitting Lua 5.2 gotos.
+    fn dispatch_remaining_cfg(&mut self) -> ast::Block {
+        let entry = self.function.entry().unwrap();
+        let reachable = Dfs::new(self.function.graph(), entry)
+            .iter(self.function.graph())
+            .collect::<FxHashSet<_>>();
+        let mut nodes = reachable.into_iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.index());
+
+        let mut blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let edges = self
+                .function
+                .edges(node)
+                .map(|edge| (edge.target(), edge.weight().clone()))
+                .collect::<Vec<_>>();
+            let mut block = self.function.remove_block(node).unwrap();
+            Self::lower_dispatch_pseudo_statements(&mut block);
+            blocks.push((node, block, edges));
+        }
+
+        let state = ast::RcLocal::default();
+        let mut cases = Vec::with_capacity(blocks.len());
+        for (node, mut block, edges) in blocks {
+            match edges.as_slice() {
+                [] => Self::append_dispatch_exit(&mut block),
+                [(target, edge)] => match edge.branch_type {
+                    BranchType::Unconditional => {
+                        Self::append_dispatch_transfer(&mut block, &state, *target, edge);
+                    }
+                    BranchType::Then | BranchType::Else => {
+                        let conditional =
+                            Self::take_dispatch_conditional(&mut block, self.function.id, node);
+                        let (taken, missing) = if edge.branch_type == BranchType::Then {
+                            (&conditional.then_block, &conditional.else_block)
+                        } else {
+                            (&conditional.else_block, &conditional.then_block)
+                        };
+                        Self::append_dispatch_transfer(&mut taken.lock(), &state, *target, edge);
+                        Self::append_dispatch_exit(&mut missing.lock());
+                        block.push(conditional.into());
+                    }
+                },
+                [first, second] => {
+                    let (then_edge, else_edge) = match (&first.1.branch_type, &second.1.branch_type)
+                    {
+                        (BranchType::Then, BranchType::Else) => (first, second),
+                        (BranchType::Else, BranchType::Then) => (second, first),
+                        _ => panic!("conditional dispatcher node must have then and else edges"),
+                    };
+                    let conditional =
+                        Self::take_dispatch_conditional(&mut block, self.function.id, node);
+                    Self::append_dispatch_transfer(
+                        &mut conditional.then_block.lock(),
+                        &state,
+                        then_edge.0,
+                        &then_edge.1,
+                    );
+                    Self::append_dispatch_transfer(
+                        &mut conditional.else_block.lock(),
+                        &state,
+                        else_edge.0,
+                        &else_edge.1,
+                    );
+                    block.push(conditional.into());
+                }
+                _ => panic!("dispatcher node has more than two successors"),
             }
 
-            res_block
+            cases.push((node, block));
+        }
+        let cases = Self::dispatch_tree(&state, cases);
+
+        let mut initialize = ast::Assign::new(
+            vec![ast::LValue::Local(state)],
+            vec![ast::Literal::Number(entry.index() as f64).into()],
+        );
+        initialize.prefix = true;
+        ast::Block(vec![
+            initialize.into(),
+            ast::While::new(ast::Literal::Boolean(true).into(), cases).into(),
+        ])
+    }
+
+    fn structure(mut self) -> ast::Block {
+        let mut collapsed_fallback = None;
+        let mut result = if Self::collapse_within_budget(self.function.graph().node_count()) {
+            let fallback_function = Self::detached_function_clone(&self.function);
+            if self.collapse() {
+                collapsed_fallback = Some(fallback_function);
+                Self::remove_last_return(
+                    self.function
+                        .remove_block(self.function.entry().unwrap())
+                        .unwrap(),
+                )
+            } else {
+                self.function = fallback_function;
+                self.dispatch_remaining_cfg()
+            }
         } else {
-            Self::remove_last_return(
-                self.function
-                    .remove_block(self.function.entry().unwrap())
-                    .unwrap(),
-            )
+            self.dispatch_remaining_cfg()
         };
         // Loop exits first: an unrecovered `goto` in the interior disqualifies
         // the whole block from terminal back-edge recovery below.
-        if recover_loop_exit_breaks(&mut result) {
-            let mut referenced = FxHashSet::default();
-            collect_referenced_labels(&result, &mut referenced);
-            remove_unreferenced_labels(&mut result, &referenced);
-        }
+        recover_loop_exit_breaks(&mut result);
+        let mut referenced = FxHashSet::default();
+        collect_referenced_labels(&result, &mut referenced);
+        remove_unreferenced_labels(&mut result, &referenced);
         recover_terminal_backedge_loop(&mut result);
         flatten_single_iteration_loops(&mut result);
         relocate_unreachable_terminal_returns(&mut result, &self.reachable_terminal_returns);
+        referenced.clear();
+        collect_referenced_labels(&result, &mut referenced);
+        remove_unreferenced_labels(&mut result, &referenced);
+        if Self::contains_invalid_structure(&result, 0)
+            && let Some(fallback_function) = collapsed_fallback
+        {
+            self.function = fallback_function;
+            result = self.dispatch_remaining_cfg();
+            recover_loop_exit_breaks(&mut result);
+            referenced.clear();
+            collect_referenced_labels(&result, &mut referenced);
+            remove_unreferenced_labels(&mut result, &referenced);
+            recover_terminal_backedge_loop(&mut result);
+            flatten_single_iteration_loops(&mut result);
+            relocate_unreachable_terminal_returns(&mut result, &self.reachable_terminal_returns);
+            referenced.clear();
+            collect_referenced_labels(&result, &mut referenced);
+            remove_unreferenced_labels(&mut result, &referenced);
+        }
         result
     }
 }
@@ -440,6 +693,9 @@ fn replace_exit_gotos_with_break(block: &mut ast::Block, label: &ast::Label) -> 
                 changed |= replace_exit_gotos_with_break(&mut r#if.then_block.lock(), label);
                 changed |= replace_exit_gotos_with_break(&mut r#if.else_block.lock(), label);
             }
+            ast::Statement::Do(r#do) => {
+                changed |= replace_exit_gotos_with_break(&mut r#do.block.lock(), label);
+            }
             _ => {}
         }
     }
@@ -463,6 +719,9 @@ fn recover_loop_exit_breaks(block: &mut ast::Block) -> bool {
                 changed |= recover_loop_exit_breaks(&mut r#if.then_block.lock());
                 changed |= recover_loop_exit_breaks(&mut r#if.else_block.lock());
             }
+            ast::Statement::Do(r#do) => {
+                changed |= recover_loop_exit_breaks(&mut r#do.block.lock());
+            }
             ast::Statement::While(r#while) => {
                 changed |= recover_loop_exit_breaks(&mut r#while.block.lock());
             }
@@ -480,7 +739,12 @@ fn recover_loop_exit_breaks(block: &mut ast::Block) -> bool {
     }
 
     for index in 0..block.len() {
-        let Some(label) = block.0.get(index + 1).and_then(ast::Statement::as_label).cloned() else {
+        let Some(label) = block
+            .0
+            .get(index + 1)
+            .and_then(ast::Statement::as_label)
+            .cloned()
+        else {
             continue;
         };
         let Some(body) = loop_body(&block.0[index]).cloned() else {
@@ -503,6 +767,9 @@ fn collect_referenced_labels(block: &ast::Block, referenced: &mut FxHashSet<ast:
                 collect_referenced_labels(&r#if.then_block.lock(), referenced);
                 collect_referenced_labels(&r#if.else_block.lock(), referenced);
             }
+            ast::Statement::Do(r#do) => {
+                collect_referenced_labels(&r#do.block.lock(), referenced);
+            }
             _ => {
                 if let Some(body) = loop_body(statement) {
                     collect_referenced_labels(&body.lock(), referenced);
@@ -520,6 +787,9 @@ fn remove_unreferenced_labels(block: &mut ast::Block, referenced: &FxHashSet<ast
             ast::Statement::If(r#if) => {
                 changed |= remove_unreferenced_labels(&mut r#if.then_block.lock(), referenced);
                 changed |= remove_unreferenced_labels(&mut r#if.else_block.lock(), referenced);
+            }
+            ast::Statement::Do(r#do) => {
+                changed |= remove_unreferenced_labels(&mut r#do.block.lock(), referenced);
             }
             _ => {
                 if let Some(body) = loop_body(statement) {
@@ -564,6 +834,7 @@ fn contains_unstructured_jump(statements: &[ast::Statement]) -> bool {
             contains_unstructured_jump(&if_.then_block.lock())
                 || contains_unstructured_jump(&if_.else_block.lock())
         }
+        ast::Statement::Do(do_) => contains_unstructured_jump(&do_.block.lock()),
         ast::Statement::While(while_) => contains_unstructured_jump(&while_.block.lock()),
         ast::Statement::Repeat(repeat) => contains_unstructured_jump(&repeat.block.lock()),
         ast::Statement::NumericFor(for_) => contains_unstructured_jump(&for_.block.lock()),
@@ -967,9 +1238,10 @@ pub fn lift(
 #[cfg(test)]
 mod tests {
     use crate::{
-        collect_referenced_labels, contains_reachable_return, flatten_single_iteration_loops, lift,
-        recover_loop_exit_breaks, recover_terminal_backedge_loop, remove_unreferenced_labels,
-        relocate_unreachable_terminal_returns,
+        GraphStructurer, collect_referenced_labels, contains_reachable_return,
+        contains_unstructured_jump, flatten_single_iteration_loops, lift, recover_loop_exit_breaks,
+        recover_terminal_backedge_loop, relocate_unreachable_terminal_returns,
+        remove_unreferenced_labels,
     };
     use ast::{
         Assign, Binary, BinaryOperation, Call, Global, If, LValue, Literal, Local, RValue, RcLocal,
@@ -988,6 +1260,145 @@ mod tests {
 
     fn assign(target: &RcLocal, value: RValue) -> Statement {
         Assign::new(vec![LValue::Local(target.clone())], vec![value]).into()
+    }
+
+    fn maximum_if_depth(block: &ast::Block) -> usize {
+        block
+            .iter()
+            .map(|statement| match statement {
+                Statement::If(r#if) => {
+                    1 + maximum_if_depth(&r#if.then_block.lock())
+                        .max(maximum_if_depth(&r#if.else_block.lock()))
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn dispatcher_uses_a_balanced_decision_tree() {
+        let state = local("state");
+        let cases = (0..4096)
+            .map(|index| {
+                (
+                    petgraph::stable_graph::NodeIndex::new(index),
+                    ast::Block(vec![ast::Break {}.into()]),
+                )
+            })
+            .collect();
+
+        let tree = GraphStructurer::dispatch_tree(&state, cases);
+
+        assert!(maximum_if_depth(&tree) <= 13);
+    }
+
+    #[test]
+    fn dispatcher_does_not_append_break_after_return() {
+        let mut terminal = ast::Block(vec![Return::new(Vec::new()).into()]);
+        GraphStructurer::append_dispatch_exit(&mut terminal);
+
+        assert_eq!(terminal.len(), 1);
+        assert!(matches!(terminal[0], Statement::Return(_)));
+
+        let mut nonterminal = ast::Block(vec![
+            Call::new(Global::from("work").into(), Vec::new()).into(),
+        ]);
+        GraphStructurer::append_dispatch_exit(&mut nonterminal);
+
+        assert!(matches!(nonterminal.last(), Some(Statement::Break(_))));
+    }
+
+    #[test]
+    fn dispatcher_lowers_generic_for_next_without_a_pseudo_node() {
+        let generator = local("generator");
+        let state = local("state");
+        let internal_control = local("internal");
+        let item = local("item");
+        let mut block = ast::Block(vec![
+            ast::GenericForNext::new(vec![item], generator.into(), state, internal_control).into(),
+        ]);
+
+        let conditional = GraphStructurer::take_dispatch_conditional(
+            &mut block,
+            0,
+            petgraph::stable_graph::NodeIndex::new(0),
+        );
+        block.push(conditional.into());
+
+        assert_eq!(block.len(), 3);
+        assert!(matches!(block[0], Statement::Assign(_)));
+        assert!(matches!(block[1], Statement::Assign(_)));
+        assert!(matches!(block[2], Statement::If(_)));
+        assert!(!GraphStructurer::contains_invalid_structure(&block, 0));
+        let source = ast::format_lua51(&block);
+        assert!(source.contains("item = generator(state, internal)"));
+        assert!(source.contains("internal = item"));
+        assert!(source.contains("if item ~= nil then"));
+    }
+
+    #[test]
+    fn fallback_clone_detaches_nested_blocks() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(
+            If::new(
+                Literal::Boolean(true).into(),
+                ast::Block::default(),
+                ast::Block::default(),
+            )
+            .into(),
+        );
+
+        let mut detached = GraphStructurer::detached_function_clone(&function);
+        detached.block_mut(entry).unwrap()[0]
+            .as_if_mut()
+            .unwrap()
+            .then_block
+            .lock()
+            .push(Return::new(Vec::new()).into());
+
+        assert!(
+            function.block(entry).unwrap()[0]
+                .as_if()
+                .unwrap()
+                .then_block
+                .lock()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_structure_tracks_loop_scope_and_terminal_tails() {
+        assert!(GraphStructurer::contains_invalid_structure(
+            &ast::Block(vec![ast::Break {}.into()]),
+            0,
+        ));
+        assert!(!GraphStructurer::contains_invalid_structure(
+            &ast::Block(vec![
+                ast::While::new(
+                    Literal::Boolean(true).into(),
+                    ast::Block(vec![ast::Break {}.into()]),
+                )
+                .into(),
+            ]),
+            0,
+        ));
+        assert!(GraphStructurer::contains_invalid_structure(
+            &ast::Block(vec![
+                Return::new(Vec::new()).into(),
+                Call::new(Global::from("unreachable").into(), Vec::new()).into(),
+            ]),
+            0,
+        ));
+    }
+
+    #[test]
+    fn quadratic_collapse_work_is_bounded() {
+        assert!(GraphStructurer::collapse_within_budget(10_000));
+        assert!(!GraphStructurer::collapse_within_budget(10_001));
+        assert!(!GraphStructurer::collapse_within_budget(usize::MAX));
     }
 
     #[test]
@@ -1115,6 +1526,66 @@ mod tests {
         let returned = block.last().unwrap().as_return().unwrap();
         assert_eq!(returned.values[0], previous.clone().into());
         assert!(facts.candidate_regions()[0].members.contains(&header));
+    }
+
+    #[test]
+    fn irreducible_graph_uses_lua51_dispatcher_without_gotos() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let left = function.new_block();
+        let right = function.new_block();
+        let join = function.new_block();
+        function.set_entry(entry);
+
+        function.block_mut(entry).unwrap().push(
+            If::new(
+                Call::new(Global::from("chooseEntry").into(), Vec::new()).into(),
+                Default::default(),
+                Default::default(),
+            )
+            .into(),
+        );
+        function
+            .block_mut(left)
+            .unwrap()
+            .push(Call::new(Global::from("left").into(), Vec::new()).into());
+        function
+            .block_mut(right)
+            .unwrap()
+            .push(Call::new(Global::from("right").into(), Vec::new()).into());
+        function.block_mut(join).unwrap().push(
+            If::new(
+                Call::new(Global::from("chooseLoop").into(), Vec::new()).into(),
+                Default::default(),
+                Default::default(),
+            )
+            .into(),
+        );
+
+        function
+            .graph_mut()
+            .add_edge(entry, left, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, right, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(left, join, BlockEdge::new(BranchType::Unconditional));
+        function
+            .graph_mut()
+            .add_edge(right, join, BlockEdge::new(BranchType::Unconditional));
+        function
+            .graph_mut()
+            .add_edge(join, left, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(join, right, BlockEdge::new(BranchType::Else));
+
+        let facts = RecoveryFacts::derive(&function).unwrap();
+        let block = lift(function, &facts);
+
+        assert!(!contains_unstructured_jump(&block));
+        assert!(block.iter().any(|statement| statement.as_while().is_some()));
     }
 
     #[test]
@@ -1292,7 +1763,11 @@ mod tests {
             ast::Block(vec![ast::Goto::new(exit.clone()).into()]),
         );
         let mut block = ast::Block(vec![
-            ast::While::new(Literal::Boolean(true).into(), ast::Block(vec![inner.into()])).into(),
+            ast::While::new(
+                Literal::Boolean(true).into(),
+                ast::Block(vec![inner.into()]),
+            )
+            .into(),
             Statement::Label(exit),
         ]);
 

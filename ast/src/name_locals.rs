@@ -1,8 +1,9 @@
 use indexmap::IndexSet;
+use itertools::Either;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    Block, Call, Function, LValue, LocalRw, RValue, RcLocal, Statement, Traverse,
+    Block, Call, Function, LValue, LocalRw, PreOrPost, RValue, RcLocal, Statement, Traverse,
     is_valid_identifier,
 };
 
@@ -92,9 +93,7 @@ fn library_return_name(value: &RValue) -> Option<&'static str> {
             };
             LIBRARY_RETURN_NAMES
                 .iter()
-                .find(|(space, name, _)| {
-                    *space == namespace.name() && name == &member.as_slice()
-                })
+                .find(|(space, name, _)| *space == namespace.name() && name == &member.as_slice())
                 .map(|(_, _, label)| *label)
         }
         RValue::Global(global) if global.name() == b"setmetatable" => Some("object"),
@@ -165,9 +164,10 @@ fn initializer_shape(value: &RValue) -> Option<&'static str> {
         }
         RValue::Table(table) if table.0.is_empty() => Some("slots"),
         RValue::Table(table) => {
-            let all_string_keys = table.0.iter().all(|(key, _)| {
-                matches!(key, Some(RValue::Literal(crate::Literal::String(_))))
-            });
+            let all_string_keys = table
+                .0
+                .iter()
+                .all(|(key, _)| matches!(key, Some(RValue::Literal(crate::Literal::String(_)))));
             Some(if all_string_keys { "record" } else { "slots" })
         }
         RValue::Call(_) | RValue::Select(crate::Select::Call(_)) => {
@@ -184,12 +184,210 @@ fn initializer_shape(value: &RValue) -> Option<&'static str> {
 struct Namer {
     rename: bool,
     counter: usize,
+    next_suffix: FxHashMap<String, usize>,
     /// One frame per enclosing function. A name is taken if any frame holds
     /// it, so an inner binding cannot shadow one that is still visible.
     scopes: Vec<FxHashSet<String>>,
 }
 
 impl Namer {
+    fn record_global_name(global: &crate::Global, names: &mut FxHashSet<String>) {
+        if is_valid_identifier(global.name()) {
+            names.insert(
+                std::str::from_utf8(global.name())
+                    .expect("valid identifiers are UTF-8")
+                    .to_owned(),
+            );
+        } else {
+            names.insert("getfenv".to_owned());
+        }
+    }
+
+    fn collect_statement_global_names(
+        statement: &mut Statement,
+        names: &mut FxHashSet<String>,
+    ) {
+        let mut closures = Vec::new();
+        let _ = statement.traverse_values(&mut |phase, value| {
+            if matches!(phase, PreOrPost::Pre) {
+                match value {
+                    Either::Left(LValue::Global(global)) => {
+                        Self::record_global_name(global, names);
+                    }
+                    Either::Right(RValue::Global(global)) => {
+                        Self::record_global_name(global, names);
+                    }
+                    Either::Right(RValue::Closure(closure)) => closures.push(closure.clone()),
+                    _ => {}
+                }
+            }
+            None::<()>
+        });
+        for closure in closures {
+            Self::collect_global_names(&mut closure.function.lock().body, names);
+        }
+    }
+
+    fn collect_global_names(block: &mut Block, names: &mut FxHashSet<String>) {
+        for statement in &mut block.0 {
+            Self::collect_statement_global_names(statement, names);
+
+            match statement {
+                Statement::If(r#if) => {
+                    Self::collect_global_names(&mut r#if.then_block.lock(), names);
+                    Self::collect_global_names(&mut r#if.else_block.lock(), names);
+                }
+                Statement::Do(r#do) => {
+                    Self::collect_global_names(&mut r#do.block.lock(), names);
+                }
+                Statement::While(r#while) => {
+                    Self::collect_global_names(&mut r#while.block.lock(), names);
+                }
+                Statement::Repeat(repeat) => {
+                    Self::collect_global_names(&mut repeat.block.lock(), names);
+                }
+                Statement::NumericFor(numeric_for) => {
+                    Self::collect_global_names(&mut numeric_for.block.lock(), names);
+                }
+                Statement::GenericFor(generic_for) => {
+                    Self::collect_global_names(&mut generic_for.block.lock(), names);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn forbid_names_for_locals(
+        locals: &[RcLocal],
+        names: &FxHashSet<String>,
+        forbidden: &mut FxHashMap<RcLocal, FxHashSet<String>>,
+    ) {
+        for local in locals {
+            forbidden
+                .entry(local.clone())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+    }
+
+    fn direct_declarations(statement: &Statement) -> Vec<RcLocal> {
+        match statement {
+            Statement::Assign(assign) if assign.prefix => assign
+                .left
+                .iter()
+                .filter_map(LValue::as_local)
+                .cloned()
+                .collect(),
+            Statement::Class(class) => vec![class.target.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn prefix_function_binding(statement: &Statement) -> Option<RcLocal> {
+        let assign = statement.as_assign()?;
+        if !assign.prefix || assign.left.len() != 1 || assign.right.len() != 1 {
+            return None;
+        }
+        let local = assign.left[0].as_local()?;
+        let RValue::Closure(closure) = &assign.right[0] else {
+            return None;
+        };
+        let is_named = closure.function.lock().name.is_some();
+        let is_recursive = closure.upvalues.iter().any(|upvalue| {
+            matches!(
+                upvalue,
+                crate::Upvalue::Copy(captured) | crate::Upvalue::Ref(captured)
+                    if captured == local
+            )
+        });
+        (is_named || is_recursive).then(|| local.clone())
+    }
+
+    fn collect_shadowing_constraints(
+        block: &mut Block,
+        forbidden: &mut FxHashMap<RcLocal, FxHashSet<String>>,
+    ) -> FxHashSet<String> {
+        let mut suffix_globals = FxHashSet::default();
+        for statement in block.0.iter_mut().rev() {
+            let declarations = Self::direct_declarations(statement);
+            Self::forbid_names_for_locals(&declarations, &suffix_globals, forbidden);
+
+            let mut statement_globals = FxHashSet::default();
+            Self::collect_statement_global_names(statement, &mut statement_globals);
+            if let Some(local) = Self::prefix_function_binding(statement) {
+                Self::forbid_names_for_locals(
+                    std::slice::from_ref(&local),
+                    &statement_globals,
+                    forbidden,
+                );
+            }
+
+            match statement {
+                Statement::If(r#if) => {
+                    statement_globals.extend(Self::collect_shadowing_constraints(
+                        &mut r#if.then_block.lock(),
+                        forbidden,
+                    ));
+                    statement_globals.extend(Self::collect_shadowing_constraints(
+                        &mut r#if.else_block.lock(),
+                        forbidden,
+                    ));
+                }
+                Statement::Do(r#do) => {
+                    statement_globals.extend(Self::collect_shadowing_constraints(
+                        &mut r#do.block.lock(),
+                        forbidden,
+                    ));
+                }
+                Statement::While(r#while) => {
+                    statement_globals.extend(Self::collect_shadowing_constraints(
+                        &mut r#while.block.lock(),
+                        forbidden,
+                    ));
+                }
+                Statement::Repeat(repeat) => {
+                    let condition_globals = statement_globals.clone();
+                    let mut body = repeat.block.lock();
+                    let body_globals = Self::collect_shadowing_constraints(&mut body, forbidden);
+                    let body_locals = body
+                        .iter()
+                        .flat_map(Self::direct_declarations)
+                        .collect::<Vec<_>>();
+                    Self::forbid_names_for_locals(&body_locals, &condition_globals, forbidden);
+                    statement_globals.extend(body_globals);
+                }
+                Statement::NumericFor(numeric_for) => {
+                    let body_globals = Self::collect_shadowing_constraints(
+                        &mut numeric_for.block.lock(),
+                        forbidden,
+                    );
+                    Self::forbid_names_for_locals(
+                        std::slice::from_ref(&numeric_for.counter),
+                        &body_globals,
+                        forbidden,
+                    );
+                    statement_globals.extend(body_globals);
+                }
+                Statement::GenericFor(generic_for) => {
+                    let body_globals = Self::collect_shadowing_constraints(
+                        &mut generic_for.block.lock(),
+                        forbidden,
+                    );
+                    Self::forbid_names_for_locals(
+                        &generic_for.res_locals,
+                        &body_globals,
+                        forbidden,
+                    );
+                    statement_globals.extend(body_globals);
+                }
+                _ => {}
+            }
+
+            suffix_globals.extend(statement_globals);
+        }
+        suffix_globals
+    }
+
     fn add_declarations(block: &Block, declarations: &mut IndexSet<RcLocal>) {
         for statement in &block.0 {
             match statement {
@@ -206,6 +404,9 @@ impl Namer {
                 Statement::GenericFor(generic_for) => {
                     declarations.extend(generic_for.res_locals.iter().cloned());
                     Self::add_declarations(&generic_for.block.lock(), declarations);
+                }
+                Statement::Do(r#do) => {
+                    Self::add_declarations(&r#do.block.lock(), declarations);
                 }
                 Statement::If(r#if) => {
                     Self::add_declarations(&r#if.then_block.lock(), declarations);
@@ -472,6 +673,13 @@ impl Namer {
                     structural_names,
                     true,
                 ),
+                Statement::Do(r#do) => Self::collect_evidence(
+                    &r#do.block.lock(),
+                    parameters,
+                    evidence,
+                    structural_names,
+                    in_loop,
+                ),
                 _ => {}
             }
         }
@@ -481,8 +689,8 @@ impl Namer {
         self.scopes.iter().any(|scope| scope.contains(name))
     }
 
-    fn claim(&mut self, name: String) -> bool {
-        if self.is_taken(&name) {
+    fn claim(&mut self, name: String, forbidden: Option<&FxHashSet<String>>) -> bool {
+        if self.is_taken(&name) || forbidden.is_some_and(|names| names.contains(&name)) {
             return false;
         }
         self.scopes
@@ -492,24 +700,32 @@ impl Namer {
         true
     }
 
-    fn unique_name(&mut self, base: &str) -> String {
-        if self.claim(base.to_owned()) {
+    fn unique_name(&mut self, base: &str, forbidden: Option<&FxHashSet<String>>) -> String {
+        if self.claim(base.to_owned(), forbidden) {
+            self.next_suffix.entry(base.to_owned()).or_insert(2);
             return base.to_owned();
         }
-        for suffix in 2.. {
+        let mut suffix = self.next_suffix.get(base).copied().unwrap_or(2);
+        loop {
             let name = format!("{base}{suffix}");
-            if self.claim(name.clone()) {
+            if self.claim(name.clone(), forbidden) {
+                self.next_suffix
+                    .insert(base.to_owned(), suffix.saturating_add(1));
                 return name;
             }
+            suffix = suffix.saturating_add(1);
         }
-        unreachable!()
     }
 
-    fn fallback_name(&mut self, prefix: &str) -> String {
+    fn fallback_name(
+        &mut self,
+        prefix: &str,
+        forbidden: Option<&FxHashSet<String>>,
+    ) -> String {
         loop {
             let name = format!("{prefix}{}", self.counter);
             self.counter += 1;
-            if self.claim(name.clone()) {
+            if self.claim(name.clone(), forbidden) {
                 return name;
             }
         }
@@ -561,6 +777,7 @@ impl Namer {
         prefix: &str,
         evidence: Option<&Evidence>,
         structural_name: Option<&String>,
+        forbidden: Option<&FxHashSet<String>>,
     ) {
         let existing = (!self.rename)
             .then(|| local.0.0.lock().0.clone())
@@ -573,20 +790,24 @@ impl Namer {
 
         let name = if let Some(name) = existing.or_else(|| structural_name.cloned()).or(field_name)
         {
-            self.unique_name(&name)
+            self.unique_name(&name, forbidden)
         } else if let Some(role) = inferred {
-            self.unique_name(role)
-        } else if unused {
+            self.unique_name(role, forbidden)
+        } else if unused && forbidden.is_none_or(|names| !names.contains("_")) {
             "_".to_owned()
         } else if let Some(shape) = shape {
-            self.unique_name(shape)
+            self.unique_name(shape, forbidden)
         } else {
-            self.fallback_name(prefix)
+            self.fallback_name(prefix, forbidden)
         };
         local.0.0.lock().0 = Some(name);
     }
 
     fn name_scope(&mut self, block: &mut Block, parameters: &[RcLocal]) {
+        let mut forbidden_names = FxHashMap::default();
+        let scope_globals = Self::collect_shadowing_constraints(block, &mut forbidden_names);
+        Self::forbid_names_for_locals(parameters, &scope_globals, &mut forbidden_names);
+
         let mut declarations = parameters.iter().cloned().collect::<IndexSet<_>>();
         Self::add_declarations(block, &mut declarations);
         let parameter_set = parameters.iter().cloned().collect::<FxHashSet<_>>();
@@ -635,6 +856,7 @@ impl Namer {
                 "p",
                 evidence.get(parameter),
                 structural_names.get(parameter),
+                forbidden_names.get(parameter),
             );
         }
         // Sorted by evidence tier (stable, so declaration order still breaks
@@ -649,7 +871,13 @@ impl Namer {
             self.naming_tier(local, evidence.get(*local), structural_names.get(*local))
         });
         for local in ordered_declarations {
-            self.assign_name(local, "v", evidence.get(local), structural_names.get(local));
+            self.assign_name(
+                local,
+                "v",
+                evidence.get(local),
+                structural_names.get(local),
+                forbidden_names.get(local),
+            );
         }
 
         self.name_child_functions(block);
@@ -688,9 +916,11 @@ impl Namer {
         }
 
         let outer_counter = std::mem::replace(&mut self.counter, 1);
+        let outer_suffixes = std::mem::take(&mut self.next_suffix);
         self.scopes.push(upvalue_names);
         self.name_function(&mut function);
         self.scopes.pop();
+        self.next_suffix = outer_suffixes;
         self.counter = outer_counter;
     }
 
@@ -722,6 +952,9 @@ impl Namer {
                 Statement::GenericFor(generic_for) => {
                     self.name_child_functions(&mut generic_for.block.lock());
                 }
+                Statement::Do(r#do) => {
+                    self.name_child_functions(&mut r#do.block.lock());
+                }
                 _ => {}
             }
         }
@@ -732,6 +965,7 @@ pub fn name_locals(block: &mut Block, rename: bool) {
     Namer {
         rename,
         counter: 1,
+        next_suffix: FxHashMap::default(),
         scopes: vec![FxHashSet::default()],
     }
     .name_scope(block, &[]);
@@ -878,6 +1112,22 @@ mod tests {
         assert_eq!(local_name(&first), "value");
         assert_ne!(local_name(&duplicate), "value");
         assert_ne!(local_name(&keyword), "end");
+    }
+
+    #[test]
+    fn repeated_inferred_names_advance_the_suffix_cursor() {
+        let locals = (0..4096).map(|_| local(None)).collect::<Vec<_>>();
+        let mut statements = locals
+            .iter()
+            .map(|local| declaration(local, Global::from("source").into()).into())
+            .collect::<Vec<_>>();
+        statements.push(Return::new(locals.iter().cloned().map(Into::into).collect()).into());
+        let mut block = Block(statements);
+
+        name_locals(&mut block, false);
+
+        assert_eq!(local_name(&locals[0]), "value");
+        assert_eq!(local_name(locals.last().unwrap()), "value4096");
     }
 
     #[test]
@@ -1116,8 +1366,12 @@ mod tests {
     fn sibling_scopes_may_reuse_a_name() {
         let first = local(None);
         let second = local(None);
-        let mut left = Block(vec![declaration(&first, Literal::Number(1.0).into()).into()]);
-        let mut right = Block(vec![declaration(&second, Literal::Number(2.0).into()).into()]);
+        let mut left = Block(vec![
+            declaration(&first, Literal::Number(1.0).into()).into(),
+        ]);
+        let mut right = Block(vec![
+            declaration(&second, Literal::Number(2.0).into()).into(),
+        ]);
         let make = |body: &mut Block| Closure {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
@@ -1147,9 +1401,7 @@ mod tests {
         let counter = local(None);
         let body = Block(vec![
             Assign::new(
-                vec![
-                    crate::Index::new(registers.clone().into(), counter.clone().into()).into(),
-                ],
+                vec![crate::Index::new(registers.clone().into(), counter.clone().into()).into()],
                 vec![Literal::Number(1.0).into()],
             )
             .into(),
@@ -1377,12 +1629,7 @@ mod tests {
         let mut block = Block(vec![
             declaration(
                 &span,
-                crate::Binary::new(
-                    last.into(),
-                    first.into(),
-                    crate::BinaryOperation::Sub,
-                )
-                .into(),
+                crate::Binary::new(last.into(), first.into(), crate::BinaryOperation::Sub).into(),
             )
             .into(),
             Return::new(vec![span.clone().into()]).into(),
