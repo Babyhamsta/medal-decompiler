@@ -11,17 +11,45 @@ const MAX_GROUP: usize = 3;
 /// Joins runs of adjacent single-name declarations into one declaration list,
 /// so `local a = x` followed by `local b = y` is written `local a, b = x, y`.
 pub fn combine_local_declarations(block: &mut Block) {
-    let mut index = 0;
-    while index < block.len() {
-        let end = group_end(block, index);
-        if end > index + 1 {
-            merge(block, index, end);
-        }
-        index += 1;
-    }
+    combine_block_declarations(block);
     for statement in block.iter_mut() {
         combine_nested(statement);
     }
+}
+
+fn combine_block_declarations(block: &mut Block) {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < block.len() {
+        let end = group_end(block, index);
+        let end = end.max(index + 1);
+        groups.push((end - index, end > index + 1));
+        index = end;
+    }
+
+    let source = std::mem::take(&mut block.0);
+    let mut source = source.into_iter();
+    let mut combined = Vec::with_capacity(groups.len());
+    for (count, merge) in groups {
+        if !merge {
+            combined.push(source.next().unwrap());
+            continue;
+        }
+        let mut left = Vec::with_capacity(count);
+        let mut right = Vec::with_capacity(count);
+        for statement in source.by_ref().take(count) {
+            let Statement::Assign(assign) = statement else {
+                unreachable!("only declarations are grouped")
+            };
+            left.extend(assign.left);
+            right.extend(assign.right);
+        }
+        let mut joined = Assign::new(left, right);
+        joined.prefix = true;
+        combined.push(joined.into());
+    }
+    debug_assert!(source.next().is_none());
+    block.0 = combined;
 }
 
 fn combine_nested(statement: &mut Statement) {
@@ -144,21 +172,6 @@ fn group_end(block: &Block, start: usize) -> usize {
         end += 1;
     }
     end
-}
-
-fn merge(block: &mut Block, start: usize, end: usize) {
-    let mut left = Vec::with_capacity(end - start);
-    let mut right = Vec::with_capacity(end - start);
-    for statement in block.0.drain(start..end) {
-        let Statement::Assign(assign) = statement else {
-            unreachable!("only declarations are grouped")
-        };
-        left.extend(assign.left);
-        right.extend(assign.right);
-    }
-    let mut joined = Assign::new(left, right);
-    joined.prefix = true;
-    block.0.insert(start, joined.into());
 }
 
 #[cfg(test)]
@@ -348,6 +361,19 @@ mod tests {
             block.to_string(),
             "local v0, v1, v2 = 0, 1, 2\nlocal v3, v4 = 3, 4"
         );
+    }
+
+    #[test]
+    fn a_large_run_is_grouped_in_one_linear_rebuild() {
+        let mut block = Block(
+            (0..4096)
+                .map(|index| declare(&format!("v{index}"), Literal::Number(index as f64).into()))
+                .collect(),
+        );
+
+        combine_local_declarations(&mut block);
+
+        assert_eq!(block.len(), 4096usize.div_ceil(3));
     }
 
     #[test]

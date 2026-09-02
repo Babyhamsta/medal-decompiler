@@ -30,7 +30,10 @@ impl fmt::Display for BindingResolutionError {
 
 impl Error for BindingResolutionError {}
 
-struct BindingValidator;
+struct BindingValidator {
+    visible: FxHashSet<RcLocal>,
+    scoped_declarations: Vec<RcLocal>,
+}
 
 impl BindingValidator {
     fn error(local: &RcLocal, access: BindingAccess, statement: usize) -> BindingResolutionError {
@@ -42,37 +45,48 @@ impl BindingValidator {
     }
 
     fn require_visible<'a>(
+        &self,
         values: impl IntoIterator<Item = &'a RcLocal>,
-        visible: &FxHashSet<RcLocal>,
         access: BindingAccess,
         statement: usize,
     ) -> Result<(), BindingResolutionError> {
         for local in values {
-            if !visible.contains(local) {
+            if !self.visible.contains(local) {
                 return Err(Self::error(local, access, statement));
             }
         }
         Ok(())
     }
 
+    fn declare(&mut self, local: RcLocal, statement: usize) -> Result<(), BindingResolutionError> {
+        if !self.visible.insert(local.clone()) {
+            return Err(Self::error(&local, BindingAccess::Declaration, statement));
+        }
+        self.scoped_declarations.push(local);
+        Ok(())
+    }
+
+    fn restore_scope(&mut self, marker: usize) {
+        for local in self.scoped_declarations.drain(marker..) {
+            self.visible.remove(&local);
+        }
+    }
+
+    fn validate_child_block(&mut self, block: &Block) -> Result<(), BindingResolutionError> {
+        let marker = self.scoped_declarations.len();
+        let result = self.validate_block(block);
+        self.restore_scope(marker);
+        result
+    }
+
     fn validate_assign(
+        &mut self,
         assign: &crate::Assign,
-        visible: &mut FxHashSet<RcLocal>,
         statement: usize,
     ) -> Result<(), BindingResolutionError> {
         if !assign.prefix {
-            Self::require_visible(
-                assign.values_read(),
-                visible,
-                BindingAccess::Read,
-                statement,
-            )?;
-            return Self::require_visible(
-                assign.values_written(),
-                visible,
-                BindingAccess::Write,
-                statement,
-            );
+            self.require_visible(assign.values_read(), BindingAccess::Read, statement)?;
+            return self.require_visible(assign.values_written(), BindingAccess::Write, statement);
         }
 
         let declarations = assign
@@ -83,128 +97,99 @@ impl BindingValidator {
             .collect::<FxHashSet<_>>();
 
         for value in &assign.left {
-            Self::require_visible(value.values_read(), visible, BindingAccess::Read, statement)?;
+            self.require_visible(value.values_read(), BindingAccess::Read, statement)?;
         }
         for value in &assign.right {
             for local in value.values_read() {
                 let recursive_local_function =
                     matches!(value, RValue::Closure(_)) && declarations.contains(local);
-                if !visible.contains(local) && !recursive_local_function {
+                if !self.visible.contains(local) && !recursive_local_function {
                     return Err(Self::error(local, BindingAccess::Read, statement));
                 }
             }
         }
 
         for local in declarations {
-            if !visible.insert(local.clone()) {
-                return Err(Self::error(&local, BindingAccess::Declaration, statement));
-            }
+            self.declare(local, statement)?;
         }
         Ok(())
     }
 
-    fn validate_block(
-        block: &Block,
-        visible: &mut FxHashSet<RcLocal>,
-    ) -> Result<(), BindingResolutionError> {
+    fn validate_block(&mut self, block: &Block) -> Result<(), BindingResolutionError> {
         for (statement_index, statement) in block.iter().enumerate() {
             match statement {
                 Statement::Assign(assign) => {
-                    Self::validate_assign(assign, visible, statement_index)?;
+                    self.validate_assign(assign, statement_index)?;
                 }
                 Statement::Class(class) => {
-                    if !visible.insert(class.target.clone()) {
-                        return Err(Self::error(
-                            &class.target,
-                            BindingAccess::Declaration,
-                            statement_index,
-                        ));
-                    }
-                    Self::require_visible(
+                    self.declare(class.target.clone(), statement_index)?;
+                    self.require_visible(
                         class.values_read(),
-                        visible,
                         BindingAccess::Read,
                         statement_index,
                     )?;
                 }
                 Statement::If(if_) => {
-                    Self::require_visible(
+                    self.require_visible(
                         if_.condition.values_read(),
-                        visible,
                         BindingAccess::Read,
                         statement_index,
                     )?;
-                    Self::validate_block(&if_.then_block.lock(), &mut visible.clone())?;
-                    Self::validate_block(&if_.else_block.lock(), &mut visible.clone())?;
+                    self.validate_child_block(&if_.then_block.lock())?;
+                    self.validate_child_block(&if_.else_block.lock())?;
                 }
                 Statement::Do(do_) => {
-                    Self::validate_block(&do_.block.lock(), &mut visible.clone())?;
+                    self.validate_child_block(&do_.block.lock())?;
                 }
                 Statement::While(while_) => {
-                    Self::require_visible(
+                    self.require_visible(
                         while_.condition.values_read(),
-                        visible,
                         BindingAccess::Read,
                         statement_index,
                     )?;
-                    Self::validate_block(&while_.block.lock(), &mut visible.clone())?;
+                    self.validate_child_block(&while_.block.lock())?;
                 }
                 Statement::Repeat(repeat) => {
-                    let mut body_visible = visible.clone();
-                    Self::validate_block(&repeat.block.lock(), &mut body_visible)?;
-                    Self::require_visible(
-                        repeat.condition.values_read(),
-                        &body_visible,
-                        BindingAccess::Read,
-                        statement_index,
-                    )?;
+                    let marker = self.scoped_declarations.len();
+                    let result = self.validate_block(&repeat.block.lock()).and_then(|()| {
+                        self.require_visible(
+                            repeat.condition.values_read(),
+                            BindingAccess::Read,
+                            statement_index,
+                        )
+                    });
+                    self.restore_scope(marker);
+                    result?;
                 }
                 Statement::NumericFor(for_) => {
-                    Self::require_visible(
-                        for_.values_read(),
-                        visible,
-                        BindingAccess::Read,
-                        statement_index,
-                    )?;
-                    let mut body_visible = visible.clone();
-                    if !body_visible.insert(for_.counter.clone()) {
-                        return Err(Self::error(
-                            &for_.counter,
-                            BindingAccess::Declaration,
-                            statement_index,
-                        ));
-                    }
-                    Self::validate_block(&for_.block.lock(), &mut body_visible)?;
+                    self.require_visible(for_.values_read(), BindingAccess::Read, statement_index)?;
+                    let marker = self.scoped_declarations.len();
+                    let result = self
+                        .declare(for_.counter.clone(), statement_index)
+                        .and_then(|()| self.validate_block(&for_.block.lock()));
+                    self.restore_scope(marker);
+                    result?;
                 }
                 Statement::GenericFor(for_) => {
-                    Self::require_visible(
-                        for_.values_read(),
-                        visible,
-                        BindingAccess::Read,
-                        statement_index,
-                    )?;
-                    let mut body_visible = visible.clone();
-                    for local in &for_.res_locals {
-                        if !body_visible.insert(local.clone()) {
-                            return Err(Self::error(
-                                local,
-                                BindingAccess::Declaration,
-                                statement_index,
-                            ));
+                    self.require_visible(for_.values_read(), BindingAccess::Read, statement_index)?;
+                    let marker = self.scoped_declarations.len();
+                    let result = (|| {
+                        for local in &for_.res_locals {
+                            self.declare(local.clone(), statement_index)?;
                         }
-                    }
-                    Self::validate_block(&for_.block.lock(), &mut body_visible)?;
+                        self.validate_block(&for_.block.lock())
+                    })();
+                    self.restore_scope(marker);
+                    result?;
                 }
                 _ => {
-                    Self::require_visible(
+                    self.require_visible(
                         statement.values_read(),
-                        visible,
                         BindingAccess::Read,
                         statement_index,
                     )?;
-                    Self::require_visible(
+                    self.require_visible(
                         statement.values_written(),
-                        visible,
                         BindingAccess::Write,
                         statement_index,
                     )?;
@@ -219,7 +204,11 @@ pub fn validate_bindings(
     block: &Block,
     initially_visible: &FxHashSet<RcLocal>,
 ) -> Result<(), BindingResolutionError> {
-    BindingValidator::validate_block(block, &mut initially_visible.clone())
+    BindingValidator {
+        visible: initially_visible.clone(),
+        scoped_declarations: Vec::new(),
+    }
+    .validate_block(block)
 }
 
 #[cfg(test)]

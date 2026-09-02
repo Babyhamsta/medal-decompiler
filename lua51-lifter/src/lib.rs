@@ -106,36 +106,37 @@ fn decompile_chunk(
     lifted.reverse();
     drop(chunk);
 
-    let recovered = lifted
-        .into_par_iter()
-        .map(|(ast_function, function, upvalues_in, has_legacy_arg)| {
-            let declared_parameters = u8::try_from(
-                function
-                    .parameters
-                    .len()
-                    .saturating_sub(usize::from(has_legacy_arg)),
-            )
-            .unwrap_or(u8::MAX);
-            let declared_variadic = function.is_variadic;
-            let upvalues_out = upvalues_in.clone();
-            match decompile_function(
-                ast_function.clone(),
-                function,
-                upvalues_in,
-                has_legacy_arg,
-            ) {
-                Ok(decompiled) => decompiled,
-                Err(error) => {
-                    stub_unrecovered_function(
-                        &ast_function,
-                        &error,
-                        declared_parameters,
-                        declared_variadic,
-                    );
-                    (ByAddress(ast_function), upvalues_out)
+    let recovered =
+        lifted
+            .into_par_iter()
+            .map(|(ast_function, function, upvalues_in, has_legacy_arg)| {
+                let declared_parameters = u8::try_from(
+                    function
+                        .parameters
+                        .len()
+                        .saturating_sub(usize::from(has_legacy_arg)),
+                )
+                .unwrap_or(u8::MAX);
+                let declared_variadic = function.is_variadic;
+                let upvalues_out = upvalues_in.clone();
+                match decompile_function(
+                    ast_function.clone(),
+                    function,
+                    upvalues_in,
+                    has_legacy_arg,
+                ) {
+                    Ok(decompiled) => decompiled,
+                    Err(error) => {
+                        stub_unrecovered_function(
+                            &ast_function,
+                            &error,
+                            declared_parameters,
+                            declared_variadic,
+                        );
+                        (ByAddress(ast_function), upvalues_out)
+                    }
                 }
-            }
-        });
+            });
     let mut results = Vec::new();
     results
         .try_reserve_exact(plan.instances)
@@ -178,7 +179,9 @@ fn decompile_chunk(
                 declaration.prefix = true;
                 statements.push(ast::Statement::Assign(declaration));
             }
-            statements.push(ast::Statement::Return(ast::Return::new(vec![closure.into()])));
+            statements.push(ast::Statement::Return(ast::Return::new(vec![
+                closure.into(),
+            ])));
             ast::Block(statements)
         } else {
             root.body
@@ -533,6 +536,9 @@ fn link_upvalues_in_scope(
                 link_upvalues_in_scope(&mut value.then_block.lock(), upvalues, promoted_names);
                 link_upvalues_in_scope(&mut value.else_block.lock(), upvalues, promoted_names);
             }
+            ast::Statement::Do(value) => {
+                link_upvalues_in_scope(&mut value.block.lock(), upvalues, promoted_names);
+            }
             ast::Statement::While(value) => {
                 link_upvalues_in_scope(&mut value.block.lock(), upvalues, promoted_names);
             }
@@ -551,22 +557,56 @@ fn link_upvalues_in_scope(
 }
 
 fn unsupported_node_kind(block: &mut ast::Block) -> Option<&'static str> {
+    unsupported_node_kind_at_depth(block, 0)
+}
+
+fn unsupported_node_kind_at_depth(
+    block: &mut ast::Block,
+    loop_depth: usize,
+) -> Option<&'static str> {
+    let mut terminated = false;
     for statement in &mut block.0 {
+        let significant = !matches!(
+            statement,
+            ast::Statement::Comment(_) | ast::Statement::Empty(_)
+        );
+        if terminated && significant {
+            return Some("statement after terminal control flow");
+        }
         match statement {
             ast::Statement::Goto(_) => return Some("goto"),
             ast::Statement::Label(_) => return Some("label"),
             ast::Statement::SetList(_) => return Some("set-list"),
             ast::Statement::Continue(_) => return Some("continue"),
             ast::Statement::Class(_) => return Some("class"),
+            ast::Statement::NumForInit(_) => return Some("numeric-for initializer"),
+            ast::Statement::NumForNext(_) => return Some("numeric-for iterator"),
+            ast::Statement::GenericForInit(_) => return Some("generic-for initializer"),
+            ast::Statement::GenericForNext(_) => return Some("generic-for iterator"),
+            ast::Statement::Break(_) if loop_depth == 0 => return Some("break outside loop"),
             _ => {}
         }
         let nested = match statement {
-            ast::Statement::If(value) => unsupported_node_kind(&mut value.then_block.lock())
-                .or_else(|| unsupported_node_kind(&mut value.else_block.lock())),
-            ast::Statement::While(value) => unsupported_node_kind(&mut value.block.lock()),
-            ast::Statement::Repeat(value) => unsupported_node_kind(&mut value.block.lock()),
-            ast::Statement::NumericFor(value) => unsupported_node_kind(&mut value.block.lock()),
-            ast::Statement::GenericFor(value) => unsupported_node_kind(&mut value.block.lock()),
+            ast::Statement::If(value) => {
+                unsupported_node_kind_at_depth(&mut value.then_block.lock(), loop_depth).or_else(
+                    || unsupported_node_kind_at_depth(&mut value.else_block.lock(), loop_depth),
+                )
+            }
+            ast::Statement::Do(value) => {
+                unsupported_node_kind_at_depth(&mut value.block.lock(), loop_depth)
+            }
+            ast::Statement::While(value) => {
+                unsupported_node_kind_at_depth(&mut value.block.lock(), loop_depth + 1)
+            }
+            ast::Statement::Repeat(value) => {
+                unsupported_node_kind_at_depth(&mut value.block.lock(), loop_depth + 1)
+            }
+            ast::Statement::NumericFor(value) => {
+                unsupported_node_kind_at_depth(&mut value.block.lock(), loop_depth + 1)
+            }
+            ast::Statement::GenericFor(value) => {
+                unsupported_node_kind_at_depth(&mut value.block.lock(), loop_depth + 1)
+            }
             _ => None,
         };
         if nested.is_some() {
@@ -582,13 +622,12 @@ fn unsupported_node_kind(block: &mut ast::Block) -> Option<&'static str> {
                 ast::RValue::Literal(ast::Literal::Integer(_)) => {
                     unsupported_value = Some("integer literal")
                 }
-                ast::RValue::Binary(binary)
-                    if binary.operation == ast::BinaryOperation::IDiv =>
-                {
+                ast::RValue::Binary(binary) if binary.operation == ast::BinaryOperation::IDiv => {
                     unsupported_value = Some("floor-division expression")
                 }
                 ast::RValue::Closure(closure) => {
-                    unsupported_value = unsupported_node_kind(&mut closure.function.lock().body)
+                    unsupported_value =
+                        unsupported_node_kind_at_depth(&mut closure.function.lock().body, 0)
                 }
                 _ => {}
             }
@@ -596,17 +635,95 @@ fn unsupported_node_kind(block: &mut ast::Block) -> Option<&'static str> {
         if unsupported_value.is_some() {
             return unsupported_value;
         }
+        if significant {
+            terminated = matches!(
+                statement,
+                ast::Statement::Return(_)
+                    | ast::Statement::Break(_)
+                    | ast::Statement::Continue(_)
+                    | ast::Statement::Goto(_)
+            );
+        }
     }
     None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DecompilePhase, try_decompile_bytecode};
+    use super::{DecompilePhase, try_decompile_bytecode, unsupported_node_kind};
 
     enum Constant<'a> {
         Number(f64),
         String(&'a [u8]),
+    }
+
+    #[test]
+    fn final_output_validation_rejects_invalid_control_flow_and_pseudo_nodes() {
+        let mut root_break = ast::Block(vec![ast::Break {}.into()]);
+        assert_eq!(
+            unsupported_node_kind(&mut root_break),
+            Some("break outside loop")
+        );
+
+        let mut loop_break = ast::Block(vec![
+            ast::While::new(
+                ast::Literal::Boolean(true).into(),
+                ast::Block(vec![ast::Break {}.into()]),
+            )
+            .into(),
+        ]);
+        assert_eq!(unsupported_node_kind(&mut loop_break), None);
+
+        let closure = ast::Closure {
+            function: by_address::ByAddress(triomphe::Arc::new(parking_lot::Mutex::new(
+                ast::Function {
+                    body: ast::Block(vec![ast::Break {}.into()]),
+                    ..ast::Function::default()
+                },
+            ))),
+            upvalues: Vec::new(),
+        };
+        let mut closure_in_loop = ast::Block(vec![
+            ast::While::new(
+                ast::Literal::Boolean(true).into(),
+                ast::Block(vec![
+                    ast::Assign::new(
+                        vec![ast::LValue::Local(ast::RcLocal::default())],
+                        vec![closure.into()],
+                    )
+                    .into(),
+                ]),
+            )
+            .into(),
+        ]);
+        assert_eq!(
+            unsupported_node_kind(&mut closure_in_loop),
+            Some("break outside loop")
+        );
+
+        let mut terminal_tail = ast::Block(vec![
+            ast::Return::new(Vec::new()).into(),
+            ast::Comment::new("still terminal".to_owned()).into(),
+            ast::Call::new(ast::Global::from("unreachable").into(), Vec::new()).into(),
+        ]);
+        assert_eq!(
+            unsupported_node_kind(&mut terminal_tail),
+            Some("statement after terminal control flow")
+        );
+
+        let control = ast::RcLocal::default();
+        let mut pseudo = ast::Block(vec![
+            ast::NumForNext::new(
+                control,
+                ast::Literal::Number(1.0).into(),
+                ast::Literal::Number(1.0).into(),
+            )
+            .into(),
+        ]);
+        assert_eq!(
+            unsupported_node_kind(&mut pseudo),
+            Some("numeric-for iterator")
+        );
     }
 
     fn push_u32(output: &mut Vec<u8>, value: u32) {
@@ -715,11 +832,7 @@ mod tests {
 
     #[test]
     fn branch_to_function_end_uses_empty_terminal_block() {
-        let bytecode = chunk(
-            &[asbx(22, 0, 1), abc(30, 0, 1, 0)],
-            &[],
-            1,
-        );
+        let bytecode = chunk(&[asbx(22, 0, 1), abc(30, 0, 1, 0)], &[], 1);
 
         assert!(try_decompile_bytecode(&bytecode).is_ok());
     }
@@ -761,17 +874,7 @@ mod tests {
 
     #[test]
     fn dumped_legacy_vararg_root_keeps_its_implicit_arg_table() {
-        let bytecode = chunk_with_signature(
-            &[abc(30, 0, 2, 0)],
-            &[],
-            1,
-            1,
-            1,
-            0,
-            7,
-            0,
-            &[],
-        );
+        let bytecode = chunk_with_signature(&[abc(30, 0, 2, 0)], &[], 1, 1, 1, 0, 7, 0, &[]);
 
         let source = try_decompile_bytecode(&bytecode).unwrap();
 

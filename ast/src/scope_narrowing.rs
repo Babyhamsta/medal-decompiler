@@ -88,9 +88,12 @@ fn narrow_nested(statement: &mut Statement, budget: usize, depth: usize) {
             narrow(&mut repeat.block.lock(), budget, depth, &condition);
         }
         // The counter and the result locals live in the loop body's scope.
-        Statement::NumericFor(r#for) => {
-            narrow(&mut r#for.block.lock(), budget.saturating_sub(1), depth, &none)
-        }
+        Statement::NumericFor(r#for) => narrow(
+            &mut r#for.block.lock(),
+            budget.saturating_sub(1),
+            depth,
+            &none,
+        ),
         Statement::GenericFor(r#for) => narrow(
             &mut r#for.block.lock(),
             budget.saturating_sub(r#for.res_locals.len()),
@@ -103,9 +106,8 @@ fn narrow_nested(statement: &mut Statement, budget: usize, depth: usize) {
         if let RValue::Closure(closure) = rvalue {
             // A closure compiles into its own function, with its own registers.
             let mut function = closure.function.lock();
-            let budget = FUNCTION_BUDGET.saturating_sub(
-                function.parameters.len() + function.implicit_parameters.len(),
-            );
+            let budget = FUNCTION_BUDGET
+                .saturating_sub(function.parameters.len() + function.implicit_parameters.len());
             narrow(&mut function.body, budget, 0, &FxHashSet::default());
         }
     });
@@ -294,8 +296,17 @@ fn split_kept_declarations(body: &mut Block, kept: &FxHashSet<RcLocal>) -> Optio
     })
 }
 
-fn declarations_in(declared: &[Vec<RcLocal>], run: (usize, usize)) -> usize {
-    declared[run.0..=run.1].iter().map(Vec::len).sum()
+fn declaration_prefix_counts(declared: &[Vec<RcLocal>]) -> Vec<usize> {
+    let mut counts = Vec::with_capacity(declared.len() + 1);
+    counts.push(0usize);
+    for locals in declared {
+        counts.push(counts.last().unwrap().saturating_add(locals.len()));
+    }
+    counts
+}
+
+fn declarations_in(prefix_counts: &[usize], run: (usize, usize)) -> usize {
+    prefix_counts[run.1 + 1] - prefix_counts[run.0]
 }
 
 /// Joins neighbouring runs until each holds enough declarations to be worth a
@@ -304,13 +315,13 @@ fn declarations_in(declared: &[Vec<RcLocal>], run: (usize, usize)) -> usize {
 /// Two runs that touch can always be joined: every live range inside either one
 /// already ends within it, so it ends within the join as well. Runs separated by
 /// a block-level declaration do not touch and are left apart.
-fn merge_runs(declared: &[Vec<RcLocal>], runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+fn merge_runs(prefix_counts: &[usize], runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for run in runs {
         match merged.last_mut() {
             Some(last)
                 if last.1 + 1 == run.0
-                    && declarations_in(declared, *last) < MIN_SCOPE_DECLARATIONS =>
+                    && declarations_in(prefix_counts, *last) < MIN_SCOPE_DECLARATIONS =>
             {
                 last.1 = run.1;
             }
@@ -332,9 +343,10 @@ fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLoc
     }
 
     let declared = block.iter().map(declared_locals).collect::<Vec<_>>();
+    let prefix_counts = declaration_prefix_counts(&declared);
     let last_reference = last_references(block);
     let worth_wrapping = |run: &&(usize, usize)| {
-        declarations_in(&declared, **run) >= MIN_SCOPE_DECLARATIONS
+        declarations_in(&prefix_counts, **run) >= MIN_SCOPE_DECLARATIONS
             && (run.0 > 0 || run.1 + 1 < declared.len())
     };
 
@@ -355,13 +367,32 @@ fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLoc
     // A local live across most of the block holds every run open around it.
     // Keeping the widest-ranged one at block level lets the runs underneath it
     // close, and this repeats until the scopes on offer fit the budget.
+    let mut candidates = declared
+        .iter()
+        .enumerate()
+        .flat_map(|(index, locals)| locals.iter().map(move |local| (index, local)))
+        .filter(|(_, local)| !pinned.contains(*local) && !unsplittable.contains(*local))
+        .enumerate()
+        .map(|(order, (index, local))| {
+            (
+                last_reference.get(local).copied().unwrap_or(index) - index,
+                order,
+                local.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
     let mut kept = pinned.clone();
+    let mut next_candidate = 0;
+    let mut batch = 1usize;
     let runs = loop {
-        let runs = merge_runs(&declared, partition(&declared, &last_reference, &kept));
+        let runs = merge_runs(&prefix_counts, partition(&declared, &last_reference, &kept));
         let largest = runs
             .iter()
             .filter(|run| worth_wrapping(run))
-            .map(|run| declarations_in(&declared, *run))
+            .map(|run| declarations_in(&prefix_counts, *run))
             .max();
         // Each local kept back costs a block-level register, so this stops once
         // the scopes fit or the locals held back would fill the budget alone.
@@ -370,19 +401,18 @@ fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLoc
         {
             break runs;
         }
-        let widest = declared
-            .iter()
-            .enumerate()
-            .flat_map(|(index, locals)| locals.iter().map(move |local| (index, local)))
-            .filter(|(_, local)| !kept.contains(*local) && !unsplittable.contains(*local))
-            .max_by_key(|(index, local)| {
-                last_reference.get(*local).copied().unwrap_or(*index) - index
-            })
-            .map(|(_, local)| local.clone());
-        match widest {
-            Some(local) => kept.insert(local),
-            None => break runs,
-        };
+        let available = budget.saturating_sub(kept.len());
+        let take = batch
+            .min(available)
+            .min(candidates.len().saturating_sub(next_candidate));
+        if take == 0 {
+            break runs;
+        }
+        for (_, _, local) in &candidates[next_candidate..next_candidate + take] {
+            kept.insert(local.clone());
+        }
+        next_candidate += take;
+        batch = batch.saturating_mul(2);
     };
 
     // A kept local's declaration is split out of its scope, so it still costs a
@@ -391,9 +421,9 @@ fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLoc
         .iter()
         .filter(|run| worth_wrapping(run))
         .flat_map(|run| declared[run.0..=run.1].iter())
-        .flatten()
-        .filter(|local| !kept.contains(*local))
-        .count();
+        .filter(|locals| !locals.iter().any(|local| kept.contains(local)))
+        .map(Vec::len)
+        .sum::<usize>();
     for run in runs.into_iter().rev().filter(|run| worth_wrapping(&run)) {
         let mut body = Block(block.0.drain(run.0..=run.1).collect());
         let hoisted = split_kept_declarations(&mut body, &kept);
@@ -407,10 +437,9 @@ fn group_declarations(block: &mut Block, budget: usize, pinned: &FxHashSet<RcLoc
 
 #[cfg(test)]
 mod tests {
-    use super::{FUNCTION_BUDGET, narrow_local_scopes};
-    use crate::{
-        Assign, Block, Call, Global, Literal, Local, RValue, RcLocal, Return, Statement,
-    };
+    use super::{FUNCTION_BUDGET, group_declarations, narrow_local_scopes};
+    use crate::{Assign, Block, Call, Global, Literal, Local, RValue, RcLocal, Return, Statement};
+    use rustc_hash::FxHashSet;
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
@@ -421,7 +450,13 @@ mod tests {
         let target = local(name);
         let mut declaration = Assign::new(
             vec![target.clone().into()],
-            vec![Call::new(Global::new(format!("{name}_source").into_bytes()).into(), vec![]).into()],
+            vec![
+                Call::new(
+                    Global::new(format!("{name}_source").into_bytes()).into(),
+                    vec![],
+                )
+                .into(),
+            ],
         );
         declaration.prefix = true;
         vec![
@@ -475,6 +510,27 @@ mod tests {
         // What is left at block level fits the budget. A trailing run too small
         // to be worth a scope of its own may stay behind.
         assert!(declarations(&block) < FUNCTION_BUDGET);
+    }
+
+    #[test]
+    fn mixed_pinned_declaration_remains_fully_counted() {
+        let pinned = local("pinned");
+        let short = local("short");
+        let mut declaration = Assign::new(
+            vec![pinned.clone().into(), short.into()],
+            vec![Literal::Number(1.0).into(), Literal::Number(2.0).into()],
+        );
+        declaration.prefix = true;
+        let mut block = Block(vec![
+            declaration.into(),
+            Call::new(Global::from("work").into(), Vec::new()).into(),
+        ]);
+        let pinned = FxHashSet::from_iter([pinned]);
+
+        let held = group_declarations(&mut block, 1, &pinned);
+
+        assert_eq!(held, 2);
+        assert_eq!(declarations(&block), 2);
     }
 
     #[test]
@@ -566,16 +622,20 @@ mod tests {
         statements.push(
             Call::new(
                 Global::new(b"register".to_vec()).into(),
-                vec![crate::Closure {
-                    function: by_address::ByAddress(triomphe::Arc::new(parking_lot::Mutex::new(
-                        crate::Function {
-                            body: Block(vec![Return::new(vec![captured.clone().into()]).into()]),
-                            ..Default::default()
-                        },
-                    ))),
-                    upvalues: vec![],
-                }
-                .into()],
+                vec![
+                    crate::Closure {
+                        function: by_address::ByAddress(triomphe::Arc::new(
+                            parking_lot::Mutex::new(crate::Function {
+                                body: Block(vec![
+                                    Return::new(vec![captured.clone().into()]).into(),
+                                ]),
+                                ..Default::default()
+                            }),
+                        )),
+                        upvalues: vec![],
+                    }
+                    .into(),
+                ],
             )
             .into(),
         );

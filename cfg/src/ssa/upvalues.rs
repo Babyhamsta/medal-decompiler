@@ -8,6 +8,7 @@ use petgraph::visit::{Dfs, Walker};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::function::Function;
+use ast::LocalRw;
 
 type OpenSite = (NodeIndex, usize);
 type OpenState = FxHashMap<ast::RcLocal, EpochId>;
@@ -428,6 +429,7 @@ fn validate_local_merge_openness(
     local: &ast::RcLocal,
 ) -> Result<(), UpvalueAnalysisError> {
     let mut detached = FxHashMap::default();
+    let mut dominance = FxHashMap::default();
     let mut open_epochs = Vec::new();
     for &node in nodes {
         let mut predecessor_count = 0usize;
@@ -446,12 +448,12 @@ fn validate_local_merge_openness(
                 open_count = open_count.checked_add(1).ok_or_else(|| {
                     UpvalueAnalysisError::Resource("merge presence count overflow".into())
                 })?;
+                let canonical = epochs.find(*epoch);
                 if let Some(first_epoch) = first_epoch {
                     distinct_epoch |= first_epoch != *epoch;
                 } else {
                     first_epoch = Some(*epoch);
                 }
-                let canonical = epochs.find(*epoch);
                 if !open_epochs.contains(&canonical) {
                     reserve(open_epochs.try_reserve(1))?;
                     open_epochs.push(canonical);
@@ -462,6 +464,9 @@ fn validate_local_merge_openness(
             || open_count == 0
             || (open_count == predecessor_count && !distinct_epoch)
         {
+            continue;
+        }
+        if openness_is_unobservable_after_merge(function, node, old_locals, local) {
             continue;
         }
 
@@ -481,26 +486,209 @@ fn validate_local_merge_openness(
                 detached.insert(epoch, flags);
             }
             let flags = &detached[&epoch];
+            let mut has_open = false;
+            let mut has_closed = false;
             for predecessor in function.predecessor_blocks(node) {
-                if !exit_states.contains_key(&predecessor) {
-                    continue;
+                let predecessor_flags = flags.get(predecessor.index()).copied().unwrap_or(0);
+                let mut status = epoch_status(
+                    exit_states.get(&predecessor),
+                    local,
+                    epoch,
+                    predecessor_flags,
+                    epochs,
+                );
+                if matches!(status, EpochStatus::Closed | EpochStatus::Ambiguous) {
+                    let capture_site = epochs.site(epoch).0;
+                    let dominates =
+                        node_dominates_cached(function, capture_site, predecessor, &mut dominance)?;
+                    if !dominates {
+                        status = match status {
+                            EpochStatus::Closed => EpochStatus::Unseen,
+                            EpochStatus::Ambiguous
+                                if exit_states
+                                    .get(&predecessor)
+                                    .and_then(|state| state.get(local))
+                                    .is_some_and(|active| epochs.find(*active) == epoch) =>
+                            {
+                                EpochStatus::Open
+                            }
+                            other => other,
+                        };
+                    }
                 }
-                if flags
-                    .get(predecessor.index())
-                    .is_some_and(|flags| flags & EPOCH_DETACHED != 0)
-                {
-                    return Err(UpvalueAnalysisError::PathDependentMerge {
-                        block: node.index(),
-                    });
+                match status {
+                    EpochStatus::Open => has_open = true,
+                    EpochStatus::Closed => has_closed = true,
+                    EpochStatus::Ambiguous => {
+                        has_open = true;
+                        has_closed = true;
+                    }
+                    EpochStatus::Unseen => {}
                 }
+            }
+            if has_open && has_closed {
+                return Err(UpvalueAnalysisError::PathDependentMerge {
+                    block: node.index(),
+                });
             }
         }
     }
     Ok(())
 }
 
+fn original_local<'a>(
+    old_locals: &'a FxHashMap<ast::RcLocal, ast::RcLocal>,
+    local: &'a ast::RcLocal,
+) -> &'a ast::RcLocal {
+    old_locals.get(local).unwrap_or(local)
+}
+
+/// Checks dominance without constructing the quadratic dominator table used by
+/// petgraph's simple implementation. If `target` remains reachable after the
+/// candidate dominator is removed, the candidate does not dominate it.
+fn node_dominates_cached(
+    function: &Function,
+    dominator: NodeIndex,
+    target: NodeIndex,
+    cache: &mut FxHashMap<(NodeIndex, NodeIndex), bool>,
+) -> Result<bool, UpvalueAnalysisError> {
+    if dominator == target {
+        return Ok(true);
+    }
+    if let Some(result) = cache.get(&(dominator, target)) {
+        return Ok(*result);
+    }
+
+    let entry = (*function.entry()).ok_or_else(|| {
+        UpvalueAnalysisError::Resource("function has no control-flow entry".into())
+    })?;
+    let mut worklist = Vec::new();
+    reserve(worklist.try_reserve(function.graph().node_count()))?;
+    let mut visited = FxHashSet::default();
+    reserve(visited.try_reserve(function.graph().node_count()))?;
+    visited.insert(dominator);
+    if visited.insert(entry) {
+        worklist.push(entry);
+    }
+
+    let mut bypasses = false;
+    while let Some(node) = worklist.pop() {
+        if node == target {
+            bypasses = true;
+            break;
+        }
+        for successor in function.successor_blocks(node) {
+            if visited.insert(successor) {
+                worklist.push(successor);
+            }
+        }
+    }
+
+    let dominates = !bypasses;
+    reserve(cache.try_reserve(1))?;
+    cache.insert((dominator, target), dominates);
+    Ok(dominates)
+}
+
+/// A merge with mixed openness is harmless if no path writes or recaptures the
+/// register before closing it or leaving the function. Reading the register
+/// cannot distinguish an open stack slot from a detached upvalue because
+/// `CLOSE` preserves the register's current value. A write can distinguish the
+/// states, and a reference capture can distinguish whether the new closure
+/// shares the existing box, so both remain conservative rejection points.
+fn openness_is_unobservable_after_merge(
+    function: &Function,
+    start: NodeIndex,
+    old_locals: &FxHashMap<ast::RcLocal, ast::RcLocal>,
+    local: &ast::RcLocal,
+) -> bool {
+    let mut worklist = VecDeque::from([start]);
+    let mut visited = FxHashSet::default();
+    while let Some(node) = worklist.pop_front() {
+        if !visited.insert(node) {
+            continue;
+        }
+
+        let mut closed = false;
+        for statement in function.block(node).unwrap().iter() {
+            if let ast::Statement::Close(close) = statement
+                && close
+                    .locals
+                    .iter()
+                    .any(|closed_local| original_local(old_locals, closed_local) == local)
+            {
+                closed = true;
+                break;
+            }
+
+            let mut captures_local = false;
+            for_each_reference_capture(statement, old_locals, |captured| {
+                captures_local |= &captured == local;
+            });
+            let writes_local = statement.values_written().into_iter().any(|value| {
+                value == local
+                    || old_locals
+                        .get(value)
+                        .is_some_and(|original| original == local)
+            });
+            if captures_local || writes_local {
+                return false;
+            }
+        }
+
+        if !closed {
+            worklist.extend(function.successor_blocks(node));
+        }
+    }
+    true
+}
+
 const EPOCH_LIVE: u8 = 1;
 const EPOCH_DETACHED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EpochStatus {
+    Unseen,
+    Open,
+    Closed,
+    Ambiguous,
+}
+
+/// Classifies the tracked epoch on one incoming edge.
+///
+/// The detachment analysis intentionally keeps may-properties, so a detached
+/// bit can outlive the epoch that caused it. An active different epoch means
+/// that the tracked epoch was superseded on this edge, so its historical
+/// detached bit does not describe the binding reaching the merge. When the
+/// active state and live flags disagree, retain the conservative ambiguity
+/// rather than treating incomplete evidence as a clean path.
+fn epoch_status(
+    state: Option<&OpenState>,
+    local: &ast::RcLocal,
+    tracked_epoch: EpochId,
+    flags: u8,
+    epochs: &mut EpochForest,
+) -> EpochStatus {
+    let active_epoch = state
+        .and_then(|state| state.get(local))
+        .copied()
+        .map(|epoch| epochs.find(epoch));
+    match active_epoch {
+        Some(epoch) if epoch == tracked_epoch => {
+            if flags & EPOCH_DETACHED != 0 {
+                EpochStatus::Ambiguous
+            } else {
+                EpochStatus::Open
+            }
+        }
+        Some(_) if flags & EPOCH_DETACHED != 0 => EpochStatus::Unseen,
+        Some(_) if flags & EPOCH_LIVE != 0 => EpochStatus::Ambiguous,
+        Some(_) => EpochStatus::Unseen,
+        None if flags & EPOCH_DETACHED != 0 => EpochStatus::Closed,
+        None if flags & EPOCH_LIVE != 0 => EpochStatus::Ambiguous,
+        None => EpochStatus::Unseen,
+    }
+}
 
 /// Tracks one capture epoch of `tracked_local` through the graph.
 ///
@@ -546,20 +734,35 @@ fn epoch_detachment(
             }
         }
         for (statement_index, statement) in function.block(node).unwrap().iter().enumerate() {
-            let mut opens_tracked_epoch = None;
+            let mut capture_effect = None;
             for_each_reference_capture(statement, old_locals, |local| {
                 if &local == tracked_local {
                     let site_epoch = site_epochs[&(local, node, statement_index)];
-                    opens_tracked_epoch = Some(epochs.find(site_epoch) == tracked_epoch);
+                    capture_effect = Some((
+                        epochs.find(site_epoch) == tracked_epoch,
+                        (node, statement_index) == epochs.site(tracked_epoch),
+                    ));
                 }
             });
-            // A capture makes the site's epoch the only one attached to the
-            // register, so any other epoch stops being live here.
-            if let Some(opens_tracked_epoch) = opens_tracked_epoch {
-                flags = (flags & EPOCH_DETACHED) | if opens_tracked_epoch { EPOCH_LIVE } else { 0 };
+            // Re-executing the canonical site after a loop backedge starts a
+            // new dynamic instance, so detached history from an earlier
+            // iteration no longer describes it. A different capture site in
+            // the same canonical group must retain detached history because
+            // it may create a distinct cell on only one path.
+            if let Some((opens_tracked_epoch, is_canonical_site)) = capture_effect {
+                flags = if !opens_tracked_epoch {
+                    0
+                } else if is_canonical_site {
+                    EPOCH_LIVE
+                } else {
+                    (flags & EPOCH_DETACHED) | EPOCH_LIVE
+                };
             }
             if let ast::Statement::Close(close) = statement
-                && close.locals.contains(tracked_local)
+                && close
+                    .locals
+                    .iter()
+                    .any(|local| original_local(old_locals, local) == tracked_local)
             {
                 if flags & EPOCH_LIVE != 0 {
                     flags |= EPOCH_DETACHED;
@@ -602,7 +805,7 @@ fn transfer_block(
         });
         if let ast::Statement::Close(close) = value {
             for local in &close.locals {
-                state.remove(local);
+                state.remove(original_local(old_locals, local));
             }
         }
     }
@@ -676,6 +879,7 @@ fn materialize_ranges(
             });
             if let ast::Statement::Close(close) = value {
                 for local in &close.locals {
+                    let local = original_local(old_locals, local);
                     state.remove(local);
                     if let Some(ranges) = block_opened.get_mut(local) {
                         ranges.close_from(statement);
@@ -691,6 +895,7 @@ fn materialize_ranges(
 #[cfg(test)]
 mod tests {
     use ast::{Assign, Close, Closure, Literal, RcLocal, Upvalue};
+    use petgraph::stable_graph::NodeIndex;
     use rustc_hash::FxHashMap;
 
     use crate::{
@@ -699,6 +904,34 @@ mod tests {
     };
 
     use super::UpvaluesOpen;
+
+    #[test]
+    fn epoch_status_keeps_unrelated_and_bypass_edges_unseen() {
+        let local = RcLocal::default();
+        let mut epochs = super::EpochForest::with_capacity(2).unwrap();
+        let tracked = epochs.create((NodeIndex::new(0), 0));
+        let unrelated = epochs.create((NodeIndex::new(1), 0));
+        let unrelated_state = super::OpenState::from_iter([(local.clone(), unrelated)]);
+
+        assert_eq!(
+            super::epoch_status(
+                Some(&unrelated_state),
+                &local,
+                tracked,
+                super::EPOCH_DETACHED,
+                &mut epochs,
+            ),
+            super::EpochStatus::Unseen
+        );
+        assert_eq!(
+            super::epoch_status(Some(&unrelated_state), &local, tracked, 0, &mut epochs,),
+            super::EpochStatus::Unseen
+        );
+        assert_eq!(
+            super::epoch_status(None, &local, tracked, 0, &mut epochs),
+            super::EpochStatus::Unseen
+        );
+    }
 
     fn capture(local: &RcLocal) -> ast::Statement {
         Assign::new(
@@ -930,7 +1163,10 @@ mod tests {
             .into(),
         );
         function.block_mut(keeps_open).unwrap().push(marker());
-        function.block_mut(merge).unwrap().push(marker());
+        function
+            .block_mut(merge)
+            .unwrap()
+            .push(Assign::new(vec![captured.clone().into()], vec![Literal::Nil.into()]).into());
         function
             .graph_mut()
             .add_edge(entry, captures_first, BlockEdge::new(BranchType::Then));
@@ -1032,6 +1268,35 @@ mod tests {
     }
 
     #[test]
+    fn close_uses_the_original_register_identity() {
+        let captured = RcLocal::default();
+        let close_alias = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let after_close = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().extend([
+            capture(&captured),
+            Close {
+                locals: vec![close_alias.clone()],
+            }
+            .into(),
+        ]);
+        function.block_mut(after_close).unwrap().push(marker());
+        function
+            .graph_mut()
+            .add_edge(entry, after_close, BlockEdge::default());
+        let old_locals = FxHashMap::from_iter([
+            (captured.clone(), captured.clone()),
+            (close_alias, captured.clone()),
+        ]);
+
+        let analysis = UpvaluesOpen::try_new(&function, old_locals).unwrap();
+
+        assert_eq!(analysis.opening_location(after_close, &captured, 0), None);
+    }
+
+    #[test]
     fn unreachable_predecessor_does_not_open_capture_at_reachable_merge() {
         let captured = RcLocal::default();
         let mut function = Function::new(0);
@@ -1073,7 +1338,10 @@ mod tests {
             .into(),
         );
         function.block_mut(keeps_open).unwrap().push(marker());
-        function.block_mut(merge).unwrap().push(marker());
+        function
+            .block_mut(merge)
+            .unwrap()
+            .push(Assign::new(vec![captured.clone().into()], vec![Literal::Nil.into()]).into());
         function
             .graph_mut()
             .add_edge(entry, closes, BlockEdge::new(BranchType::Then));
@@ -1097,6 +1365,183 @@ mod tests {
     }
 
     #[test]
+    fn loop_reentry_bypass_does_not_reuse_a_detached_epoch() {
+        let captured = RcLocal::default();
+        let read = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let header = function.new_block();
+        let captures = function.new_block();
+        let merge = function.new_block();
+        let closes = function.new_block();
+        function.set_entry(entry);
+        function
+            .block_mut(captures)
+            .unwrap()
+            .push(capture(&captured));
+        function
+            .block_mut(merge)
+            .unwrap()
+            .push(Assign::new(vec![read.into()], vec![captured.clone().into()]).into());
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function
+            .graph_mut()
+            .add_edge(entry, header, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(header, captures, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(header, merge, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(captures, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(merge, closes, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(closes, header, BlockEdge::default());
+
+        UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+    }
+
+    #[test]
+    fn conditional_close_with_only_later_reads_is_safe() {
+        let captured = RcLocal::default();
+        let read = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let closes = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(capture(&captured));
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function
+            .block_mut(merge)
+            .unwrap()
+            .push(Assign::new(vec![read.into()], vec![captured.clone().into()]).into());
+        function
+            .graph_mut()
+            .add_edge(entry, closes, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, keeps_open, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(closes, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+
+        UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+    }
+
+    #[test]
+    fn later_close_before_write_resolves_conditional_openness() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let closes = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        let later_close = function.new_block();
+        let after_close = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(capture(&captured));
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function.block_mut(later_close).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function
+            .block_mut(after_close)
+            .unwrap()
+            .push(Assign::new(vec![captured.clone().into()], vec![Literal::Nil.into()]).into());
+        function
+            .graph_mut()
+            .add_edge(entry, closes, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, keeps_open, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(closes, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(merge, later_close, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(later_close, after_close, BlockEdge::default());
+
+        UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+    }
+
+    #[test]
+    fn merge_close_before_use_resolves_conditional_openness() {
+        let captured = RcLocal::default();
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let closes = function.new_block();
+        let keeps_open = function.new_block();
+        let merge = function.new_block();
+        function.set_entry(entry);
+        function.block_mut(entry).unwrap().push(capture(&captured));
+        function.block_mut(closes).unwrap().push(
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+        );
+        function.block_mut(keeps_open).unwrap().push(marker());
+        function.block_mut(merge).unwrap().extend([
+            Close {
+                locals: vec![captured.clone()],
+            }
+            .into(),
+            marker(),
+        ]);
+        function
+            .graph_mut()
+            .add_edge(entry, closes, BlockEdge::new(BranchType::Then));
+        function
+            .graph_mut()
+            .add_edge(entry, keeps_open, BlockEdge::new(BranchType::Else));
+        function
+            .graph_mut()
+            .add_edge(closes, merge, BlockEdge::default());
+        function
+            .graph_mut()
+            .add_edge(keeps_open, merge, BlockEdge::default());
+
+        let analysis = UpvaluesOpen::try_new(&function, identity_map(&captured)).unwrap();
+
+        assert_eq!(analysis.opening_location(merge, &captured, 0), None);
+        assert_eq!(analysis.opening_location(merge, &captured, 1), None);
+    }
+
+    #[test]
     fn conditional_close_and_reopen_is_rejected_at_reachable_merge() {
         let captured = RcLocal::default();
         let mut function = Function::new(0);
@@ -1114,7 +1559,10 @@ mod tests {
             capture(&captured),
         ]);
         function.block_mut(keeps_open).unwrap().push(marker());
-        function.block_mut(merge).unwrap().push(marker());
+        function
+            .block_mut(merge)
+            .unwrap()
+            .push(Assign::new(vec![captured.clone().into()], vec![Literal::Nil.into()]).into());
         function
             .graph_mut()
             .add_edge(entry, reopens, BlockEdge::new(BranchType::Then));

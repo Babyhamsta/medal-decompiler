@@ -46,6 +46,10 @@ pub struct Destructor<'a> {
     upvalue_to_group: IndexMap<RcLocal, RcLocal>,
     upvalues_in: FxHashSet<RcLocal>,
     values: FxHashMap<RcLocal, Rc<RefCell<FxHashSet<RcLocal>>>>,
+    // Value classes are immutable after compute_value_interference. Keep one
+    // ordered snapshot per class so copy sharing does not allocate a full
+    // member vector for every candidate copy.
+    value_class_members: FxHashMap<usize, Vec<RcLocal>>,
     // map( local -> rc_map( local -> (pre-order block index, param index) ) )
     // TODO: hash map?
     congruence_classes: FxHashMap<RcLocal, Rc<RefCell<CongruenceClass>>>,
@@ -58,6 +62,23 @@ pub struct Destructor<'a> {
     dominators: FxHashMap<NodeIndex, FxHashSet<NodeIndex>>,
     liveness: FxHashMap<NodeIndex, LiveSets>,
     undesirable_blocks: FxHashSet<NodeIndex>,
+    coalescing_work_remaining: usize,
+}
+
+fn coalescing_work_limit(local_count: usize) -> usize {
+    let logarithm = usize::BITS - local_count.max(1).leading_zeros();
+    local_count
+        .saturating_mul(logarithm as usize)
+        .saturating_mul(8)
+}
+
+fn reserve_work(remaining: &mut usize, amount: usize) -> bool {
+    let Some(next) = remaining.checked_sub(amount) else {
+        *remaining = 0;
+        return false;
+    };
+    *remaining = next;
+    true
 }
 
 impl<'a> Destructor<'a> {
@@ -72,6 +93,7 @@ impl<'a> Destructor<'a> {
             upvalue_to_group,
             upvalues_in,
             values: FxHashMap::with_capacity_and_hasher(local_count, Default::default()),
+            value_class_members: FxHashMap::default(),
             congruence_classes: FxHashMap::with_capacity_and_hasher(
                 local_count,
                 Default::default(),
@@ -84,7 +106,12 @@ impl<'a> Destructor<'a> {
             dominators: FxHashMap::default(),
             liveness: FxHashMap::default(),
             undesirable_blocks: FxHashSet::default(),
+            coalescing_work_remaining: coalescing_work_limit(local_count),
         }
+    }
+
+    fn reserve_coalescing_work(&mut self, amount: usize) -> bool {
+        reserve_work(&mut self.coalescing_work_remaining, amount)
     }
 
     pub fn destruct(mut self) {
@@ -474,14 +501,23 @@ impl<'a> Destructor<'a> {
     fn try_coalesce_copy_by_value(&mut self, left: RcLocal, right: RcLocal) -> bool {
         let left_con_class = self.get_congruence_class(left).clone();
         let right_con_class = self.get_congruence_class(right).clone();
+        let class_compare_cost = left_con_class
+            .borrow()
+            .len()
+            .min(right_con_class.borrow().len());
+
+        // Comparing BTreeMaps walks their common prefix. If that work cannot
+        // be charged, leave this optional copy untouched.
+        if !self.reserve_coalescing_work(class_compare_cost.saturating_add(1)) {
+            return false;
+        }
 
         if *left_con_class.borrow() == *right_con_class.borrow() {
             true
         } else if left_con_class.borrow().len() == 1 && right_con_class.borrow().len() == 1 {
             self.check_interfere_single(&left_con_class, &right_con_class)
         } else if !self.check_interfere(&left_con_class, &right_con_class) {
-            self.merge_congruence_classes(&left_con_class, &right_con_class);
-            true
+            self.merge_congruence_classes(&left_con_class, &right_con_class)
         } else {
             false
         }
@@ -492,13 +528,26 @@ impl<'a> Destructor<'a> {
         let con_class_x = self.get_congruence_class(local_a.clone()).clone();
         let con_class_y = self.get_congruence_class(local_b.clone()).clone();
 
-        let values = self
-            .get_value_class(local_a.clone())
-            .borrow()
-            .iter()
-            .cloned()
-            .collect_vec();
-        for local_c in values {
+        let value_class = self.get_value_class(local_a.clone()).clone();
+        let value_count = value_class.borrow().len();
+        let value_class_key = Rc::as_ptr(&value_class) as usize;
+        let cache_miss = !self.value_class_members.contains_key(&value_class_key);
+        // A cache miss includes the one-time snapshot cost. Every candidate
+        // still pays for scanning the members it can inspect.
+        let scan_cost = value_count.saturating_mul(if cache_miss { 2 } else { 1 });
+        if !self.reserve_coalescing_work(scan_cost) {
+            return false;
+        }
+
+        if cache_miss {
+            let values = value_class.borrow().iter().cloned().collect_vec();
+            self.value_class_members.insert(value_class_key, values);
+        }
+
+        for index in 0..value_count {
+            // Clone one handle at a time, then release the cache borrow before
+            // calling helpers that need mutable access to the destructor.
+            let local_c = self.value_class_members[&value_class_key][index].clone();
             if &local_c == local_b
                 || &local_c == local_a
                 || !self.check_pre_dom_order(&local_c, local_a)
@@ -528,6 +577,11 @@ impl<'a> Destructor<'a> {
         red: &Rc<RefCell<CongruenceClass>>,
         blue: &Rc<RefCell<CongruenceClass>>,
     ) -> bool {
+        // The singleton path still performs member ordering, liveness and
+        // value-class checks, followed by an optional map insertion.
+        if !self.reserve_coalescing_work(4) {
+            return true;
+        }
         let mut local_a = red.borrow().values().next().unwrap().clone();
         let mut local_b = blue.borrow().values().next().unwrap().clone();
         // assumes one of the blocks dominates the other
@@ -588,6 +642,9 @@ impl<'a> Destructor<'a> {
         red: &Rc<RefCell<CongruenceClass>>,
         blue: &Rc<RefCell<CongruenceClass>>,
     ) -> bool {
+        if !self.reserve_coalescing_work(red.borrow().len().saturating_add(blue.borrow().len())) {
+            return true;
+        }
         let mut dom = Vec::<(&RcLocal, RedOrBlue)>::new();
 
         let red = red.borrow();
@@ -656,13 +713,21 @@ impl<'a> Destructor<'a> {
         if let Some(local_b) = local_b.cloned() {
             assert!(!self.dominates(local_a, &local_b));
 
-            let mut tmp = Some(&local_b);
-            while let Some(curr_tmp) = tmp
-                && !self.intersect(local_a, curr_tmp)
-            {
-                tmp = self.equal_ancestor_in.get(curr_tmp);
+            let mut tmp = Some(local_b.clone());
+            loop {
+                let Some(curr_tmp) = tmp.clone() else {
+                    break;
+                };
+                if !self.reserve_coalescing_work(1) {
+                    // An exhausted budget is conservatively treated as
+                    // interference. No merge will be attempted by the caller.
+                    return true;
+                }
+                if self.intersect(local_a, &curr_tmp) {
+                    break;
+                }
+                tmp = self.equal_ancestor_in.get(&curr_tmp).cloned();
             }
-            let tmp = tmp.cloned();
 
             let local_b = local_b.clone();
             // TODO: get many mut
@@ -687,16 +752,31 @@ impl<'a> Destructor<'a> {
         &mut self,
         con_class_a: &Rc<RefCell<CongruenceClass>>,
         con_class_b: &Rc<RefCell<CongruenceClass>>,
-    ) {
-        // TODO: move out of con_class_b with con_class_b.unwrap()
-        let con_class_b = std::mem::take(&mut *con_class_b.borrow_mut());
-        for local in con_class_b.values() {
-            self.congruence_classes
-                .insert(local.clone(), con_class_a.clone());
+    ) -> bool {
+        let (target, source) = if con_class_a.borrow().len() >= con_class_b.borrow().len() {
+            (con_class_a, con_class_b)
+        } else {
+            (con_class_b, con_class_a)
+        };
+        let target_len = target.borrow().len();
+        let source_len = source.borrow().len();
+        // Map rewrites and the equal-ancestor refresh happen after the source
+        // is taken. Reserve the complete cost first so an exhausted budget
+        // never leaves a half-merged class graph.
+        let merge_cost = target_len
+            .saturating_add(source_len.saturating_mul(2))
+            .saturating_add(1);
+        if !self.reserve_coalescing_work(merge_cost) {
+            return false;
         }
-        con_class_a.borrow_mut().extend(con_class_b);
+        let source_values = std::mem::take(&mut *source.borrow_mut());
+        for local in source_values.values() {
+            self.congruence_classes
+                .insert(local.clone(), target.clone());
+        }
+        target.borrow_mut().extend(source_values);
 
-        for local in con_class_a.borrow().values() {
+        for local in target.borrow().values() {
             let local_in = self.equal_ancestor_in.get(local);
             let local_out = self.equal_ancestor_out.get(local);
             let new_local_in = match (local_in, local_out) {
@@ -715,6 +795,7 @@ impl<'a> Destructor<'a> {
                     .insert(local.clone(), new_local_in.clone());
             }
         }
+        true
     }
 
     fn compute_value_interference(&mut self) {
@@ -950,5 +1031,37 @@ impl<'a> Destructor<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{coalescing_work_limit, reserve_work};
+
+    #[test]
+    fn coalescing_budget_is_bounded_and_exhaustion_is_sticky() {
+        assert_eq!(coalescing_work_limit(0), 0);
+        assert_eq!(coalescing_work_limit(1), 8);
+        assert!(coalescing_work_limit(64) < coalescing_work_limit(128));
+
+        let mut remaining = coalescing_work_limit(128);
+        assert!(reserve_work(&mut remaining, 1));
+        assert!(remaining < coalescing_work_limit(128));
+
+        let overrun = remaining.saturating_add(1);
+        assert!(!reserve_work(&mut remaining, overrun));
+        assert_eq!(remaining, 0);
+        assert!(!reserve_work(&mut remaining, 1));
+    }
+
+    #[test]
+    fn coalescing_budget_limit_does_not_overflow() {
+        let limit = coalescing_work_limit(usize::MAX);
+        assert_eq!(limit, usize::MAX);
+
+        let mut remaining = limit;
+        assert!(reserve_work(&mut remaining, usize::MAX));
+        assert_eq!(remaining, 0);
+        assert!(!reserve_work(&mut remaining, 1));
     }
 }
