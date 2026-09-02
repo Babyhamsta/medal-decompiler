@@ -21,6 +21,7 @@ pub enum Upvalue {
 pub struct Function {
     pub name: Option<String>,
     pub parameters: Vec<RcLocal>,
+    pub implicit_parameters: Vec<RcLocal>,
     pub is_variadic: bool,
     pub is_method: bool,
     pub body: Block,
@@ -62,6 +63,7 @@ impl fmt::Display for Closure {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_closure(self)
     }

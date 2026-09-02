@@ -268,7 +268,10 @@ fn match_conditional_sequence(
     }
 }
 
-pub fn structure_conditionals(function: &mut Function) -> bool {
+fn structure_conditionals_inner(
+    function: &mut Function,
+    allow_conditional_expressions: bool,
+) -> bool {
     let mut did_structure = false;
     // TODO: does this need to be in dfs post order?
     let mut dfs = DfsPostOrder::new(function.graph(), function.entry().unwrap());
@@ -276,7 +279,7 @@ pub fn structure_conditionals(function: &mut Function) -> bool {
         if simplify_condition(function, node) {
             did_structure = true;
         }
-        if structure_bool_conditional(function, node) {
+        if structure_bool_conditional(function, node, allow_conditional_expressions) {
             did_structure = true;
         }
 
@@ -344,11 +347,20 @@ pub fn structure_conditionals(function: &mut Function) -> bool {
     did_structure
 }
 
-fn make_conditional_value(
+pub fn structure_conditionals(function: &mut Function) -> bool {
+    structure_conditionals_inner(function, true)
+}
+
+pub fn structure_conditionals_lua51(function: &mut Function) -> bool {
+    structure_conditionals_inner(function, false)
+}
+
+fn try_make_conditional_value(
     condition: ast::RValue,
     then_value: ast::RValue,
     else_value: ast::RValue,
-) -> ast::RValue {
+    allow_conditional_expressions: bool,
+) -> Option<ast::RValue> {
     if let ast::RValue::Literal(ast::Literal::Boolean(then_boolean)) = then_value
         && let ast::RValue::Literal(ast::Literal::Boolean(else_boolean)) = else_value
         && then_boolean != else_boolean
@@ -364,8 +376,21 @@ fn make_conditional_value(
     } else if then_value == condition && !condition.has_side_effects() {
         ast::Binary::new(condition, else_value, ast::BinaryOperation::Or).reduce()
     } else {
+        if !allow_conditional_expressions {
+            return None;
+        }
         ast::Conditional::new(condition, then_value, else_value).into()
     }
+    .into()
+}
+
+#[cfg(test)]
+fn make_conditional_value(
+    condition: ast::RValue,
+    then_value: ast::RValue,
+    else_value: ast::RValue,
+) -> ast::RValue {
+    try_make_conditional_value(condition, then_value, else_value, true).unwrap()
 }
 
 // TODO: STYLE: rename
@@ -374,18 +399,34 @@ fn make_bool_conditional(
     node: NodeIndex,
     then_value: ast::RValue,
     else_value: ast::RValue,
+    allow_conditional_expressions: bool,
 ) -> Option<ast::RValue> {
-    let block = function.block_mut(node).unwrap();
-    let r#if = block.last_mut().unwrap().as_if_mut().unwrap();
-    let condition = std::mem::replace(&mut r#if.condition, ast::Literal::Nil.into());
-    Some(make_conditional_value(condition, then_value, else_value))
+    let condition = function
+        .block(node)
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_if()
+        .unwrap()
+        .condition
+        .clone();
+    try_make_conditional_value(
+        condition,
+        then_value,
+        else_value,
+        allow_conditional_expressions,
+    )
 }
 
 // TODO: `return if g then true else false` in luau?
 // local a; if g then a = true else a = false end; return a -> return g and true or false
 // local a; if g then a = false else a = true end; return a -> return not g
 // local a; if g == 1 then a = true else a = false end; return a -> return g == 1
-fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool {
+fn structure_bool_conditional(
+    function: &mut Function,
+    node: NodeIndex,
+    allow_conditional_expressions: bool,
+) -> bool {
     let match_triangle = |assigner, next, next_args: FxHashMap<ast::RcLocal, ast::RValue>| {
         if let Some(edge_to_next) = function.unconditional_edge(assigner)
             && edge_to_next.target() == next
@@ -428,7 +469,13 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 let then_value = then_value.clone();
                 let else_value = else_value.clone();
 
-                if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+                if let Some(res) = make_bool_conditional(
+                    function,
+                    node,
+                    then_value,
+                    else_value,
+                    allow_conditional_expressions,
+                ) {
                     function
                         .graph_mut()
                         .edge_weight_mut(then_edge)
@@ -476,7 +523,13 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 else_edge.id(),
             );
             let res_local = res_local.clone();
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(
+                function,
+                node,
+                then_value,
+                else_value,
+                allow_conditional_expressions,
+            ) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -525,7 +578,13 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 function.unconditional_edge(else_block).unwrap().id(),
             );
             let res_local = res_local.clone();
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(
+                function,
+                node,
+                then_value,
+                else_value,
+                allow_conditional_expressions,
+            ) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -582,7 +641,13 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 function.unconditional_edge(then_block).unwrap().id(),
                 function.unconditional_edge(else_block).unwrap().id(),
             );
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(
+                function,
+                node,
+                then_value,
+                else_value,
+                allow_conditional_expressions,
+            ) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -644,7 +709,13 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
             let then_value = then_value.clone();
             let else_value = else_value.clone();
 
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(
+                function,
+                node,
+                then_value,
+                else_value,
+                allow_conditional_expressions,
+            ) {
                 function.remove_block(then_target);
                 function.remove_block(else_target);
                 let block = function.block_mut(node).unwrap();
@@ -841,7 +912,7 @@ mod tests {
         UnaryOperation,
     };
 
-    use super::make_conditional_value;
+    use super::{make_conditional_value, try_make_conditional_value};
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
@@ -856,6 +927,18 @@ mod tests {
         );
 
         assert_eq!(value.to_string(), "if condition then false else nil");
+    }
+
+    #[test]
+    fn lua51_declines_conditional_expression_fallback() {
+        let value = try_make_conditional_value(
+            local("condition").into(),
+            local("selected").into(),
+            local("fallback").into(),
+            false,
+        );
+
+        assert!(value.is_none());
     }
 
     #[test]

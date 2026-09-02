@@ -69,6 +69,7 @@ impl fmt::Display for Conditional {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_conditional(self)
     }

@@ -72,6 +72,7 @@ pub use control_flow_cleanup::*;
 pub use do_block::*;
 pub use expression_recovery::*;
 pub use r#for::*;
+pub use formatter::format_lua51;
 pub use function_recovery::*;
 pub use global::*;
 pub use goto::*;

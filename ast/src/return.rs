@@ -47,6 +47,7 @@ impl fmt::Display for Return {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
+            dialect: Default::default(),
         }
         .format_return(self)
     }

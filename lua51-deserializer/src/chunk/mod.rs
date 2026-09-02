@@ -1,6 +1,9 @@
 use std::mem;
 
-use nom::IResult;
+use nom::{
+    Err, IResult,
+    error::{Error, ErrorKind},
+};
 
 pub use header::Header;
 
@@ -17,18 +20,20 @@ pub struct Chunk<'a> {
 }
 
 impl<'a> Chunk<'a> {
-    pub fn parse(input: &'a [u8]) -> IResult<&[u8], Self> {
+    pub fn parse(input: &'a [u8]) -> IResult<&'a [u8], Self> {
         let (input, header) = Header::parse(input)?;
-        // TODO: pass header to Function::parse
-        assert_eq!(header.version_number, 0x51);
-        assert_eq!(header.format, Format::Official);
-        assert_eq!(header.endianness, Endianness::Little);
-        assert_eq!(header.int_width as usize, mem::size_of::<i32>());
-        assert_eq!(header.size_t_width as usize, mem::size_of::<u32>());
-        assert_eq!(header.instr_width as usize, mem::size_of::<u32>());
-        assert_eq!(header.number_width as usize, mem::size_of::<f64>());
-        assert!(!header.number_is_integral);
-        let (input, function) = Function::parse(input)?;
+        let supported = header.version_number == 0x51
+            && header.format == Format::Official
+            && header.endianness == Endianness::Little
+            && header.int_width as usize == mem::size_of::<i32>()
+            && matches!(header.size_t_width, 4 | 8)
+            && header.instr_width as usize == mem::size_of::<u32>()
+            && header.number_width as usize == mem::size_of::<f64>()
+            && !header.number_is_integral;
+        if !supported {
+            return Err(Err::Failure(Error::new(input, ErrorKind::Verify)));
+        }
+        let (input, function) = Function::parse_with_size_t(input, header.size_t_width)?;
 
         Ok((input, Self { function }))
     }

@@ -1,6 +1,6 @@
 use crate::{
-    BinaryOperation, Block, Continue, Literal, RValue, Reduce, Return, SideEffects, Statement,
-    Traverse, Unary, UnaryOperation,
+    BinaryOperation, Block, Continue, Literal, LocalRw, RValue, RcLocal, Reduce, Return,
+    SideEffects, Statement, Traverse, Unary, UnaryOperation,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -57,25 +57,38 @@ fn block_terminates(block: &Block) -> bool {
         .is_some_and(statement_terminates)
 }
 
-fn clean_statement(statement: &mut Statement, stats: &mut ControlFlowCleanupStats) {
+fn clean_statement(
+    statement: &mut Statement,
+    allow_continue: bool,
+    stats: &mut ControlFlowCleanupStats,
+) {
     statement.traverse_rvalues(&mut |value| {
         if let RValue::Closure(closure) = value {
-            clean_block(&mut closure.function.lock().body, false, stats);
+            clean_block(
+                &mut closure.function.lock().body,
+                false,
+                allow_continue,
+                stats,
+            );
         }
     });
 
     match statement {
         Statement::If(r#if) => {
-            clean_block(&mut r#if.then_block.lock(), false, stats);
-            clean_block(&mut r#if.else_block.lock(), false, stats);
+            clean_block(&mut r#if.then_block.lock(), false, allow_continue, stats);
+            clean_block(&mut r#if.else_block.lock(), false, allow_continue, stats);
         }
-        Statement::While(r#while) => clean_block(&mut r#while.block.lock(), true, stats),
-        Statement::Repeat(repeat) => clean_block(&mut repeat.block.lock(), true, stats),
+        Statement::While(r#while) => {
+            clean_block(&mut r#while.block.lock(), true, allow_continue, stats)
+        }
+        Statement::Repeat(repeat) => {
+            clean_block(&mut repeat.block.lock(), true, allow_continue, stats)
+        }
         Statement::NumericFor(numeric_for) => {
-            clean_block(&mut numeric_for.block.lock(), true, stats)
+            clean_block(&mut numeric_for.block.lock(), true, allow_continue, stats)
         }
         Statement::GenericFor(generic_for) => {
-            clean_block(&mut generic_for.block.lock(), true, stats)
+            clean_block(&mut generic_for.block.lock(), true, allow_continue, stats)
         }
         _ => {}
     }
@@ -268,15 +281,20 @@ fn recover_trailing_comparison_guard(
     true
 }
 
-fn clean_block(block: &mut Block, loop_body: bool, stats: &mut ControlFlowCleanupStats) {
+fn clean_block(
+    block: &mut Block,
+    loop_body: bool,
+    allow_continue: bool,
+    stats: &mut ControlFlowCleanupStats,
+) {
     loop {
         for statement in &mut block.0 {
-            clean_statement(statement, stats);
+            clean_statement(statement, allow_continue, stats);
         }
         resolve_constant_conditions(block, stats);
         normalize_empty_branches(block, stats);
         flatten_terminal_branches(block, stats);
-        if !loop_body || !recover_loop_tail_guard(block, stats) {
+        if !loop_body || !allow_continue || !recover_loop_tail_guard(block, stats) {
             break;
         }
     }
@@ -284,19 +302,246 @@ fn clean_block(block: &mut Block, loop_body: bool, stats: &mut ControlFlowCleanu
 
 pub fn cleanup_control_flow(block: &mut Block) -> ControlFlowCleanupStats {
     let mut stats = ControlFlowCleanupStats::default();
-    clean_block(block, false, &mut stats);
+    clean_block(block, false, true, &mut stats);
     while recover_trailing_comparison_guard(block, &mut stats) {}
     stats
+}
+
+pub fn cleanup_control_flow_lua51(block: &mut Block) -> ControlFlowCleanupStats {
+    let mut stats = ControlFlowCleanupStats::default();
+    clean_block(block, false, false, &mut stats);
+    while recover_trailing_comparison_guard(block, &mut stats) {}
+    stats
+}
+
+fn current_loop_controls(block: &Block) -> (bool, bool) {
+    let mut has_continue = false;
+    let mut has_break = false;
+    for statement in &block.0 {
+        let (nested_continue, nested_break) = match statement {
+            Statement::Continue(_) => (true, false),
+            Statement::Break(_) => (false, true),
+            Statement::If(value) => {
+                let then_controls = current_loop_controls(&value.then_block.lock());
+                let else_controls = current_loop_controls(&value.else_block.lock());
+                (
+                    then_controls.0 || else_controls.0,
+                    then_controls.1 || else_controls.1,
+                )
+            }
+            Statement::Do(value) => current_loop_controls(&value.block.lock()),
+            _ => (false, false),
+        };
+        has_continue |= nested_continue;
+        has_break |= nested_break;
+    }
+    (has_continue, has_break)
+}
+
+fn rewrite_current_loop_controls(block: &mut Block, break_flag: Option<&RcLocal>) {
+    let mut rewritten = Vec::with_capacity(block.len());
+    for mut statement in std::mem::take(&mut block.0) {
+        match &mut statement {
+            Statement::Continue(_) => rewritten.push(crate::Break {}.into()),
+            Statement::Break(_) => {
+                if let Some(flag) = break_flag {
+                    rewritten.push(
+                        crate::Assign::new(
+                            vec![flag.clone().into()],
+                            vec![Literal::Boolean(true).into()],
+                        )
+                        .into(),
+                    );
+                }
+                rewritten.push(statement);
+            }
+            Statement::If(value) => {
+                rewrite_current_loop_controls(&mut value.then_block.lock(), break_flag);
+                rewrite_current_loop_controls(&mut value.else_block.lock(), break_flag);
+                rewritten.push(statement);
+            }
+            Statement::Do(value) => {
+                rewrite_current_loop_controls(&mut value.block.lock(), break_flag);
+                rewritten.push(statement);
+            }
+            _ => rewritten.push(statement),
+        }
+    }
+    block.0 = rewritten;
+}
+
+fn repeat_condition_declaration_boundary(block: &Block, condition: &RValue) -> Option<usize> {
+    let condition_locals = condition
+        .values_read()
+        .into_iter()
+        .cloned()
+        .collect::<rustc_hash::FxHashSet<_>>();
+
+    block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            statement
+                .as_assign()
+                .filter(|assign| {
+                    assign.prefix
+                        && assign
+                            .left
+                            .iter()
+                            .filter_map(|value| value.as_local())
+                            .any(|local| condition_locals.contains(local))
+                })
+                .map(|_| index)
+        })
+        .last()
+}
+
+fn hoist_repeat_condition_declarations(block: &mut Block, condition: &RValue) -> Vec<Statement> {
+    let condition_locals = condition
+        .values_read()
+        .into_iter()
+        .cloned()
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let mut declarations = Vec::new();
+    let mut remove = Vec::new();
+    for (index, statement) in block.0.iter_mut().enumerate() {
+        let Some(assign) = statement.as_assign_mut() else {
+            continue;
+        };
+        if !assign.prefix
+            || !assign
+                .left
+                .iter()
+                .filter_map(|value| value.as_local())
+                .any(|local| condition_locals.contains(local))
+        {
+            continue;
+        }
+
+        let declared = assign
+            .left
+            .iter()
+            .filter_map(|value| value.as_local().cloned())
+            .collect::<Vec<_>>();
+        if declared.is_empty() {
+            continue;
+        }
+        for local in &declared {
+            local.0.0.lock().0 = Some(format!("__lua51_repeat_local_{}", local.id()));
+        }
+        let mut declaration = crate::Assign::new(
+            declared.into_iter().map(crate::LValue::Local).collect(),
+            Vec::new(),
+        );
+        declaration.prefix = true;
+        declarations.push(declaration.into());
+        if assign.right.is_empty() {
+            remove.push(index);
+        } else {
+            assign.prefix = false;
+        }
+    }
+    for index in remove.into_iter().rev() {
+        block.remove(index);
+    }
+    declarations
+}
+
+fn lower_lua51_current_loop_body(block: &mut Block) {
+    let (has_continue, has_break) = current_loop_controls(block);
+    if !has_continue {
+        return;
+    }
+
+    let break_flag = has_break.then(RcLocal::default);
+    rewrite_current_loop_controls(block, break_flag.as_ref());
+    let wrapped = crate::Repeat::new(Literal::Boolean(true).into(), std::mem::take(block));
+    if let Some(flag) = break_flag {
+        let mut declaration = crate::Assign::new(
+            vec![flag.clone().into()],
+            vec![Literal::Boolean(false).into()],
+        );
+        declaration.prefix = true;
+        block.0.push(declaration.into());
+        block.0.push(wrapped.into());
+        block.0.push(
+            crate::If::new(
+                flag.into(),
+                Block(vec![crate::Break {}.into()]),
+                Block::default(),
+            )
+            .into(),
+        );
+    } else {
+        block.0.push(wrapped.into());
+    }
+}
+
+fn lower_lua51_loop_body(block: &mut Block, repeat_condition: Option<&RValue>) {
+    lower_lua51_continues_nested(block);
+    if !current_loop_controls(block).0 {
+        return;
+    }
+
+    if let Some(boundary) = repeat_condition
+        .and_then(|condition| repeat_condition_declaration_boundary(block, condition))
+    {
+        let prefix = Block(block.0[..=boundary].to_vec());
+        if current_loop_controls(&prefix).0 {
+            let mut declarations = hoist_repeat_condition_declarations(
+                block,
+                repeat_condition.expect("repeat declaration boundary requires a condition"),
+            );
+            lower_lua51_current_loop_body(block);
+            declarations.append(&mut block.0);
+            block.0 = declarations;
+            return;
+        }
+
+        let mut suffix = Block(block.0.split_off(boundary + 1));
+        lower_lua51_current_loop_body(&mut suffix);
+        block.0.extend(suffix.0);
+    } else {
+        lower_lua51_current_loop_body(block);
+    }
+}
+
+fn lower_lua51_continues_nested(block: &mut Block) {
+    for statement in &mut block.0 {
+        statement.traverse_rvalues(&mut |value| {
+            if let RValue::Closure(closure) = value {
+                lower_lua51_continues(&mut closure.function.lock().body);
+            }
+        });
+        match statement {
+            Statement::If(value) => {
+                lower_lua51_continues_nested(&mut value.then_block.lock());
+                lower_lua51_continues_nested(&mut value.else_block.lock());
+            }
+            Statement::Do(value) => lower_lua51_continues_nested(&mut value.block.lock()),
+            Statement::While(value) => lower_lua51_loop_body(&mut value.block.lock(), None),
+            Statement::Repeat(value) => {
+                lower_lua51_loop_body(&mut value.block.lock(), Some(&value.condition))
+            }
+            Statement::NumericFor(value) => lower_lua51_loop_body(&mut value.block.lock(), None),
+            Statement::GenericFor(value) => lower_lua51_loop_body(&mut value.block.lock(), None),
+            _ => {}
+        }
+    }
+}
+
+pub fn lower_lua51_continues(block: &mut Block) {
+    lower_lua51_continues_nested(block);
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         Assign, Binary, BinaryOperation, Block, Call, Global, If, Index, LValue, Literal, Local,
-        RValue, RcLocal, Return, Statement, Unary, UnaryOperation, While,
+        Break, Continue, RValue, RcLocal, Repeat, Return, Statement, Unary, UnaryOperation, While,
     };
 
-    use super::cleanup_control_flow;
+    use super::{cleanup_control_flow, cleanup_control_flow_lua51};
 
     fn local(name: &str) -> RcLocal {
         RcLocal::new(Local::new(Some(name.to_owned())))
@@ -503,6 +748,190 @@ mod tests {
                     && matches!(unary.value.as_ref(), RValue::Local(local) if local == &enabled)));
         assert!(loop_body[1].as_assign().is_some());
         assert!(loop_body[2].as_assign().is_some());
+    }
+
+    #[test]
+    fn lua51_cleanup_does_not_create_continue() {
+        let enabled = local("enabled");
+        let value = local("value");
+        let loop_body = Block(vec![
+            If::new(
+                enabled.into(),
+                Block(vec![assign(&value, 1.0), assign(&value, 2.0)]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+        let mut block = Block(vec![
+            While::new(Literal::Boolean(true).into(), loop_body).into(),
+        ]);
+
+        let stats = cleanup_control_flow_lua51(&mut block);
+        let loop_body = block[0].as_while().unwrap().block.lock();
+
+        assert_eq!(stats.loop_guards, 0);
+        assert!(loop_body[0].as_if().is_some());
+    }
+
+    #[test]
+    fn lua51_lowering_preserves_continue_and_break_meanings() {
+        let skip = local("skip");
+        let stop = local("stop");
+        let loop_body = Block(vec![
+            If::new(
+                skip.into(),
+                Block(vec![Continue {}.into()]),
+                Block::default(),
+            )
+            .into(),
+            If::new(
+                stop.into(),
+                Block(vec![Break {}.into()]),
+                Block::default(),
+            )
+            .into(),
+        ]);
+        let mut block = Block(vec![
+            While::new(Literal::Boolean(true).into(), loop_body).into(),
+        ]);
+
+        super::lower_lua51_continues(&mut block);
+        let source = crate::format_lua51(&block);
+
+        assert!(!source.contains("continue"), "{source}");
+        assert!(source.contains("repeat"), "{source}");
+        assert!(source.contains("until true"), "{source}");
+    }
+
+    #[test]
+    fn lua51_repeat_continue_keeps_body_local_visible_to_condition() {
+        let done = local("done");
+        let declaration = Assign::new(
+            vec![done.clone().into()],
+            vec![Literal::Boolean(false).into()],
+        );
+        let block = Block(vec![
+            Repeat::new(
+                done.clone().into(),
+                Block(vec![declaration.into(), Continue {}.into()]),
+            )
+            .into(),
+        ]);
+        let block = triomphe::Arc::new(parking_lot::Mutex::new(block));
+        crate::local_declarations::LocalDeclarer::default()
+            .declare_locals(triomphe::Arc::clone(&block), &Default::default());
+        let mut block = triomphe::Arc::try_unwrap(block).unwrap().into_inner();
+
+        super::lower_lua51_continues(&mut block);
+
+        assert!(crate::validate_bindings(&block, &Default::default()).is_ok());
+        let source = crate::format_lua51(&block);
+        assert!(!source.contains("continue"), "{source}");
+        assert!(source.contains("local done"), "{source}");
+        assert!(source.contains("until done"), "{source}");
+    }
+
+    #[test]
+    fn lua51_repeat_continue_preserves_declaration_initializer_scope() {
+        let done = local("done");
+        let declaration = Assign::new(
+            vec![done.clone().into()],
+            vec![Global::from("done").into()],
+        );
+        let block = Block(vec![
+            Repeat::new(
+                done.clone().into(),
+                Block(vec![declaration.into(), Continue {}.into()]),
+            )
+            .into(),
+        ]);
+        let block = triomphe::Arc::new(parking_lot::Mutex::new(block));
+        crate::local_declarations::LocalDeclarer::default()
+            .declare_locals(triomphe::Arc::clone(&block), &Default::default());
+        let mut block = triomphe::Arc::try_unwrap(block).unwrap().into_inner();
+
+        super::lower_lua51_continues(&mut block);
+
+        assert!(crate::validate_bindings(&block, &Default::default()).is_ok());
+        let repeat = block[0].as_repeat().unwrap();
+        let body = repeat.block.lock();
+        let declaration = body[0].as_assign().expect("condition local declaration");
+        assert!(declaration.prefix);
+        assert!(matches!(declaration.right.as_slice(), [RValue::Global(_)]));
+        drop(body);
+        let source = crate::format_lua51(&block);
+        assert!(!source.contains("continue"), "{source}");
+        assert!(source.contains("local done = done"), "{source}");
+    }
+
+    #[test]
+    fn lua51_repeat_continue_before_condition_local_is_lowered() {
+        let skip = local("skip");
+        let done = local("done");
+        let declaration = Assign::new(
+            vec![done.clone().into()],
+            vec![Global::from("done").into()],
+        );
+        let block = Block(vec![
+            Repeat::new(
+                done.clone().into(),
+                Block(vec![
+                    If::new(
+                        skip.into(),
+                        Block(vec![Continue {}.into()]),
+                        Block::default(),
+                    )
+                    .into(),
+                    declaration.into(),
+                ]),
+            )
+            .into(),
+        ]);
+        let block = triomphe::Arc::new(parking_lot::Mutex::new(block));
+        crate::local_declarations::LocalDeclarer::default()
+            .declare_locals(triomphe::Arc::clone(&block), &Default::default());
+        let mut block = triomphe::Arc::try_unwrap(block).unwrap().into_inner();
+
+        super::lower_lua51_continues(&mut block);
+
+        assert!(crate::validate_bindings(&block, &Default::default()).is_ok());
+        let source = crate::format_lua51(&block);
+        assert!(!source.contains("continue"), "{source}");
+        assert!(source.contains("= done"), "{source}");
+        assert!(source.contains("until __lua51_repeat_local_"), "{source}");
+    }
+
+    #[test]
+    fn lua51_repeat_continue_before_bare_condition_local_formats() {
+        let skip = local("skip");
+        let done = local("done");
+        let declaration = Assign::new(vec![done.clone().into()], Vec::new());
+        let block = Block(vec![
+            Repeat::new(
+                done.clone().into(),
+                Block(vec![
+                    If::new(
+                        skip.into(),
+                        Block(vec![Continue {}.into()]),
+                        Block::default(),
+                    )
+                    .into(),
+                    declaration.into(),
+                ]),
+            )
+            .into(),
+        ]);
+        let block = triomphe::Arc::new(parking_lot::Mutex::new(block));
+        crate::local_declarations::LocalDeclarer::default()
+            .declare_locals(triomphe::Arc::clone(&block), &Default::default());
+        let mut block = triomphe::Arc::try_unwrap(block).unwrap().into_inner();
+
+        super::lower_lua51_continues(&mut block);
+
+        assert!(crate::validate_bindings(&block, &Default::default()).is_ok());
+        let source = crate::format_lua51(&block);
+        assert!(!source.contains("continue"), "{source}");
+        assert!(source.contains("local __lua51_repeat_local_"), "{source}");
     }
 
     #[test]

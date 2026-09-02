@@ -207,6 +207,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: vec![stack_parameter, value_parameter],
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: Block::default(),
@@ -236,6 +237,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: vec![local(Some(parameter_name))],
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: Block::default(),
@@ -273,6 +275,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: vec![local(Some("stack"))],
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: Block::default(),
@@ -303,6 +306,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: vec![stack_parameter],
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: Block::default(),
@@ -314,6 +318,7 @@ mod tests {
             function: ByAddress(Arc::new(Mutex::new(Function {
                 name: None,
                 parameters: Vec::new(),
+                implicit_parameters: Vec::new(),
                 is_variadic: false,
                 is_method: false,
                 body: Block(vec![
