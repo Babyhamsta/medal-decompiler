@@ -25,9 +25,12 @@ use lua51_deserializer::chunk::Chunk;
 
 pub use error::{DecompileError, DecompilePhase};
 
+mod disasm;
 mod error;
 mod lifter;
 mod validate;
+
+pub use disasm::{DisassembleError, ProtoSelection, disassemble, list_prototypes};
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
