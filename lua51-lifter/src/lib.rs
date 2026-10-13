@@ -799,6 +799,124 @@ mod tests {
     }
 
     #[test]
+    fn fixed_call_keeps_both_pcall_results() {
+        let bytecode = chunk(
+            &[
+                abx(5, 0, 0),     // GETGLOBAL pcall
+                abx(5, 1, 1),     // GETGLOBAL type
+                abx(1, 2, 2),     // LOADK "value"
+                abc(28, 0, 3, 3), // CALL: two results
+                abc(30, 0, 3, 0),
+            ],
+            &[
+                Constant::String(b"pcall"),
+                Constant::String(b"type"),
+                Constant::String(b"value"),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            try_decompile_bytecode(&bytecode).unwrap(),
+            "local v1, v2 = pcall(type, \"value\")\nreturn v1, v2"
+        );
+    }
+
+    #[test]
+    fn fixed_call_keeps_nil_bearing_result_packet() {
+        let bytecode = chunk(
+            &[
+                abx(5, 0, 0),
+                abx(1, 1, 1),
+                abx(1, 2, 2),
+                abc(3, 3, 3, 0),
+                abx(1, 4, 3),
+                abc(3, 5, 5, 0),
+                abc(28, 0, 6, 4), // select returns nil, "c", nil
+                abc(30, 0, 4, 0),
+            ],
+            &[
+                Constant::String(b"select"),
+                Constant::Number(2.0),
+                Constant::String(b"a"),
+                Constant::String(b"c"),
+            ],
+            6,
+        );
+
+        assert_eq!(
+            try_decompile_bytecode(&bytecode).unwrap(),
+            "local v1, v2, v3 = select(2, \"a\", nil, \"c\", nil)\nreturn v1, v2, v3"
+        );
+    }
+
+    #[test]
+    fn fixed_vararg_keeps_three_results() {
+        let bytecode = chunk_with_signature(
+            &[abc(37, 0, 4, 0), abc(30, 0, 4, 0)],
+            &[],
+            3,
+            0,
+            0,
+            0,
+            2,
+            0,
+            &[],
+        );
+
+        assert_eq!(
+            try_decompile_bytecode(&bytecode).unwrap(),
+            "local v1, v2, v3 = ...\nreturn v1, v2, v3"
+        );
+    }
+
+    #[test]
+    fn single_call_and_vararg_results_stay_scalar_when_inlined_into_return() {
+        let call = chunk(
+            &[abx(5, 0, 0), abc(28, 0, 1, 2), abc(30, 0, 2, 0)],
+            &[Constant::String(b"produce")],
+            2,
+        );
+        let vararg = chunk_with_signature(
+            &[abc(37, 0, 2, 0), abc(30, 0, 2, 0)],
+            &[],
+            2,
+            0,
+            0,
+            0,
+            2,
+            0,
+            &[],
+        );
+
+        assert_eq!(try_decompile_bytecode(&call).unwrap(), "return (produce())");
+        assert_eq!(try_decompile_bytecode(&vararg).unwrap(), "return (...)");
+    }
+
+    #[test]
+    fn discarded_call_runs_and_zero_result_vararg_is_omitted() {
+        let call = chunk(
+            &[abx(5, 0, 0), abc(28, 0, 1, 1), abc(30, 0, 1, 0)],
+            &[Constant::String(b"effect")],
+            2,
+        );
+        let vararg = chunk_with_signature(
+            &[abc(37, 0, 1, 0), abx(1, 0, 0), abc(30, 0, 2, 0)],
+            &[Constant::Number(7.0)],
+            2,
+            0,
+            0,
+            0,
+            2,
+            0,
+            &[],
+        );
+
+        assert_eq!(try_decompile_bytecode(&call).unwrap(), "effect()");
+        assert_eq!(try_decompile_bytecode(&vararg).unwrap(), "return 7");
+    }
+
+    #[test]
     fn invalid_bytecode_returns_structured_deserialize_error() {
         let error = try_decompile_bytecode(b"not bytecode").unwrap_err();
 

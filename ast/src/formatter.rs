@@ -1439,6 +1439,86 @@ mod tests {
     }
 
     #[test]
+    fn result_list_positions_preserve_expansion_and_explicit_scalar_adjustment() {
+        let producers = [
+            (
+                Select::Call(Call::new(Global::from("produce").into(), Vec::new())),
+                "produce()",
+            ),
+            (
+                Select::MethodCall(MethodCall::new(
+                    local("object").into(),
+                    "produce".to_owned(),
+                    Vec::new(),
+                )),
+                "object:produce()",
+            ),
+            (Select::VarArg(VarArg), "..."),
+        ];
+        for (producer, text) in producers {
+            let open = producer.clone().into_rvalue(ResultDemand::Open);
+            let scalar = producer.into_rvalue(ResultDemand::Exact(1));
+            let marker = Literal::Number(1.0).into();
+            let targets = vec![local("a").into(), local("b").into(), local("c").into()];
+            let blocks = [
+                (
+                    Return::new(vec![open.clone(), marker]).into(),
+                    format!("return {text}, 1"),
+                ),
+                (
+                    Return::new(vec![Literal::Number(1.0).into(), open.clone()]).into(),
+                    format!("return 1, {text}"),
+                ),
+                (
+                    Return::new(vec![scalar.clone()]).into(),
+                    format!("return ({text})"),
+                ),
+                (
+                    Assign::new(targets.clone(), vec![open.clone()]).into(),
+                    format!("a, b, c = {text}"),
+                ),
+                (
+                    Assign::new(targets, vec![scalar.clone()]).into(),
+                    format!("a, b, c = ({text})"),
+                ),
+                (
+                    Call::new(
+                        Global::from("consume").into(),
+                        vec![open.clone(), Literal::Number(1.0).into()],
+                    )
+                    .into(),
+                    format!("consume({text}, 1)"),
+                ),
+                (
+                    Call::new(
+                        Global::from("consume").into(),
+                        vec![Literal::Number(1.0).into(), open.clone()],
+                    )
+                    .into(),
+                    format!("consume(1, {text})"),
+                ),
+                (
+                    Call::new(Global::from("consume").into(), vec![scalar.clone()]).into(),
+                    format!("consume(({text}))"),
+                ),
+                (
+                    Return::new(vec![Table(vec![(None, open)]).into()]).into(),
+                    format!("return {{ {text} }}"),
+                ),
+                (
+                    Return::new(vec![Table(vec![(None, scalar)]).into()]).into(),
+                    format!("return {{ ({text}) }}"),
+                ),
+            ];
+            for (statement, expected) in blocks {
+                let block = Block(vec![statement]);
+                assert_eq!(block.to_string(), expected);
+                assert_eq!(super::format_lua51(&block), expected);
+            }
+        }
+    }
+
+    #[test]
     fn conditional_tail_disambiguates_following_parenthesized_call() {
         let conditional = Conditional::new(
             local("condition").into(),

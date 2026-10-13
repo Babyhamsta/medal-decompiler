@@ -669,7 +669,9 @@ impl<'a, 'b> Lifter<'a, 'b> {
                                     (function.0..function.0 + return_values - 1)
                                         .map(|r| self.locals[&Register(r)].clone().into())
                                         .collect_vec(),
-                                    vec![ast::RValue::Select(call.into())],
+                                    vec![ast::Select::Call(call).into_rvalue(
+                                        ast::ResultDemand::Exact((return_values - 1) as usize),
+                                    )],
                                 )
                                 .into(),
                             );
@@ -704,17 +706,18 @@ impl<'a, 'b> Lifter<'a, 'b> {
                 }
                 &Instruction::VarArg(destination, b) => {
                     let vararg = ast::VarArg {};
-                    if b != 0 {
+                    if b > 1 {
                         statements.push(
                             ast::Assign::new(
                                 (destination.0..destination.0 + b - 1)
                                     .map(|r| self.locals[&Register(r)].clone().into())
                                     .collect(),
-                                vec![ast::RValue::Select(vararg.into())],
+                                vec![ast::Select::VarArg(vararg)
+                                    .into_rvalue(ast::ResultDemand::Exact((b - 1) as usize))],
                             )
                             .into(),
                         );
-                    } else {
+                    } else if b == 0 {
                         top = Some((vararg.into(), destination.0));
                     }
                 }
