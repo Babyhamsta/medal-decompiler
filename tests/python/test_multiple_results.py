@@ -87,6 +87,39 @@ CASES = (
         'local object = {produce = function(self) return nil, "middle", nil end}; return (object:produce())',
         "1|nil:nil",
     ),
+    (
+        "nested_closure_method_packet",
+        """local receiver = {
+    count = 5,
+    bump = function(self, amount)
+        self.count = self.count + amount
+        return self.count
+    end,
+}
+local a, b, c = (function(...)
+    local values = {...}
+    local first, second = (function(value)
+        return value, value + 2
+    end)(values[1])
+    return receiver:bump(first), second, #values
+end)(4, 6, 8)
+return a, b, c, receiver.count""",
+        "4|number:9|number:6|number:3|number:9",
+    ),
+    (
+        "nested_closure_nil_packet",
+        """local a, b, c = (function(...)
+    local first, middle, last = (function(...) return ... end)(...)
+    return first, middle, last
+end)(nil, "middle", nil)
+return a, b, c""",
+        "3|nil:nil|string:middle|nil:nil",
+    ),
+    (
+        "closure_scalar_packet",
+        "local a, b = ((function() return 7, 11 end)()); return a, b",
+        "2|number:7|nil:nil",
+    ),
 )
 
 
