@@ -17,6 +17,17 @@ local fresh_get = function() return current[1] end
 return {returned}"""
 
 
+EFFECT_WRITES = """local trace = ""
+local function mark(tag, value)
+    trace = trace .. tag
+    return value
+end
+local current = {mark("A", "first"), mark("B", nil)}
+current.label = mark("C", "named")
+current[3] = mark("D", "third")
+"""
+
+
 CASES = (
     (
         "nil_overwrite",
@@ -55,6 +66,23 @@ CASES = (
             "nil", 'current.label = "new"', "old_get(), current[1], current.label"
         ),
         "3|nil:nil|nil:nil|string:new",
+    ),
+    (
+        "effect_before_return_snapshot",
+        EFFECT_WRITES
+        + "return trace, current[1], current[2], current[3], current.label",
+        "5|string:ABCD|string:first|nil:nil|string:third|string:named",
+    ),
+    (
+        "effect_before_argument_snapshot",
+        EFFECT_WRITES
+        + "return (function(before, value) return before, value end)(trace, current[3])",
+        "2|string:ABCD|string:third",
+    ),
+    (
+        "effect_after_literal_prefix",
+        EFFECT_WRITES + 'return "constant", current[3], trace',
+        "3|string:constant|string:third|string:ABCD",
     ),
 )
 

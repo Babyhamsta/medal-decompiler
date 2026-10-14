@@ -740,8 +740,11 @@ fn place_value(
             return Some(placed);
         }
     }
+    // A moved call can change a captured local before this earlier read.
     // The node's own effect happens after its children are evaluated.
-    if has_observable_effect(target, foldable) {
+    if has_observable_effect(target, foldable)
+        || fold.value.has_side_effects() && !target.values_read().is_empty()
+    {
         *crossed = true;
     }
     None
@@ -1151,6 +1154,46 @@ mod tests {
         ]);
 
         assert_eq!(fold_table_slots(&mut block, &[]), 0);
+    }
+
+    #[test]
+    fn keeps_effectful_slot_values_before_earlier_local_reads() {
+        let registers = local(Some("registers"));
+        let trace = local(Some("trace"));
+        let earlier_values = [
+            trace.clone().into(),
+            crate::Closure {
+                function: Default::default(),
+                upvalues: vec![crate::Upvalue::Copy(trace)],
+            }
+            .into(),
+        ];
+        for earlier in earlier_values {
+            let produce = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+            let mut block = Block(vec![
+                declaration(&registers),
+                Assign::new(vec![slot(&registers, 1.0)], vec![produce.into()]).into(),
+                crate::Return::new(vec![earlier, slot_read(&registers, 1.0)]).into(),
+            ]);
+            let original = block.clone();
+
+            assert_eq!(fold_table_slots(&mut block, &[]), 0);
+            assert_eq!(block, original);
+        }
+    }
+
+    #[test]
+    fn folds_effectful_slot_values_after_a_literal_prefix() {
+        let registers = local(Some("registers"));
+        let produce = Select::Call(Call::new(Global::from("produce").into(), Vec::new()));
+        let mut block = Block(vec![
+            declaration(&registers),
+            Assign::new(vec![slot(&registers, 1.0)], vec![produce.into()]).into(),
+            crate::Return::new(vec![Literal::Number(1.0).into(), slot_read(&registers, 1.0)])
+                .into(),
+        ]);
+
+        assert_eq!(fold_table_slots(&mut block, &[]), 1);
     }
 
     /// The mirror image: the read comes first in evaluation order, so the
