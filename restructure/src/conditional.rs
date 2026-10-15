@@ -259,6 +259,8 @@ impl GraphStructurer {
         } else if Some(node) == next {
             let block = &mut self.function.block_mut(entry).unwrap();
             block.push(ast::Break {}.into());
+        } else {
+            return false;
         }
         self.function.set_edges(entry, vec![]);
         true

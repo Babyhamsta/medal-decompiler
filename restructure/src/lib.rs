@@ -1277,6 +1277,87 @@ mod tests {
     }
 
     #[test]
+    fn virtual_jump_keeps_unclassified_targets() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let header = function.new_block();
+        let target = function.new_block();
+        function.set_entry(entry);
+        function
+            .block_mut(entry)
+            .unwrap()
+            .push(Call::new(Global::from("recordExit").into(), Vec::new()).into());
+        function.set_edges(
+            entry,
+            vec![(target, BlockEdge::new(BranchType::Unconditional))],
+        );
+        let facts = RecoveryFacts::derive(&function).unwrap();
+        let mut structurer = GraphStructurer::new(function, &facts);
+        let post_dom = super::post_dominators(structurer.function.graph_mut());
+        let original = structurer.function.block(entry).unwrap().clone();
+
+        for next in [None, Some(entry)] {
+            assert!(!structurer.refine_virtual_edge_jump(&post_dom, entry, target, header, next));
+            assert_eq!(structurer.function.block(entry).unwrap(), &original);
+            assert_eq!(
+                structurer
+                    .function
+                    .successor_blocks(entry)
+                    .collect::<Vec<_>>(),
+                vec![target]
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_jump_emits_recognized_break() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let header = function.new_block();
+        let exit = function.new_block();
+        function.set_entry(entry);
+        function.set_edges(
+            entry,
+            vec![(exit, BlockEdge::new(BranchType::Unconditional))],
+        );
+        let facts = RecoveryFacts::derive(&function).unwrap();
+        let mut structurer = GraphStructurer::new(function, &facts);
+        let post_dom = super::post_dominators(structurer.function.graph_mut());
+
+        assert!(structurer.refine_virtual_edge_jump(&post_dom, entry, exit, header, Some(exit)));
+        assert!(matches!(
+            structurer.function.block(entry).unwrap().as_slice(),
+            [Statement::Break(_)]
+        ));
+        assert_eq!(structurer.function.successor_blocks(entry).count(), 0);
+    }
+
+    #[test]
+    fn virtual_jump_keeps_unproven_continue() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        let header = function.new_block();
+        function.set_entry(entry);
+        function.set_edges(
+            entry,
+            vec![(header, BlockEdge::new(BranchType::Unconditional))],
+        );
+        let facts = RecoveryFacts::derive(&function).unwrap();
+        let mut structurer = GraphStructurer::new(function, &facts);
+        let post_dom = super::post_dominators(structurer.function.graph_mut());
+
+        assert!(!structurer.refine_virtual_edge_jump(&post_dom, entry, header, header, None));
+        assert!(structurer.function.block(entry).unwrap().is_empty());
+        assert_eq!(
+            structurer
+                .function
+                .successor_blocks(entry)
+                .collect::<Vec<_>>(),
+            vec![header]
+        );
+    }
+
+    #[test]
     fn dispatcher_uses_a_balanced_decision_tree() {
         let state = local("state");
         let cases = (0..4096)
