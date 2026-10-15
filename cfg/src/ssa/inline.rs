@@ -100,6 +100,23 @@ fn fold_table_fields(
             let table = block[table_index].as_assign_mut().unwrap().right[0]
                 .as_table_mut()
                 .unwrap();
+            let list_len = table.0.iter().filter(|(key, _)| key.is_none()).count();
+            // Lua may flush positional fields after keyed constructor fields.
+            // A later write that could replace a positional slot must stay after
+            // the constructor so the positional value cannot overwrite it.
+            let overlaps_list = match &key {
+                ast::RValue::Literal(ast::Literal::Number(key)) => {
+                    key.fract() == 0.0 && (1.0..=list_len as f64).contains(key)
+                }
+                ast::RValue::Literal(ast::Literal::Integer(key)) => {
+                    usize::try_from(*key).is_ok_and(|key| (1..=list_len).contains(&key))
+                }
+                ast::RValue::Literal(_) => false,
+                _ => list_len != 0,
+            };
+            if overlaps_list {
+                break;
+            }
             // A constructor template reserves a slot for every key the author
             // wrote, holding nil where the value is computed. Filling that slot
             // keeps the field in its original position; only a key with no slot
@@ -836,6 +853,62 @@ mod tests {
             upvalues,
         }
         .into()
+    }
+
+    #[test]
+    fn keeps_writes_that_can_overwrite_positional_fields() {
+        let object = local("current");
+        let keys: [RValue; 3] = [
+            Literal::Number(1.0).into(),
+            Literal::Integer(1).into(),
+            local("key").into(),
+        ];
+        let values: [RValue; 3] = [
+            Literal::Nil.into(),
+            Literal::String(b"old".to_vec()).into(),
+            Index::new(local("old").into(), Literal::Number(1.0).into()).into(),
+        ];
+        for key in keys {
+            for value in &values {
+                let mut block = Block(vec![
+                    Assign::new(
+                        vec![object.clone().into()],
+                        vec![Table(vec![(None, value.clone())]).into()],
+                    )
+                    .into(),
+                    field_assignment(&object, key.clone(), Literal::String(b"new".to_vec()).into()),
+                ]);
+                let original = block.clone();
+
+                assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 0);
+                assert_eq!(block, original);
+            }
+        }
+    }
+
+    #[test]
+    fn folds_fields_disjoint_from_positional_slots() {
+        let object = local("current");
+        for key in [
+            Literal::Number(2.0).into(),
+            Literal::Integer(2).into(),
+            Literal::Number(1.5).into(),
+            Literal::Number(0.0).into(),
+            Literal::Number(-1.0).into(),
+            Literal::String(b"label".to_vec()).into(),
+        ] {
+            let mut block = Block(vec![
+                Assign::new(
+                    vec![object.clone().into()],
+                    vec![Table(vec![(None, Literal::Nil.into())]).into()],
+                )
+                .into(),
+                field_assignment(&object, key, Literal::String(b"new".to_vec()).into()),
+            ]);
+
+            assert_eq!(fold_table_fields(&mut block, &FxHashSet::default()), 1);
+            assert_eq!(block.len(), 1);
+        }
     }
 
     #[test]
